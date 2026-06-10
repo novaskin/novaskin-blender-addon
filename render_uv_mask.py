@@ -1544,11 +1544,6 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
     out_dir: StringProperty(
         name="Output", default="//novaskin/", subtype='DIR_PATH',
         description="Where to write the export (relative to the .blend with //)")
-    player_folders: EnumProperty(
-        name="Folders",
-        items=[('index', "player1, player2, …", "Number the players by sort order"),
-               ('armature', "Armature name", "Use the armature object name")],
-        default='index')
     uv_format: EnumProperty(
         name="UV Format",
         items=[('PNG', "PNG", "8/16-bit PNG"),
@@ -1581,7 +1576,6 @@ def _apply_settings(scene):
         return
     g = globals()
     g["OUT_DIR"] = st.out_dir
-    g["PLAYER_FOLDER_SCHEME"] = st.player_folders
     g["UV_FORMAT"] = st.uv_format
     g["EXR_HALF"] = st.exr_half
     g["EXR_CODEC"] = st.exr_codec
@@ -1743,7 +1737,6 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         box = layout.box()
         box.label(text="Output", icon='FILE_FOLDER')
         box.prop(st, "out_dir")
-        box.prop(st, "player_folders")
         box.prop(st, "uv_format")
         if st.uv_format == 'OPEN_EXR':
             row = box.row(align=True)
