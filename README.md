@@ -130,7 +130,7 @@ Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key o
 | `EXPORT_BACKFACE_UV` | Also export the back-face UVs |
 | `EXPORT_PLAYER_ILLUM_SHADOW` | Illum + shadow per player |
 | `EXPORT_BACKGROUND_NO_PLAYERS` | Render the scenery without players |
-| `FIX_2LAYER_POSITION` | Snap the head's outer layer (`2_Layer_Extrusion`), parked above the head by default, back onto `NoFace_Head` before export (position only; persistent) |
+| `FIX_2LAYER_POSITION` / `HAT_SCALE_RATIO` | Snap the hat (`2_Layer_Extrusion`) onto `NoFace_Head` and scale it to the Minecraft hat size (`1.125`× the head) before export (persistent) |
 | `ILLUM_SAMPLES` / `ILLUM_COLORSPACE` | Illum quality/encoding |
 | `PNG_BIT_DEPTH` | Bit depth of UV/mask PNGs (default `8`; 256 levels, enough for MC skins) |
 | `UV_ALPHA_LIGHT` | Pack illum lightness into the UV's alpha (`_UVDL.png`). **Default `False`** — see note below |

@@ -31,8 +31,9 @@ How it works
   - Mask: scene in its normal state (drivers active); Cycles (EEVEE does not fill the
     Object Index pass); samples=1; configurable resolution.
   - Before exporting, the head's outer "hat" layer (2_Layer_Extrusion), which the rig parks
-    above the head by default, is snapped back onto NoFace_Head (position only). This is a
-    persistent, idempotent fix; toggle it with FIX_2LAYER_POSITION.
+    above the head (and sizes 1:1 with it), is snapped onto NoFace_Head and scaled to the
+    Minecraft hat size (1.125x the head). Persistent + idempotent; see FIX_2LAYER_POSITION /
+    HAT_SCALE_RATIO.
 
 Requirements (checked at startup by _preflight, which aborts with a clear message):
   - Tailored to the Thomas_Rig_Legacy rig (see the CONFIG block below).
@@ -137,12 +138,12 @@ RIG_ID_VALUE = "Thomas_Rig_Legacy"
 # Inside the rig container, the parts collection starts with this prefix.
 MESH_COLLECTION_PREFIX = "Mesh"                  # "Mesh", "Mesh.001", ...
 
-# This rig parks the head's outer "hat" layer (2_Layer_Extrusion) ABOVE the head by
-# default, so the artist can edit it separately. Before exporting, snap it back onto the
-# head (match NoFace_Head's local location). Only the LOCATION is matched -- the layer's
-# own rotation/scale (the outer-shell scale, e.g. 0.44 vs the head's 0.40) are preserved.
-# This is a persistent correction (not restored afterwards) and is idempotent.
+# The rig parks the head's outer "hat" layer (2_Layer_Extrusion) ABOVE the head by default
+# (so the artist can edit it apart), AND leaves it the same size as the head. Before export
+# we snap it onto NoFace_Head and scale it to the Minecraft hat size: the hat is the head
+# inflated 0.5px (an 8px cube -> 9px), i.e. 9/8 = 1.125x the head. Persistent + idempotent.
 FIX_2LAYER_POSITION = True
+HAT_SCALE_RATIO = 1.125            # hat size relative to the head; None = keep the rig's scale
 LAYER2_NAME = "2_Layer_Extrusion"
 LAYER2_HEAD_NAME = "NoFace_Head"
 
@@ -369,30 +370,37 @@ def discover_players():
 
 
 def _fix_2layer_positions(players):
-    """Snap each player's '2_Layer_Extrusion' (head outer/hat layer, parked above the head
-    by default) onto its 'NoFace_Head'. Only the local location is matched; rotation/scale
-    are preserved. Persistent + idempotent. Returns the number of objects moved."""
-    moved = 0
+    """Fix each player's hat ('2_Layer_Extrusion', the head outer layer) for export:
+      - snap it onto 'NoFace_Head' (match local location); and
+      - scale it to the Minecraft hat size (HAT_SCALE_RATIO x the head; the rig leaves it the
+        same size as the head). Set HAT_SCALE_RATIO=None to keep the rig's scale.
+    Rotation is preserved. Persistent + idempotent. Returns the number of objects changed."""
+    changed = 0
     for p in players:
         meshes = p["char_all"]
         head = next((o for o in meshes if o.name.startswith(LAYER2_HEAD_NAME)), None)
         if head is None:
-            print(f"[2LAYER] {p['label']}: '{LAYER2_HEAD_NAME}*' not found, skipping.")
+            print(f"[HAT] {p['label']}: '{LAYER2_HEAD_NAME}*' not found, skipping.")
             continue
         for o in meshes:
             if not o.name.startswith(LAYER2_NAME):
                 continue
-            if (o.location - head.location).length <= 1e-5:
-                continue   # already aligned
-            before = [round(v, 4) for v in o.location]
-            o.location = head.location.copy()
-            o.update_tag()
-            moved += 1
-            print(f"[2LAYER] {p['label']}: {o.name} {before} -> "
-                  f"{[round(v, 4) for v in o.location]}")
-    if moved:
+            did = []
+            if (o.location - head.location).length > 1e-5:
+                o.location = head.location.copy()
+                did.append("pos")
+            if HAT_SCALE_RATIO is not None:
+                target = head.scale * HAT_SCALE_RATIO
+                if (o.scale - target).length > 1e-5:
+                    o.scale = target
+                    did.append(f"scale->{round(target.x, 4)}")
+            if did:
+                o.update_tag()
+                changed += 1
+                print(f"[HAT] {p['label']}: {o.name} ({', '.join(did)})")
+    if changed:
         bpy.context.view_layer.update()
-    return moved
+    return changed
 
 
 def _opaque_mask_material():
@@ -1374,7 +1382,10 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
     export_player_illum_shadow: BoolProperty(name="Illum + shadow", default=True)
     composite_base_layer: BoolProperty(name="base_layer composite", default=True)
     export_background_no_players: BoolProperty(name="Background (no players)", default=True)
-    fix_2layer_position: BoolProperty(name="Fix 2_Layer position", default=True)
+    fix_2layer_position: BoolProperty(
+        name="Fix hat position", default=True,
+        description="Snap the hat (2_Layer_Extrusion) onto the head and scale it to the "
+                    "Minecraft hat size (a bit bigger than the head)")
     illum_samples: IntProperty(name="Illum samples", default=48, min=1, max=4096)
     lightshadow_format: EnumProperty(
         name="Illum/Shadow", items=[('JPEG', "JPEG", ""), ('PNG', "PNG", "")], default='JPEG')
