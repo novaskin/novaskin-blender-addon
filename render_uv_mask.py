@@ -1302,6 +1302,22 @@ def render_all(op=None):
 
 
 # ----------------------- Operator + menu -----------------------
+def _set_progress_header(text):
+    """Show (or clear, if text is None) a progress string in every 3D Viewport header,
+    which is far more visible than the bottom status bar."""
+    wm = bpy.context.window_manager
+    if wm is None:
+        return
+    for win in wm.windows:
+        scr = win.screen
+        if not scr:
+            continue
+        for area in scr.areas:
+            if area.type == 'VIEW_3D':
+                area.header_text_set(text)
+                area.tag_redraw()
+
+
 class RENDER_OT_novaskin(bpy.types.Operator):
     """Export per-part UV + occlusion mask + illum/shadow per player to <blend>/novaskin/"""
     bl_idname = "render.novaskin"
@@ -1330,6 +1346,7 @@ class RENDER_OT_novaskin(bpy.types.Operator):
         self._timer = self._wm.event_timer_add(0.001, window=context.window)
         self._wm.modal_handler_add(self)
         context.workspace.status_text_set("NovaSkin: starting... (Esc to cancel)")
+        _set_progress_header("NovaSkin: starting... (Esc to cancel)")
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
@@ -1346,7 +1363,9 @@ class RENDER_OT_novaskin(bpy.types.Operator):
                 print(f"NovaSkin failed: {ex!r}")
                 return self._finish(context, cancelled=True)
             self._wm.progress_update(frac)
-            context.workspace.status_text_set(f"NovaSkin {frac * 100:.0f}%  -  {msg}")
+            label = f"NovaSkin {frac * 100:.0f}%  -  {msg}  (Esc to cancel)"
+            context.workspace.status_text_set(label)
+            _set_progress_header(label)
             return {'RUNNING_MODAL'}
         return {'PASS_THROUGH'}
 
@@ -1356,6 +1375,7 @@ class RENDER_OT_novaskin(bpy.types.Operator):
             self._timer = None
         self._wm.progress_end()
         context.workspace.status_text_set(None)
+        _set_progress_header(None)
         if cancelled and getattr(self, "_gen", None) is not None:
             self._gen.close()   # raises GeneratorExit at the yield -> finally -> sess.restore()
         self._gen = None
