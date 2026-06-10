@@ -1451,8 +1451,6 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         items=[('PNG', "PNG", "8/16-bit PNG"),
                ('OPEN_EXR', "EXR (float)", "Float EXR -- straight alpha, no quantization")],
         default='PNG')
-    png_bit_depth: EnumProperty(
-        name="PNG Depth", items=[('8', "8-bit", ""), ('16', "16-bit", "")], default='8')
     exr_half: BoolProperty(name="Half float", default=True,
                            description="16-bit half EXR (smaller); off = 32-bit float")
     exr_codec: EnumProperty(
@@ -1481,7 +1479,6 @@ def _apply_settings(scene):
     g = globals()
     g["OUT_DIR"] = st.out_dir
     g["UV_FORMAT"] = st.uv_format
-    g["PNG_BIT_DEPTH"] = int(st.png_bit_depth)
     g["EXR_HALF"] = st.exr_half
     g["EXR_CODEC"] = st.exr_codec
     g["EXPORT_BACKFACE_UV"] = st.export_backface_uv
@@ -1638,8 +1635,6 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             row.prop(st, "exr_half", toggle=True)
             row.prop(st, "exr_codec", text="")
             box.label(text="+ light layer (when illum on)", icon='LIGHT')
-        else:
-            box.prop(st, "png_bit_depth")
 
         box = layout.box()
         box.label(text="Layers", icon='RENDERLAYERS')
