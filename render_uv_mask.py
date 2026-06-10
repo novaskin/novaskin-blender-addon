@@ -43,10 +43,10 @@ Requirements (checked at startup by _preflight, which aborts with a clear messag
 Usage
 -----
   - As an add-on: Edit > Preferences > Add-ons > Install... -> pick this file -> enable.
-    Then run it from the top bar:  Render > Render for NovaSkin.
-  - Or interactively: Scripting workspace -> open this file -> Run. This registers the
-    operator and adds the "Render for NovaSkin" entry to the Render menu (for the session).
-  - Or from the Python console / another script:  bpy.ops.render.novaskin()
+  - 3D Viewport sidebar (press N) -> "NovaSkin" tab: options + a "Render for NovaSkin"
+    button. The panel's options override the CONFIG constants below at run time.
+  - Top bar: Render > Render for NovaSkin.
+  - Python console / another script:  bpy.ops.render.novaskin()
 Outputs go to <blend_dir>/novaskin/.
 """
 
@@ -65,6 +65,8 @@ import os
 import re
 import json
 import numpy as np
+from bpy.props import (BoolProperty, IntProperty, EnumProperty,
+                       StringProperty, PointerProperty)
 
 # ----------------------------- CONFIG -----------------------------
 OUT_DIR = "//novaskin/"
@@ -1308,6 +1310,7 @@ def _render_steps(players, op=None):
 def render_all(op=None):
     """Synchronous full run (UI is blocked while it works). Returns the results dict, or
     None if the preflight aborts. The menu uses the modal operator instead (see invoke)."""
+    _apply_settings(bpy.context.scene)
     players = discover_players()
     errors = _preflight(players)
     if errors:
@@ -1335,7 +1338,66 @@ def render_all(op=None):
     return results
 
 
-# ----------------------- Operator + menu -----------------------
+# ----------------------- UI: settings + panel -----------------------
+# The CONFIG constants at the top are the defaults/fallback. These scene properties mirror
+# the most-used ones so they can be edited in the N-panel; _apply_settings() copies them
+# into the module globals at the start of each run (so the rest of the code is unchanged).
+class NovaSkinSettings(bpy.types.PropertyGroup):
+    out_dir: StringProperty(
+        name="Output", default="//novaskin/", subtype='DIR_PATH',
+        description="Where to write the export (relative to the .blend with //)")
+    uv_format: EnumProperty(
+        name="UV Format",
+        items=[('PNG', "PNG", "8/16-bit PNG"),
+               ('OPEN_EXR', "EXR (float)", "Float EXR -- straight alpha, no quantization")],
+        default='PNG')
+    png_bit_depth: EnumProperty(
+        name="PNG Depth", items=[('8', "8-bit", ""), ('16', "16-bit", "")], default='8')
+    exr_half: BoolProperty(name="Half float", default=True,
+                           description="16-bit half EXR (smaller); off = 32-bit float")
+    exr_codec: EnumProperty(
+        name="EXR Codec",
+        items=[(c, c, "") for c in ('ZIP', 'ZIPS', 'PIZ', 'PXR24', 'RLE', 'NONE', 'DWAA', 'DWAB')],
+        default='ZIP')
+    uv_alpha_light: BoolProperty(
+        name="Pack light in UV alpha", default=False,
+        description="A=light (_UVDL). Off keeps A=1 (safe for 2D-canvas readers)")
+    export_backface_uv: BoolProperty(name="Back-face UVs", default=True)
+    export_player_illum_shadow: BoolProperty(name="Illum + shadow", default=True)
+    composite_base_layer: BoolProperty(name="base_layer composite", default=True)
+    export_background_no_players: BoolProperty(name="Background (no players)", default=True)
+    fix_2layer_position: BoolProperty(name="Fix 2_Layer position", default=True)
+    illum_samples: IntProperty(name="Illum samples", default=48, min=1, max=4096)
+    lightshadow_format: EnumProperty(
+        name="Illum/Shadow", items=[('JPEG', "JPEG", ""), ('PNG', "PNG", "")], default='JPEG')
+    jpeg_quality: IntProperty(name="JPEG quality", default=90, min=1, max=100)
+
+
+def _apply_settings(scene):
+    """Copy the panel's scene properties into the module globals (no-op if absent)."""
+    st = getattr(scene, "novaskin", None)
+    if st is None:
+        return
+    g = globals()
+    g["OUT_DIR"] = st.out_dir
+    g["UV_FORMAT"] = st.uv_format
+    g["PNG_BIT_DEPTH"] = int(st.png_bit_depth)
+    g["EXR_HALF"] = st.exr_half
+    g["EXR_CODEC"] = st.exr_codec
+    g["UV_ALPHA_LIGHT"] = st.uv_alpha_light
+    g["EXPORT_BACKFACE_UV"] = st.export_backface_uv
+    g["EXPORT_PLAYER_ILLUM_SHADOW"] = st.export_player_illum_shadow
+    g["COMPOSITE_BASE_LAYER"] = st.composite_base_layer
+    g["EXPORT_BACKGROUND_NO_PLAYERS"] = st.export_background_no_players
+    g["FIX_2LAYER_POSITION"] = st.fix_2layer_position
+    g["ILLUM_SAMPLES"] = st.illum_samples
+    g["LIGHTSHADOW_FORMAT"] = st.lightshadow_format
+    g["JPEG_QUALITY"] = st.jpeg_quality
+    g["UV_EXT"] = '.exr' if st.uv_format == 'OPEN_EXR' else '.png'
+    g["LIGHTSHADOW_EXT"] = '.jpg' if st.lightshadow_format == 'JPEG' else '.png'
+
+
+# ----------------------- Operator + menu + panel -----------------------
 def _set_progress_header(text):
     """Show (or clear, if text is None) a progress string in every 3D Viewport header,
     which is far more visible than the bottom status bar."""
@@ -1365,7 +1427,8 @@ class RENDER_OT_novaskin(bpy.types.Operator):
     # blocks briefly while its render runs). True non-blocking rendering is not possible.
 
     def invoke(self, context, event):
-        # Interactive launch (from the menu): run as a modal job with a progress bar.
+        # Interactive launch (from the menu/panel): run as a modal job with a progress bar.
+        _apply_settings(context.scene)
         players = discover_players()
         errors = _preflight(players)
         if errors:
@@ -1430,14 +1493,70 @@ def _menu_draw(self, context):
     self.layout.operator(RENDER_OT_novaskin.bl_idname, icon='RENDER_STILL')
 
 
+class VIEW3D_PT_novaskin(bpy.types.Panel):
+    """NovaSkin export options + run button, in the 3D Viewport sidebar (press N)."""
+    bl_label = "NovaSkin Export"
+    bl_idname = "VIEW3D_PT_novaskin"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "NovaSkin"
+
+    def draw(self, context):
+        layout = self.layout
+        st = context.scene.novaskin
+
+        col = layout.column()
+        col.scale_y = 1.5
+        col.operator("render.novaskin", icon='RENDER_STILL')
+
+        box = layout.box()
+        box.label(text="Output", icon='FILE_FOLDER')
+        box.prop(st, "out_dir")
+        box.prop(st, "uv_format")
+        if st.uv_format == 'OPEN_EXR':
+            row = box.row(align=True)
+            row.prop(st, "exr_half", toggle=True)
+            row.prop(st, "exr_codec", text="")
+        else:
+            box.prop(st, "png_bit_depth")
+        box.prop(st, "uv_alpha_light")
+
+        box = layout.box()
+        box.label(text="Layers", icon='RENDERLAYERS')
+        box.prop(st, "export_backface_uv")
+        box.prop(st, "export_player_illum_shadow")
+        box.prop(st, "composite_base_layer")
+        box.prop(st, "export_background_no_players")
+
+        box = layout.box()
+        box.label(text="Quality", icon='SETTINGS')
+        box.prop(st, "illum_samples")
+        row = box.row(align=True)
+        row.prop(st, "lightshadow_format", text="")
+        if st.lightshadow_format == 'JPEG':
+            row.prop(st, "jpeg_quality", text="Q")
+
+        box = layout.box()
+        box.label(text="Rig", icon='ARMATURE_DATA')
+        box.prop(st, "fix_2layer_position")
+
+
+_classes = (NovaSkinSettings, RENDER_OT_novaskin, VIEW3D_PT_novaskin)
+
+
 def register():
-    bpy.utils.register_class(RENDER_OT_novaskin)
+    for cls in _classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.novaskin = PointerProperty(type=NovaSkinSettings)
     bpy.types.TOPBAR_MT_render.append(_menu_draw)
 
 
 def unregister():
     bpy.types.TOPBAR_MT_render.remove(_menu_draw)
-    bpy.utils.unregister_class(RENDER_OT_novaskin)
+    if hasattr(bpy.types.Scene, "novaskin"):
+        del bpy.types.Scene.novaskin
+    for cls in reversed(_classes):
+        bpy.utils.unregister_class(cls)
 
 
 if __name__ == "__main__":

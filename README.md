@@ -33,7 +33,13 @@ instead of failing midway.
 1. `Edit > Preferences > Add-ons`
 2. **Install...** (*Install from Disk*) → select `render_uv_mask.py`
 3. Tick the checkbox to enable **“NovaSkin Export (Thomas_Rig_Legacy)”**
-4. Run it from: **top bar → Render → “Render for NovaSkin”**
+4. Run it from either:
+   - **3D Viewport sidebar** (press <kbd>N</kbd>) → **“NovaSkin”** tab — options + a
+     **Render for NovaSkin** button, or
+   - **top bar → Render → “Render for NovaSkin”**.
+
+The panel exposes the common options (output folder, UV format, layers, samples, etc.);
+its values override the `CONFIG` constants in the script at run time.
 
 ### Option B — Run from the *Scripting* workspace *(quick test / development)*
 
