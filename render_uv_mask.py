@@ -185,6 +185,13 @@ UV_FORMAT = 'PNG'                  # 'PNG' or 'OPEN_EXR'
 EXR_HALF = True                    # half-float (16-bit) EXR -> smaller; else 32-bit float
 EXR_CODEC = 'ZIP'                  # lossless: ZIP/ZIPS/PIZ/PXR24/RLE/NONE; lossy: DWAA/DWAB/B44A
 UV_EXT = '.exr' if UV_FORMAT == 'OPEN_EXR' else '.png'
+# 8-bit PNG: quantize U/V with FLOOR into texel bins (byte = texel index) instead of the
+# default round-to-nearest, so a value inside texel i stays in texel i (round pushes the
+# upper half of a texel into the next one -- an off-by-one at HD 256px, where 8-bit = exactly
+# one level per texel). UV_TEXEL_BINS = bin count; 256 covers 64/128/256 skins (they all
+# divide 256). EXR keeps the raw float (the consumer floors the exact value).
+UV_PNG_FLOOR_TEXELS = True
+UV_TEXEL_BINS = 256
 # Illum (light) + shadow do not need PNG; JPEG keeps the files much smaller.
 LIGHTSHADOW_FORMAT = 'JPEG'        # 'JPEG' or 'PNG'
 JPEG_QUALITY = 90                  # 0..100 (JPEG only)
@@ -832,6 +839,11 @@ def export_part_uv(part, sess, out_subdir, tag="_UV", depth_range=None, label=No
             b[cov] = np.clip((z[cov] - zmin) / (zmax - zmin), 0.0, 1.0)
             out[:, 2] = b                 # B = normalized depth (0=near, 1=far)
     out[:, 3] = cov.astype('float32')        # A = coverage (1 inside the part, 0 outside)
+    # 8-bit PNG: store U/V as the texel index (FLOOR), not round-to-nearest. byte = floor(u*
+    # bins) clamped to 255, written as byte/255 so Blender's round() reproduces it exactly.
+    if UV_FORMAT != 'OPEN_EXR' and UV_PNG_FLOOR_TEXELS:
+        out[:, 0] = np.clip(np.floor(out[:, 0] * UV_TEXEL_BINS), 0.0, 255.0) / 255.0
+        out[:, 1] = np.clip(np.floor(out[:, 1] * UV_TEXEL_BINS), 0.0, 255.0) / 255.0
     # RGB light to embed (EXR only): valid (N,3) light map, masked to covered pixels.
     light = None
     if (UV_FORMAT == 'OPEN_EXR' and light_map is not None
@@ -1178,6 +1190,12 @@ def _write_manifest(players, out_path):
                 + ", A=coverage (1 in part, 0 outside)"
                 + (" + light layer (light.R/G/B, sRGB)"
                    if (UV_FORMAT == 'OPEN_EXR' and EXPORT_PLAYER_ILLUM_SHADOW) else "")),
+            "uv_png_texel_bins": (UV_TEXEL_BINS
+                                  if (UV_FORMAT != 'OPEN_EXR' and UV_PNG_FLOOR_TEXELS)
+                                  else None),
+            "uv_decode_note": ("PNG U/V byte = floor(u * %d); texel = floor(byte * texW / "
+                               "%d) (== byte for a %d-wide skin). EXR stores the raw float."
+                               % (UV_TEXEL_BINS, UV_TEXEL_BINS, UV_TEXEL_BINS)),
             "base_layer": ([COMPOSITE_OUTPUT_NAME.format(variant=v) + UV_EXT
                             for v, _ in MASK_ARM_VARIANTS] if COMPOSITE_BASE_LAYER else None),
             "base_layer_parts": (COMPOSITE_BASE_LABELS if COMPOSITE_BASE_LAYER else None),
