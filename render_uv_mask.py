@@ -196,6 +196,10 @@ MC_PART_MAP = {
 # HD 256x256); the depth packed in the UV's B channel only needs to RANK parts within a
 # single player, so 256 levels are plenty. Set to 16 for full-precision PNGs.
 PNG_BIT_DEPTH = 8                  # 8 or 16
+# PNG zlib compression 0..100. Blender's img.save() default (~15) barely compresses, so a
+# mostly-transparent frame still costs ~36 KB; 90 cuts data PNGs ~70% (byte-exact). Saved
+# via save_render (img.save ignores this). Only applies to data (Non-Color) PNGs.
+PNG_COMPRESSION = 90
 # UV + base_layer format: 'PNG' (8/16-bit) or 'OPEN_EXR' (float). EXR avoids the 2D-canvas
 # premultiply problem (when alpha carries the light) AND removes 8-bit quantization, but the
 # files are bigger and need a float EXR loader to read (browsers can't decode EXR via canvas).
@@ -618,6 +622,28 @@ def _save_image(arr_flat, W, H, path, colorspace='Non-Color',
                     pass
     elif file_format == 'JPEG':
         img.save(quality=JPEG_QUALITY if quality is None else quality)
+    elif colorspace == 'Non-Color':
+        # Data PNG: img.save() ignores PNG compression (stuck on Blender's low default), so
+        # save via save_render to set it. color_management OVERRIDE + 'Raw' writes raw bytes.
+        sc = bpy.context.scene
+        ims = sc.render.image_settings
+        snap = (ims.file_format, ims.compression, ims.color_depth, ims.color_management)
+        vt = None
+        try:
+            ims.file_format = 'PNG'
+            ims.compression = PNG_COMPRESSION
+            ims.color_depth = '16' if bit_depth >= 16 else '8'
+            ims.color_management = 'OVERRIDE'
+            vt = ims.view_settings.view_transform
+            ims.view_settings.view_transform = 'Raw'
+            img.save_render(path, scene=sc)
+        finally:
+            ims.file_format, ims.compression, ims.color_depth, ims.color_management = snap
+            if vt is not None:
+                try:
+                    ims.view_settings.view_transform = vt
+                except Exception:
+                    pass
     else:
         img.save()
     bpy.data.images.remove(img)
