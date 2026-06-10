@@ -30,10 +30,15 @@ instead of failing midway.
 
 ### Option A — Install as an add-on ✅ *(recommended)*
 
-1. `Edit > Preferences > Add-ons`
-2. **Install...** (*Install from Disk*) → select `render_uv_mask.py`
-3. Tick the checkbox to enable **“NovaSkin Export (Thomas_Rig_Legacy)”**
-4. Run it from either:
+Two ways:
+
+- **Extension zip (Blender 4.2+):** build it with `python3 build_addon.py` (creates
+  `dist/novaskin_export-<version>.zip`), then **drag the `.zip` onto the Blender window**, or
+  `Edit > Preferences > Get Extensions > ⌄ > Install from Disk…`.
+- **Classic add-on:** `Edit > Preferences > Add-ons > Install…` → select
+  `render_uv_mask.py` (the single file keeps its `bl_info`).
+
+Then enable **“NovaSkin Export (Thomas_Rig_Legacy)”** and run it from either:
    - **3D Viewport sidebar** (press <kbd>N</kbd>) → **“NovaSkin”** tab — options + a
      **Render for NovaSkin** button, or
    - **top bar → Render → “Render for NovaSkin”**.

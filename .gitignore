@@ -1,5 +1,7 @@
-# Track only the NovaSkin script + its README; ignore everything else.
+# Track only the NovaSkin add-on sources; ignore everything else (incl. dist/).
 *
 !.gitignore
 !render_uv_mask.py
 !README.md
+!blender_manifest.toml
+!build_addon.py

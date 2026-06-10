@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "novaskin_export"
+version = "1.0.0"
+name = "NovaSkin Export (Thomas_Rig_Legacy)"
+tagline = "Export per-part UV/mask/illum/shadow for Minecraft skins"
+maintainer = "saviski"
+type = "add-on"
+
+website = "https://github.com/novaskin/novaskin-blender-addon"
+tags = ["Render", "Pipeline", "UV"]
+
+blender_version_min = "4.2.0"
+
+# bpy add-ons are derivative works of the GPL Blender API. Change if you intend otherwise.
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Write the exported UV/mask/light files next to the .blend"
+network = "Open the NovaSkin wallpaper tool in your browser"
