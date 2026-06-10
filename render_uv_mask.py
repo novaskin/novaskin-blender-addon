@@ -8,8 +8,11 @@ Outputs (one subfolder per player):
         <part> is a Minecraft-style label (head/hat, body/jacket, arm/sleeve, leg/pant,
         with _left/_right and _classic/_slim where relevant). See MC_PART_MAP; the manifest
         records the label -> object-name mapping.
+  - <OUT_DIR>/<armature>/<part>_light.jpg     (per-part light, PNG pipeline; base parts use
+        the base-only render, overlays the full render. EXR packs it in the 'light' layer
+        instead. See EXPORT_PART_LIGHT.)
   - <OUT_DIR>/<armature>/base_layer_<classic|slim>.png  (base parts composited per arm
-        variant, nearest pixel wins)
+        variant, nearest pixel wins; + base_layer_<v>_light.jpg in the PNG pipeline)
   - <OUT_DIR>/<armature>/mask_<classic|slim>.png
 
 Multi-player
@@ -120,6 +123,10 @@ UV_DEPTH_IN_BLUE = True
 # we extract the body's illumination (masked by the player's mask) AND the shadow it casts
 # on the scenery (ratio vs the clean scene). Replaces the global illum.
 EXPORT_PLAYER_ILLUM_SHADOW = True
+# Also save the per-part light as its own image next to the UV ("<part>_light.<ext>", the
+# illum/shadow format). Needed for the PNG pipeline (the light can't go in the UV alpha --
+# canvas premultiply). With EXR the light is embedded in the UV's 'light' layer instead.
+EXPORT_PART_LIGHT = True
 EXPORT_ILLUM_BACKGROUND = False   # global (all together) -- superseded by the per-player one
 ILLUM_SAMPLES = 48
 ILLUM_RES_PCT = 100               # must match MASK_RES_PCT to align with the mask
@@ -858,17 +865,24 @@ def export_part_uv(part, sess, out_subdir, tag="_UV", depth_range=None, label=No
     if UV_FORMAT != 'OPEN_EXR' and UV_PNG_FLOOR_TEXELS:
         out[:, 0] = np.clip(np.floor(out[:, 0] * UV_TEXEL_BINS), 0.0, 255.0) / 255.0
         out[:, 1] = np.clip(np.floor(out[:, 1] * UV_TEXEL_BINS), 0.0, 255.0) / 255.0
-    # RGB light to embed (EXR only): valid (N,3) light map, masked to covered pixels.
+    # Per-part RGB light (sRGB), masked to covered pixels. Embedded in the EXR's 'light'
+    # layer; for PNG it is saved as a separate "<part>_light.<ext>" image.
     light = None
-    if (UV_FORMAT == 'OPEN_EXR' and light_map is not None
-            and getattr(light_map, "ndim", 0) == 2 and light_map.shape == (out.shape[0], 3)):
+    if (light_map is not None and getattr(light_map, "ndim", 0) == 2
+            and light_map.shape == (out.shape[0], 3)):
         light = np.zeros((out.shape[0], 3), dtype='float32')
         light[cov] = np.clip(light_map[cov], 0.0, 1.0)
     path = os.path.join(_abs(OUT_DIR), out_subdir, stem + tag + UV_EXT)
-    if light is not None:
+    if UV_FORMAT == 'OPEN_EXR' and light is not None:
         _save_exr_uvdl(out, light, W, H, path)
     else:
         _save_image(out.reshape(-1), W, H, path, file_format=UV_FORMAT)
+        if light is not None and EXPORT_PART_LIGHT:
+            la = np.ones((light.shape[0], 4), dtype='float32')
+            la[:, :3] = light
+            _save_image(la.reshape(-1), W, H,
+                        os.path.join(_abs(OUT_DIR), out_subdir, stem + "_light" + LIGHTSHADOW_EXT),
+                        colorspace='Non-Color', file_format=LIGHTSHADOW_FORMAT)
     return path, out, cov, light, W, H
 
 
@@ -1397,7 +1411,8 @@ def _render_steps(players, op=None):
     # light_maps[(player_label, variant)] = sRGB RGB light (N,3), filled by the illum step
     # and embedded as a 'light' layer in EXR UVs. Empty if the illum step is disabled.
     light_maps = {}
-    embed_light = (UV_FORMAT == 'OPEN_EXR' and EXPORT_PLAYER_ILLUM_SHADOW)
+    have_light = EXPORT_PLAYER_ILLUM_SHADOW
+    embed_light = (UV_FORMAT == 'OPEN_EXR' and have_light)   # light goes inside the EXR
     front_tag = "_UVDL" if embed_light else "_UV"
 
     try:
@@ -1451,7 +1466,7 @@ def _render_steps(players, op=None):
                 for part in p["uv_parts"]:
                     lab = p["uv_labels"][part.name]
                     lmap = (_light_for_label(light_maps, p["label"], lab)
-                            if embed_light else None)
+                            if have_light else None)
                     res = export_part_uv(part, sess, p["label"], tag=front_tag, label=lab,
                                          depth_range=p["depth_range"], light_map=lmap)
                     if res is None:
@@ -1468,7 +1483,7 @@ def _render_steps(players, op=None):
                                 c = [np.zeros((cW * cH, 4), dtype='float32'),
                                      np.full(cW * cH, np.inf, dtype='float32'),
                                      (np.zeros((cW * cH, 3), dtype='float32')
-                                      if embed_light else None)]
+                                      if have_light else None)]
                                 comps[v] = c
                             comp, zbuf, clight = c
                             d = np.where(cov, out[:, 2], np.inf)   # nearest (0=near) wins
@@ -1484,12 +1499,19 @@ def _render_steps(players, op=None):
                         if c is None:
                             continue
                         comp, zbuf, clight = c
-                        cpath = os.path.join(_abs(OUT_DIR), p["label"],
-                                             COMPOSITE_OUTPUT_NAME.format(variant=v) + UV_EXT)
-                        if clight is not None:
+                        stem = COMPOSITE_OUTPUT_NAME.format(variant=v)
+                        cpath = os.path.join(_abs(OUT_DIR), p["label"], stem + UV_EXT)
+                        if UV_FORMAT == 'OPEN_EXR' and clight is not None:
                             _save_exr_uvdl(comp, clight, cW, cH, cpath)
                         else:
                             _save_image(comp.reshape(-1), cW, cH, cpath, file_format=UV_FORMAT)
+                            if clight is not None and EXPORT_PART_LIGHT:
+                                la = np.ones((clight.shape[0], 4), dtype='float32')
+                                la[:, :3] = clight
+                                _save_image(la.reshape(-1), cW, cH,
+                                            os.path.join(_abs(OUT_DIR), p["label"],
+                                                         stem + "_light" + LIGHTSHADOW_EXT),
+                                            colorspace='Non-Color', file_format=LIGHTSHADOW_FORMAT)
                         results[p["label"]].setdefault("composite", {})[v] = cpath
                         yield prog(f"Composite base_layer ({v}): {p['label']}")
         finally:
