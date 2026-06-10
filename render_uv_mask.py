@@ -73,6 +73,12 @@ from bpy.props import (BoolProperty, IntProperty, EnumProperty,
 # ----------------------------- CONFIG -----------------------------
 OUT_DIR = "//novaskin/"
 
+# Per-player output subfolder name: 'index' -> player1, player2, ... (PLAYER_FOLDER_PREFIX,
+# in armature-name sort order); 'armature' -> the armature object name (Thomas_rig, ...).
+# The manifest records both the folder label and the armature name.
+PLAYER_FOLDER_SCHEME = 'index'      # 'index' or 'armature'
+PLAYER_FOLDER_PREFIX = 'player'
+
 UV_SAMPLES = 1
 MASK_SAMPLES = 1
 MASK_RES_PCT = 100
@@ -400,7 +406,10 @@ def discover_players():
         char_all = [o for o in mesh_coll.objects if o.type == 'MESH'] + extras
         # Selection by visibility in the basic look (robustly filters fingers/3x3).
         uv_parts = _select_uv_parts(arm, char_all)
-        players.append({"label": arm.name, "rig_id": arm[RIG_ID_PROP], "arm": arm,
+        label = ("%s%d" % (PLAYER_FOLDER_PREFIX, len(players) + 1)
+                 if PLAYER_FOLDER_SCHEME == 'index' else arm.name)
+        players.append({"label": label, "armature": arm.name,
+                        "rig_id": arm[RIG_ID_PROP], "arm": arm,
                         "char_all": char_all, "uv_parts": uv_parts})
 
     # Cross-rig reconciliation: a part visible (in the basic look) on ANY rig is a real
@@ -898,7 +907,7 @@ def export_character_mask_variant(player, vname, vval, sess, all_players=None):
         print(f"[MASK] {player['label']} / {vname}")
         arr, W, H = sess.render_pass('Object Index', 'CYCLES', MASK_SAMPLES, MASK_RES_PCT)
         if arr is None:
-            return None
+            return None, None, 0, 0
         m = (arr[:, 0] >= 0.5).astype('float32')
         out = np.zeros((m.size, 4), dtype='float32')
         out[:, 0] = out[:, 1] = out[:, 2] = m
@@ -906,7 +915,17 @@ def export_character_mask_variant(player, vname, vval, sess, all_players=None):
         path = os.path.join(_abs(OUT_DIR), player["label"],
                             f"mask_{vname}.png")
         _save_image(out.reshape(-1), W, H, path)
-        return path
+        # bbox of the visible silhouette, in TOP-LEFT pixel coords (the saved PNG is
+        # top-left; the Viewer array is bottom-left, so flip the rows).
+        mm = m.reshape(H, W)
+        ys, xs = np.nonzero(mm >= 0.5)
+        if xs.size:
+            x0, x1 = int(xs.min()), int(xs.max())
+            rb0, rb1 = int(ys.min()), int(ys.max())
+            bbox = (x0, H - 1 - rb1, x1, H - 1 - rb0)   # (x0, y0, x1, y1) inclusive
+        else:
+            bbox = None
+        return path, bbox, W, H
     finally:
         for d in muted:
             d.mute = False
@@ -1203,6 +1222,22 @@ def _player_camera_depth(player):
     return float(-(inv @ centroid).z)   # camera depth (larger = further back)
 
 
+def _bbox_dict(bbox, size):
+    """Format an inclusive top-left pixel bbox (x0,y0,x1,y1) + (W,H) for the manifest:
+    pixels {x,y,w,h} and normalized {x,y,w,h} (0..1), origin top-left. None if no bbox."""
+    if not bbox:
+        return None
+    x0, y0, x1, y1 = bbox
+    w, h = x1 - x0 + 1, y1 - y0 + 1
+    out = {"origin": "top-left", "px": {"x": x0, "y": y0, "w": w, "h": h}}
+    if size and size[0] and size[1]:
+        W, H = size
+        out["resolution"] = [W, H]
+        out["norm"] = {"x": round(x0 / W, 5), "y": round(y0 / H, 5),
+                       "w": round(w / W, 5), "h": round(h / H, 5)}
+    return out
+
+
 def _write_manifest(players, out_path):
     s = bpy.context.scene
     ordered = sorted((p for p in players if p.get("camera_depth") is not None),
@@ -1250,8 +1285,10 @@ def _write_manifest(players, out_path):
         "players": [
             {
                 "label": p["label"],
+                "armature": p.get("armature"),
                 "rig_id": p.get("rig_id"),
                 "folder": p["label"],
+                "visible_bbox": _bbox_dict(p.get("bbox"), p.get("render_size")),
                 "camera_depth": round(p["camera_depth"], 4) if p.get("camera_depth") is not None else None,
                 "depth_range_viewer": ([round(x, 5) for x in p["depth_range"]]
                                        if p.get("depth_range") else None),
@@ -1357,8 +1394,15 @@ def _render_steps(players, op=None):
         try:
             for p in players:
                 for vname, vval in MASK_ARM_VARIANTS:
-                    results[p["label"]]["masks"][vname] = \
+                    mpath, bbox, mW, mH = \
                         export_character_mask_variant(p, vname, vval, sess, players)
+                    results[p["label"]]["masks"][vname] = mpath
+                    if bbox is not None:
+                        p["render_size"] = (mW, mH)
+                        b = p.get("bbox")
+                        p["bbox"] = list(bbox) if b is None else [
+                            min(b[0], bbox[0]), min(b[1], bbox[1]),
+                            max(b[2], bbox[2]), max(b[3], bbox[3])]   # union over variants
                     yield prog(f"Mask: {p['label']} / {vname}")
         finally:
             _restore_materials(saved_mats)
@@ -1500,6 +1544,11 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
     out_dir: StringProperty(
         name="Output", default="//novaskin/", subtype='DIR_PATH',
         description="Where to write the export (relative to the .blend with //)")
+    player_folders: EnumProperty(
+        name="Folders",
+        items=[('index', "player1, player2, …", "Number the players by sort order"),
+               ('armature', "Armature name", "Use the armature object name")],
+        default='index')
     uv_format: EnumProperty(
         name="UV Format",
         items=[('PNG', "PNG", "8/16-bit PNG"),
@@ -1532,6 +1581,7 @@ def _apply_settings(scene):
         return
     g = globals()
     g["OUT_DIR"] = st.out_dir
+    g["PLAYER_FOLDER_SCHEME"] = st.player_folders
     g["UV_FORMAT"] = st.uv_format
     g["EXR_HALF"] = st.exr_half
     g["EXR_CODEC"] = st.exr_codec
@@ -1683,6 +1733,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         box = layout.box()
         box.label(text="Output", icon='FILE_FOLDER')
         box.prop(st, "out_dir")
+        box.prop(st, "player_folders")
         box.prop(st, "uv_format")
         if st.uv_format == 'OPEN_EXR':
             row = box.row(align=True)
