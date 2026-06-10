@@ -127,6 +127,11 @@ EXPORT_PLAYER_ILLUM_SHADOW = True
 # illum/shadow format). Needed for the PNG pipeline (the light can't go in the UV alpha --
 # canvas premultiply). With EXR the light is embedded in the UV's 'light' layer instead.
 EXPORT_PART_LIGHT = True
+# For the LIGHT renders, make the scenery invisible to the camera (visible_camera=False) so
+# objects IN FRONT of the player don't bleed their color into its light -- the player renders
+# unoccluded while the scenery still shadows/bounces light onto it (lighting stays real). The
+# shadow render keeps the scenery visible (the shadow falls on it).
+ILLUM_HIDE_SCENERY_FROM_CAMERA = True
 EXPORT_ILLUM_BACKGROUND = False   # global (all together) -- superseded by the per-player one
 ILLUM_SAMPLES = 48
 ILLUM_RES_PCT = 100               # must match MASK_RES_PCT to align with the mask
@@ -1128,10 +1133,24 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                 if ILLUM_PURE_SHADOW:
                     for o in p["char_all"]:
                         o.visible_diffuse = False   # pure shadow, but loses self-bounce
+                active_names = set(o.name for o in p["char_all"])
+                scenery = ([o for o in s.objects
+                            if o.type == 'MESH' and o.name not in active_names]
+                           if ILLUM_HIDE_SCENERY_FROM_CAMERA else [])
                 bpy.context.view_layer.update()
                 try:
-                    print(f"[ILLUM full] {p['label']} / {vname}")
-                    comb_full, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)  # overlay light + illum image
+                    # FULL light: scenery invisible to the camera (player not occluded by
+                    # foreground objects; their light/shadow contribution stays).
+                    sc = {o: o.visible_camera for o in scenery}
+                    for o in scenery:
+                        o.visible_camera = False
+                    bpy.context.view_layer.update()
+                    try:
+                        print(f"[ILLUM full] {p['label']} / {vname}")
+                        comb_full, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+                    finally:
+                        for o, c in sc.items():
+                            o.visible_camera = c
 
                     # Hide the overlays (hat/jacket/sleeve/pant): the BASE light and the
                     # shadow are both for the base layer only.
@@ -1150,13 +1169,21 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                         o.hide_render = True
                     bpy.context.view_layer.update()
                     try:
-                        # BASE light: base layer visible -> the base's own lighting even where
-                        # the overlays would occlude it in the full render.
-                        print(f"[ILLUM base] {p['label']} / {vname}")
-                        comb_base, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+                        # BASE light: base visible (its own lighting even where overlays would
+                        # occlude it), scenery again invisible to the camera.
+                        sc = {o: o.visible_camera for o in scenery}
+                        for o in scenery:
+                            o.visible_camera = False
+                        bpy.context.view_layer.update()
+                        try:
+                            print(f"[ILLUM base] {p['label']} / {vname}")
+                            comb_base, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+                        finally:
+                            for o, c in sc.items():
+                                o.visible_camera = c
 
-                        # SHADOW: base layer INVISIBLE to the camera (but still casting), so
-                        # the shadow behind/under the player is captured, not blocked.
+                        # SHADOW: base layer INVISIBLE to the camera (still casting), scenery
+                        # VISIBLE (the shadow falls on it).
                         sh_cam = {}
                         for o in p["char_all"]:
                             sh_cam[o] = o.visible_camera
