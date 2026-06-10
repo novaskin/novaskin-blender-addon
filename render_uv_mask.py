@@ -1417,6 +1417,10 @@ def _apply_settings(scene):
 
 
 # ----------------------- Operator + menu + panel -----------------------
+# Live progress for the panel (updated by the modal operator, read by the panel draw).
+_PROGRESS = {"running": False, "frac": 0.0, "msg": ""}
+
+
 def _set_progress_header(text):
     """Show (or clear, if text is None) a progress string in every 3D Viewport header,
     which is far more visible than the bottom status bar."""
@@ -1461,6 +1465,7 @@ class RENDER_OT_novaskin(bpy.types.Operator):
         self._wm.progress_begin(0.0, 1.0)
         self._timer = self._wm.event_timer_add(0.001, window=context.window)
         self._wm.modal_handler_add(self)
+        _PROGRESS.update(running=True, frac=0.0, msg="starting...")
         context.workspace.status_text_set("NovaSkin: starting... (Esc to cancel)")
         _set_progress_header("NovaSkin: starting... (Esc to cancel)")
         return {'RUNNING_MODAL'}
@@ -1479,6 +1484,7 @@ class RENDER_OT_novaskin(bpy.types.Operator):
                 print(f"NovaSkin failed: {ex!r}")
                 return self._finish(context, cancelled=True)
             self._wm.progress_update(frac)
+            _PROGRESS.update(frac=frac, msg=msg)
             label = f"NovaSkin {frac * 100:.0f}%  -  {msg}  (Esc to cancel)"
             context.workspace.status_text_set(label)
             _set_progress_header(label)
@@ -1490,6 +1496,7 @@ class RENDER_OT_novaskin(bpy.types.Operator):
             self._wm.event_timer_remove(self._timer)
             self._timer = None
         self._wm.progress_end()
+        _PROGRESS.update(running=False, frac=0.0, msg="")
         context.workspace.status_text_set(None)
         _set_progress_header(None)
         if cancelled and getattr(self, "_gen", None) is not None:
@@ -1524,9 +1531,19 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         layout = self.layout
         st = context.scene.novaskin
 
-        col = layout.column()
-        col.scale_y = 1.5
-        col.operator("render.novaskin", icon='RENDER_STILL')
+        if _PROGRESS["running"]:
+            col = layout.column()
+            pct = _PROGRESS["frac"] * 100.0
+            try:
+                col.progress(factor=_PROGRESS["frac"],
+                             text=f"{pct:.0f}%  -  {_PROGRESS['msg']}", type='BAR')
+            except (AttributeError, TypeError):   # older Blender without UILayout.progress
+                col.label(text=f"NovaSkin  {pct:.0f}%  -  {_PROGRESS['msg']}")
+            col.label(text="Esc (in the viewport) to cancel", icon='CANCEL')
+        else:
+            col = layout.column()
+            col.scale_y = 1.5
+            col.operator("render.novaskin", icon='RENDER_STILL')
 
         if WALLPAPER_TOOL_URL:
             layout.operator("wm.url_open", text="Open Wallpaper Tool",
