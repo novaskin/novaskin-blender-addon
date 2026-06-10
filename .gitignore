@@ -1,0 +1,5 @@
+# Track only the NovaSkin script + its README; ignore everything else.
+*
+!.gitignore
+!render_uv_mask.py
+!README.md
