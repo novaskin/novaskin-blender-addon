@@ -1,10 +1,10 @@
 """Export per-part UV + (occlusion) mask per player, for N players in the scene.
 
 Outputs (one subfolder per player):
-  - <OUT_DIR>/<armature>/<part>_UVDL.png      (PNG, RAW/Non-Color; 8-bit by default)
-        R=U, G=V, B=depth(per character), A=light (sRGB lightness from the illum pass).
-        Named "<part>_UV.png" with A=coverage (1 inside the part, 0 outside) if
-        UV_ALPHA_LIGHT / the illum pass is off.
+  - <OUT_DIR>/<armature>/<part>_UV.png        (PNG, RAW/Non-Color; 8-bit by default)
+        R=U, G=V, B=depth(per character), A=coverage (1 inside the part, 0 outside).
+        As EXR (UV_FORMAT='OPEN_EXR') with the illum pass on, it is "<part>_UVDL.exr" with
+        the same RGBA plus a "light" layer (light.R/G/B = sRGB illum color).
         <part> is a Minecraft-style label (head/hat, body/jacket, arm/sleeve, leg/pant,
         with _left/_right and _classic/_slim where relevant). See MC_PART_MAP; the manifest
         records the label -> object-name mapping.
@@ -190,12 +190,11 @@ LIGHTSHADOW_FORMAT = 'JPEG'        # 'JPEG' or 'PNG'
 JPEG_QUALITY = 90                  # 0..100 (JPEG only)
 LIGHTSHADOW_EXT = '.jpg' if LIGHTSHADOW_FORMAT == 'JPEG' else '.png'
 
-# Pack a single "lightness" channel (luminance of the illum pass, sRGB-encoded) into the
-# UV file's alpha channel (otherwise unused) -> "<part>_UVDL.png" (R=U, G=V, B=depth, A=light).
-# OFF by default (A=1, "<part>_UV.png"): a variable alpha gets CORRUPTED if the consumer reads
-# the PNG through an HTML 2D canvas (premultiply round-trip mangles U/V where the light is
-# dark). Turn ON only if you read straight-alpha (GPU/EXR loader). Light is also in illum_*.
-UV_ALPHA_LIGHT = False
+# The default RGBA of every UV file is (R=U, G=V, B=depth, A=coverage). When exporting as
+# EXR (UV_FORMAT='OPEN_EXR') and the illum pass is on, the RGB light is ALSO embedded in the
+# same file as an extra "light" layer (light.R/G/B, sRGB) -> "<part>_UVDL.exr". PNG never
+# carries the light (4 channels max + the 2D-canvas premultiply issue); its light is the
+# separate illum_*.jpg.
 
 # After a player's parts are exported, composite the BASE layers (no overlays, no back
 # faces) into one UVDL image PER arm variant, nearest pixel (smallest depth) winning. All
@@ -542,6 +541,27 @@ def _save_image(arr_flat, W, H, path, colorspace='Non-Color',
     bpy.data.images.remove(img)
 
 
+def _save_exr_uvdl(out4, light3, W, H, path):
+    """Write a multi-channel EXR via OpenImageIO: the default RGBA layer = (R=U, G=V,
+    B=depth, A=coverage) -- same as the PNG, so the existing reader works -- plus a 'light'
+    layer (light.R/G/B = sRGB illum color). Half (EXR_HALF) + EXR_CODEC compression."""
+    import OpenImageIO as oiio
+    n = W * H
+    if light3 is None:
+        light3 = np.zeros((n, 3), dtype='float32')
+    data = np.concatenate([np.asarray(out4, dtype='float32'),
+                           np.asarray(light3, dtype='float32')], axis=1)   # (N, 7)
+    data = np.ascontiguousarray(data.reshape(H, W, 7))
+    spec = oiio.ImageSpec(W, H, 7, oiio.HALF if EXR_HALF else oiio.FLOAT)
+    spec.channelnames = ("R", "G", "B", "A", "light.R", "light.G", "light.B")
+    spec.attribute("compression", EXR_CODEC.lower())
+    out = oiio.ImageOutput.create(path)
+    if out is None or not out.open(path, spec):
+        raise RuntimeError(f"OIIO cannot write {path}: {oiio.geterror()}")
+    out.write_image(data)
+    out.close()
+
+
 class _Session:
     """Full snapshot/restore + reading a pass via the Viewer."""
 
@@ -736,9 +756,10 @@ def _rendered_depth_range(player, sess, gray_mat, _back_mat=None):
 
 def export_part_uv(part, sess, out_subdir, tag="_UV", depth_range=None, label=None,
                    light_map=None):
-    """Render one part's UV (+ optional depth in B, + optional light in A) and save it as
-    "<label><tag>.png". Returns (path, out, cov, W, H) -- out is the (N,4) pixel array and
-    cov the coverage mask, for the base-layer composite -- or None if the part is empty."""
+    """Render one part's UV and save it. The file is RGBA = (R=U, G=V, B=depth, A=coverage);
+    if light_map (N,3 sRGB) is given AND UV_FORMAT is EXR, the light is embedded as an extra
+    'light' layer. Returns (path, out(N,4), cov, light(N,3) or None, W, H) for the base-layer
+    composite -- or None if the part is empty."""
     stem = label if label is not None else part.name
     s = sess.s
     sess.mute_drivers(True)
@@ -761,17 +782,19 @@ def export_part_uv(part, sess, out_subdir, tag="_UV", depth_range=None, label=No
             b = np.zeros(z.shape, dtype='float32')
             b[cov] = np.clip((z[cov] - zmin) / (zmax - zmin), 0.0, 1.0)
             out[:, 2] = b                 # B = normalized depth (0=near, 1=far)
-    # A = coverage (1 inside the part, 0 outside) -- or the light, packed only on covered
-    # pixels, when UV_ALPHA_LIGHT is on. Either way uncovered pixels get alpha 0.
-    if light_map is not None and light_map.shape[0] == out.shape[0]:
-        a = np.zeros(out.shape[0], dtype='float32')
-        a[cov] = np.clip(light_map[cov], 0.0, 1.0)
-        out[:, 3] = a
-    else:
-        out[:, 3] = cov.astype('float32')   # coverage mask in alpha (0 outside the part)
+    out[:, 3] = cov.astype('float32')        # A = coverage (1 inside the part, 0 outside)
+    # RGB light to embed (EXR only): valid (N,3) light map, masked to covered pixels.
+    light = None
+    if (UV_FORMAT == 'OPEN_EXR' and light_map is not None
+            and getattr(light_map, "ndim", 0) == 2 and light_map.shape == (out.shape[0], 3)):
+        light = np.zeros((out.shape[0], 3), dtype='float32')
+        light[cov] = np.clip(light_map[cov], 0.0, 1.0)
     path = os.path.join(_abs(OUT_DIR), out_subdir, stem + tag + UV_EXT)
-    _save_image(out.reshape(-1), W, H, path, file_format=UV_FORMAT)
-    return path, out, cov, W, H
+    if light is not None:
+        _save_exr_uvdl(out, light, W, H, path)
+    else:
+        _save_image(out.reshape(-1), W, H, path, file_format=UV_FORMAT)
+    return path, out, cov, light, W, H
 
 
 def export_character_mask_variant(player, vname, vval, sess, all_players=None):
@@ -1027,12 +1050,10 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                                          f"illum_{vname}{LIGHTSHADOW_EXT}"),
                             colorspace=ILLUM_COLORSPACE, file_format=LIGHTSHADOW_FORMAT)
 
-                # keep a single sRGB lightness map (for packing into the UV's alpha later)
+                # keep the sRGB RGB light map (embedded as a 'light' layer in EXR UVs)
                 if light_maps is not None:
-                    lum = (0.2126 * illum[:, 0] + 0.7152 * illum[:, 1]
-                           + 0.0722 * illum[:, 2])
                     light_maps[(p["label"], vname)] = \
-                        _lin_to_srgb(lum).astype('float32')
+                        _lin_to_srgb(illum[:, :3]).astype('float32')   # (N, 3)
 
                 # shadow = ratio (multiply); 1.0 where the body is (it gets composited on top)
                 ratio = np.clip(comb[:, :3] / np.clip(clean[:, :3], 1e-4, None), 0.0, 1.0)
@@ -1098,16 +1119,16 @@ def _write_manifest(players, out_path):
             "mask_res_pct": MASK_RES_PCT,
             "uv_depth_in_blue": UV_DEPTH_IN_BLUE,
             "export_backface_uv": EXPORT_BACKFACE_UV,
-            "uv_file_suffix": ("_UVDL" if (UV_ALPHA_LIGHT and EXPORT_PLAYER_ILLUM_SHADOW)
-                               else "_UV"),
+            "uv_file_suffix": ("_UVDL" if (UV_FORMAT == 'OPEN_EXR'
+                                           and EXPORT_PLAYER_ILLUM_SHADOW) else "_UV"),
             "uv_format": UV_FORMAT,
             "uv_ext": UV_EXT,
             "uv_channels": (
                 ("R=U, G=V, B=depth(0=near,1=far) normalized per character"
                  if UV_DEPTH_IN_BLUE else "R=U, G=V, B=1.0")
-                + (", A=light (sRGB lightness)"
-                   if (UV_ALPHA_LIGHT and EXPORT_PLAYER_ILLUM_SHADOW)
-                   else ", A=coverage (1 in part, 0 outside)")),
+                + ", A=coverage (1 in part, 0 outside)"
+                + (" + light layer (light.R/G/B, sRGB)"
+                   if (UV_FORMAT == 'OPEN_EXR' and EXPORT_PLAYER_ILLUM_SHADOW) else "")),
             "base_layer": ([COMPOSITE_OUTPUT_NAME.format(variant=v) + UV_EXT
                             for v, _ in MASK_ARM_VARIANTS] if COMPOSITE_BASE_LAYER else None),
             "base_layer_parts": (COMPOSITE_BASE_LABELS if COMPOSITE_BASE_LAYER else None),
@@ -1211,10 +1232,11 @@ def _render_steps(players, op=None):
         print(f"[{state['done']}/{total}] {msg}")
         return (state["done"] / total, msg)
 
-    # light_maps[(player_label, variant)] = sRGB lightness (W*H), filled by the illum step
-    # and packed into each part's UV alpha. Empty if the illum step is disabled.
+    # light_maps[(player_label, variant)] = sRGB RGB light (N,3), filled by the illum step
+    # and embedded as a 'light' layer in EXR UVs. Empty if the illum step is disabled.
     light_maps = {}
-    front_tag = "_UVDL" if (UV_ALPHA_LIGHT and EXPORT_PLAYER_ILLUM_SHADOW) else "_UV"
+    embed_light = (UV_FORMAT == 'OPEN_EXR' and EXPORT_PLAYER_ILLUM_SHADOW)
+    front_tag = "_UVDL" if embed_light else "_UV"
 
     try:
         # 0) Depth range per player (for depth in the B channel), in the Viewer's scale
@@ -1247,26 +1269,26 @@ def _render_steps(players, op=None):
                     yield prog(f"Illum background: {vname}")
             finally:
                 _restore_materials(saved_il)
-        # 3) FRONT-face UVs (opaque override): R=U, G=V, B=depth, A=light. Then composite
-        #    the base layers per player (nearest pixel wins).
+        # 3) FRONT-face UVs (opaque override): R=U, G=V, B=depth, A=coverage (+ a 'light'
+        #    layer in EXR). Then composite the base layers per player (nearest pixel wins).
         variant_names = [v for v, _ in MASK_ARM_VARIANTS]
         base_sets = {v: {lab.format(variant=v) for lab in COMPOSITE_BASE_LABELS}
                      for v in variant_names}
         saved_mats = _swap_materials(all_char, mask_mat)
         try:
             for p in players:
-                comps = {}            # variant -> [comp (N,4), zbuf (N,)]
+                comps = {}            # variant -> [comp (N,4), zbuf (N,), light (N,3)|None]
                 cW = cH = None
                 for part in p["uv_parts"]:
                     lab = p["uv_labels"][part.name]
                     lmap = (_light_for_label(light_maps, p["label"], lab)
-                            if UV_ALPHA_LIGHT else None)
+                            if embed_light else None)
                     res = export_part_uv(part, sess, p["label"], tag=front_tag, label=lab,
                                          depth_range=p["depth_range"], light_map=lmap)
                     if res is None:
                         yield prog(f"UV front: {p['label']} / {lab} (empty)")
                         continue
-                    path, out, cov, cW, cH = res
+                    path, out, cov, light, cW, cH = res
                     results[p["label"]]["uv"][part.name] = path
                     if COMPOSITE_BASE_LAYER:
                         for v in variant_names:
@@ -1275,22 +1297,30 @@ def _render_steps(players, op=None):
                             c = comps.get(v)
                             if c is None:
                                 c = [np.zeros((cW * cH, 4), dtype='float32'),
-                                     np.full(cW * cH, np.inf, dtype='float32')]
+                                     np.full(cW * cH, np.inf, dtype='float32'),
+                                     (np.zeros((cW * cH, 3), dtype='float32')
+                                      if embed_light else None)]
                                 comps[v] = c
-                            comp, zbuf = c
+                            comp, zbuf, clight = c
                             d = np.where(cov, out[:, 2], np.inf)   # nearest (0=near) wins
                             win = d < zbuf
                             comp[win] = out[win]
                             zbuf[win] = d[win]
+                            if clight is not None and light is not None:
+                                clight[win] = light[win]
                     yield prog(f"UV front: {p['label']} / {lab}")
                 if COMPOSITE_BASE_LAYER:
                     for v in variant_names:
                         c = comps.get(v)
                         if c is None:
                             continue
+                        comp, zbuf, clight = c
                         cpath = os.path.join(_abs(OUT_DIR), p["label"],
                                              COMPOSITE_OUTPUT_NAME.format(variant=v) + UV_EXT)
-                        _save_image(c[0].reshape(-1), cW, cH, cpath, file_format=UV_FORMAT)
+                        if clight is not None:
+                            _save_exr_uvdl(comp, clight, cW, cH, cpath)
+                        else:
+                            _save_image(comp.reshape(-1), cW, cH, cpath, file_format=UV_FORMAT)
                         results[p["label"]].setdefault("composite", {})[v] = cpath
                         yield prog(f"Composite base_layer ({v}): {p['label']}")
         finally:
@@ -1375,9 +1405,6 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         name="EXR Codec",
         items=[(c, c, "") for c in ('ZIP', 'ZIPS', 'PIZ', 'PXR24', 'RLE', 'NONE', 'DWAA', 'DWAB')],
         default='ZIP')
-    uv_alpha_light: BoolProperty(
-        name="Pack light in UV alpha", default=False,
-        description="A=light (_UVDL). Off keeps A=1 (safe for 2D-canvas readers)")
     export_backface_uv: BoolProperty(name="Back-face UVs", default=True)
     export_player_illum_shadow: BoolProperty(name="Illum + shadow", default=True)
     composite_base_layer: BoolProperty(name="base_layer composite", default=True)
@@ -1403,7 +1430,6 @@ def _apply_settings(scene):
     g["PNG_BIT_DEPTH"] = int(st.png_bit_depth)
     g["EXR_HALF"] = st.exr_half
     g["EXR_CODEC"] = st.exr_codec
-    g["UV_ALPHA_LIGHT"] = st.uv_alpha_light
     g["EXPORT_BACKFACE_UV"] = st.export_backface_uv
     g["EXPORT_PLAYER_ILLUM_SHADOW"] = st.export_player_illum_shadow
     g["COMPOSITE_BASE_LAYER"] = st.composite_base_layer
@@ -1557,9 +1583,9 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             row = box.row(align=True)
             row.prop(st, "exr_half", toggle=True)
             row.prop(st, "exr_codec", text="")
+            box.label(text="+ light layer (when illum on)", icon='LIGHT')
         else:
             box.prop(st, "png_bit_depth")
-        box.prop(st, "uv_alpha_light")
 
         box = layout.box()
         box.label(text="Layers", icon='RENDERLAYERS')

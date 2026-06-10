@@ -134,8 +134,7 @@ Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key o
 | `FIX_2LAYER_POSITION` / `HAT_SCALE_RATIO` | Snap the hat (`2_Layer_Extrusion`) onto `NoFace_Head` and scale it to the Minecraft hat size (`1.125`× the head) before export (persistent) |
 | `ILLUM_SAMPLES` / `ILLUM_COLORSPACE` | Illum quality/encoding |
 | `PNG_BIT_DEPTH` | Bit depth of UV/mask PNGs (default `8`; 256 levels, enough for MC skins) |
-| `UV_ALPHA_LIGHT` | Pack illum lightness into the UV's alpha (`_UVDL.png`). **Default `False`** — see note below |
-| `UV_FORMAT` / `EXR_HALF` / `EXR_CODEC` | UV + base_layer format: `PNG` (default) or `OPEN_EXR` (half-float, `ZIP` ≈ PNG size, lossless; see note) |
+| `UV_FORMAT` / `EXR_HALF` / `EXR_CODEC` | UV + base_layer format: `PNG` (default) or `OPEN_EXR` (half-float, `ZIP` ≈ PNG size, lossless). As EXR + illum, the RGB light is embedded as an extra `light.*` layer — see note |
 | `COMPOSITE_BASE_LAYER` / `COMPOSITE_BASE_LABELS` | Composite base parts into `base_layer.png` (nearest pixel wins) |
 | `LIGHTSHADOW_FORMAT` / `JPEG_QUALITY` | Illum + shadow file format (default `JPEG`, quality `90`) |
 | `RIG_ID_PROP` / `RIG_ID_VALUE` | How players are detected |
@@ -151,19 +150,20 @@ disable and keep raw object names, set `RENAME_UV_PARTS = False`.
 
 ### Reading the UV alpha (light): mind premultiplied alpha
 
-By **default `UV_ALPHA_LIGHT=False`**, so the UV alpha is a constant `1` and the file is
-`<part>_UV.png` — safe to read anywhere, including an HTML 2D canvas. Take the light from
-the separate `illum_*.jpg`.
+**PNG** files are `<part>_UV.png` with RGBA = (U, V, depth, coverage) — alpha is `0`/`1`
+(coverage), so they read fine anywhere, including an HTML 2D canvas. The light is the
+separate `illum_*.jpg`.
 
-If you turn `UV_ALPHA_LIGHT=True` (light packed in alpha, `<part>_UVDL.png`), **do not read
-it through a 2D canvas** (`drawImage` + `getImageData`): the canvas stores premultiplied
-alpha and un-premultiplies on read, which **corrupts U/V wherever the light is dark**. Then
-either:
-- upload the `ImageBitmap` straight to the GPU unpremultiplied (WebGL
-  `UNPACK_PREMULTIPLY_ALPHA_WEBGL=false`; Three.js texture from the bitmap, no `getImageData`), or
-- set `UV_FORMAT='OPEN_EXR'` — float, straight alpha, no quantization. With `EXR_HALF=True`
-  + `EXR_CODEC='ZIP'` it is lossless and ≈ PNG file size (~90 KB at 1080p), but needs a float
-  EXR loader (e.g. Three.js `EXRLoader`) since browsers can't decode EXR via canvas.
+**EXR** files (`UV_FORMAT='OPEN_EXR'`) keep the same RGBA = (U, V, depth, coverage) and,
+when the illum pass is on, embed the **RGB light** as an extra `light.*` channel layer
+(`light.R/G/B`, sRGB) → `<part>_UVDL.exr`. Read with a float EXR loader (e.g. Three.js
+`EXRLoader`) — the default RGBA gives U/V/depth/coverage exactly like the PNG; read the
+`light` layer for the color light. With `EXR_HALF=True` + `EXR_CODEC='ZIP'` it is lossless
+and ≈ PNG file size (~110 KB at 1080p for the 7 channels). Browsers can't decode EXR via a
+2D canvas, so this also sidesteps the canvas premultiply gotcha entirely.
+
+> Light is never packed into a PNG alpha: a variable alpha gets corrupted by the 2D-canvas
+> premultiply round-trip (it un-premultiplies on read, mangling U/V where the light is dark).
 
 > This script is specific to the **Thomas_Rig_Legacy** rig. Other rigs would require
 > adjusting `RIG_ID_VALUE`, `SLIM_CONTROL`, `SELECTION_FORCE_OFF`, `MESH_COLLECTION_PREFIX`,
