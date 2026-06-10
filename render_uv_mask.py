@@ -170,10 +170,16 @@ MC_PART_MAP = {
 }
 
 # Output formats / bit depth.
-# UV + mask are saved as PNG. 8-bit (256 levels) is enough for Minecraft skins (64x64 and
-# even HD 256x256); the depth packed in the UV's B channel only needs to RANK parts within
-# a single player, so 256 levels are plenty. Set to 16 for full-precision PNGs.
+# Mask is saved as PNG. 8-bit (256 levels) is enough for Minecraft skins (64x64 and even
+# HD 256x256); the depth packed in the UV's B channel only needs to RANK parts within a
+# single player, so 256 levels are plenty. Set to 16 for full-precision PNGs.
 PNG_BIT_DEPTH = 8                  # 8 or 16
+# UV + base_layer format: 'PNG' (8/16-bit) or 'OPEN_EXR' (float). EXR avoids the 2D-canvas
+# premultiply problem (when alpha carries the light) AND removes 8-bit quantization, but the
+# files are bigger and need a float EXR loader to read (browsers can't decode EXR via canvas).
+UV_FORMAT = 'PNG'                  # 'PNG' or 'OPEN_EXR'
+EXR_HALF = True                    # half-float (16-bit) EXR -> smaller; else 32-bit float
+UV_EXT = '.exr' if UV_FORMAT == 'OPEN_EXR' else '.png'
 # Illum (light) + shadow do not need PNG; JPEG keeps the files much smaller.
 LIGHTSHADOW_FORMAT = 'JPEG'        # 'JPEG' or 'PNG'
 JPEG_QUALITY = 90                  # 0..100 (JPEG only)
@@ -190,7 +196,7 @@ UV_ALPHA_LIGHT = True
 # parts share the Minecraft skin UV space, so this maps each screen pixel -> skin UV +
 # depth + light. "{variant}" is replaced by each MASK_ARM_VARIANTS name (classic/slim).
 COMPOSITE_BASE_LAYER = True
-COMPOSITE_OUTPUT_NAME = "base_layer_{variant}.png"
+COMPOSITE_OUTPUT_NAME = "base_layer_{variant}"   # extension added from UV_EXT
 COMPOSITE_BASE_LABELS = ["head", "body",
                          "arm_left_{variant}", "arm_right_{variant}",
                          "leg_left", "leg_right"]
@@ -480,16 +486,21 @@ def _save_image(arr_flat, W, H, path, colorspace='Non-Color',
     applied; the colorspace controls encoding: 'Non-Color' = raw linear values (UV/Depth/
     shadow), 'sRGB' = sRGB curve on encode (illum -> display look).
     PNG honors bit_depth (default PNG_BIT_DEPTH; 8 or 16). JPEG is always 8-bit and drops
-    the alpha channel; quality defaults to JPEG_QUALITY."""
+    the alpha channel; quality defaults to JPEG_QUALITY. OPEN_EXR is float (half if
+    EXR_HALF) and preserves the exact values -- no premultiply/quantization."""
     if bit_depth is None:
         bit_depth = PNG_BIT_DEPTH
-    use_float = (file_format == 'PNG' and bit_depth >= 16)  # float buffer -> 16-bit PNG
+    # float buffer -> 16-bit PNG / float EXR
+    use_float = (file_format == 'OPEN_EXR') or (file_format == 'PNG' and bit_depth >= 16)
     img = bpy.data.images.new("__tmp_save__", W, H, alpha=True, float_buffer=use_float)
     img.colorspace_settings.name = colorspace
     img.pixels.foreach_set(arr_flat)
     img.filepath_raw = path
     img.file_format = file_format
-    if file_format == 'JPEG':
+    if file_format == 'OPEN_EXR':
+        img.use_half_precision = EXR_HALF
+        img.save()
+    elif file_format == 'JPEG':
         img.save(quality=JPEG_QUALITY if quality is None else quality)
     else:
         img.save()
@@ -720,8 +731,8 @@ def export_part_uv(part, sess, out_subdir, tag="_UV", depth_range=None, label=No
         a = np.zeros(out.shape[0], dtype='float32')
         a[cov] = np.clip(light_map[cov], 0.0, 1.0)
         out[:, 3] = a
-    path = os.path.join(_abs(OUT_DIR), out_subdir, stem + tag + ".png")
-    _save_image(out.reshape(-1), W, H, path)
+    path = os.path.join(_abs(OUT_DIR), out_subdir, stem + tag + UV_EXT)
+    _save_image(out.reshape(-1), W, H, path, file_format=UV_FORMAT)
     return path, out, cov, W, H
 
 
@@ -1051,12 +1062,14 @@ def _write_manifest(players, out_path):
             "export_backface_uv": EXPORT_BACKFACE_UV,
             "uv_file_suffix": ("_UVDL" if (UV_ALPHA_LIGHT and EXPORT_PLAYER_ILLUM_SHADOW)
                                else "_UV"),
+            "uv_format": UV_FORMAT,
+            "uv_ext": UV_EXT,
             "uv_channels": (
                 ("R=U, G=V, B=depth(0=near,1=far) normalized per character"
                  if UV_DEPTH_IN_BLUE else "R=U, G=V, B=1.0")
                 + (", A=light (sRGB lightness)"
                    if (UV_ALPHA_LIGHT and EXPORT_PLAYER_ILLUM_SHADOW) else ", A=1.0")),
-            "base_layer": ([COMPOSITE_OUTPUT_NAME.format(variant=v)
+            "base_layer": ([COMPOSITE_OUTPUT_NAME.format(variant=v) + UV_EXT
                             for v, _ in MASK_ARM_VARIANTS] if COMPOSITE_BASE_LAYER else None),
             "base_layer_parts": (COMPOSITE_BASE_LABELS if COMPOSITE_BASE_LAYER else None),
             "png_bit_depth": PNG_BIT_DEPTH,
@@ -1082,7 +1095,7 @@ def _write_manifest(players, out_path):
                 "uv_parts": {lab: obj for obj, lab in
                              sorted((p.get("uv_labels") or {o.name: o.name for o in p["uv_parts"]}).items(),
                                     key=lambda kv: kv[1])},
-                "base_layer": ([COMPOSITE_OUTPUT_NAME.format(variant=v)
+                "base_layer": ([COMPOSITE_OUTPUT_NAME.format(variant=v) + UV_EXT
                                 for v, _ in MASK_ARM_VARIANTS] if COMPOSITE_BASE_LAYER else None),
                 "masks": [v for v, _ in MASK_ARM_VARIANTS],
             }
@@ -1237,8 +1250,8 @@ def _render_steps(players, op=None):
                         if c is None:
                             continue
                         cpath = os.path.join(_abs(OUT_DIR), p["label"],
-                                             COMPOSITE_OUTPUT_NAME.format(variant=v))
-                        _save_image(c[0].reshape(-1), cW, cH, cpath)
+                                             COMPOSITE_OUTPUT_NAME.format(variant=v) + UV_EXT)
+                        _save_image(c[0].reshape(-1), cW, cH, cpath, file_format=UV_FORMAT)
                         results[p["label"]].setdefault("composite", {})[v] = cpath
                         yield prog(f"Composite base_layer ({v}): {p['label']}")
         finally:

@@ -127,6 +127,7 @@ Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key o
 | `ILLUM_SAMPLES` / `ILLUM_COLORSPACE` | Illum quality/encoding |
 | `PNG_BIT_DEPTH` | Bit depth of UV/mask PNGs (default `8`; 256 levels, enough for MC skins) |
 | `UV_ALPHA_LIGHT` | Pack illum lightness into the UV's alpha (`_UVDL.png`); needs the illum pass |
+| `UV_FORMAT` / `EXR_HALF` | UV + base_layer format: `PNG` (default) or `OPEN_EXR` (float; see note below) |
 | `COMPOSITE_BASE_LAYER` / `COMPOSITE_BASE_LABELS` | Composite base parts into `base_layer.png` (nearest pixel wins) |
 | `LIGHTSHADOW_FORMAT` / `JPEG_QUALITY` | Illum + shadow file format (default `JPEG`, quality `90`) |
 | `RIG_ID_PROP` / `RIG_ID_VALUE` | How players are detected |
@@ -139,6 +140,18 @@ UV part filenames use Minecraft-style labels: `head`, `hat`, `body`, `jacket`,
 Unmapped meshes fall back to a sanitized object name, and duplicate labels get a `_2`/`_3`
 suffix. The mapping (label → object name) is recorded in `manifest.json` per player. To
 disable and keep raw object names, set `RENAME_UV_PARTS = False`.
+
+### Reading the UV alpha (light): mind premultiplied alpha
+
+`<part>_UVDL.png` packs the light in the alpha channel. If you read it through an HTML
+**2D canvas** (`drawImage` + `getImageData`), the canvas stores premultiplied alpha and
+un-premultiplies on read — which **corrupts U/V wherever the light (alpha) is dark**
+(8-bit, so the lost precision is gone). Avoid it by either:
+- uploading the `ImageBitmap` straight to the GPU unpremultiplied (WebGL
+  `UNPACK_PREMULTIPLY_ALPHA_WEBGL=false`; Three.js texture from the bitmap, no `getImageData`), or
+- setting `UV_ALPHA_LIGHT=False` (alpha=1, lossless) and taking the light from `illum_*.jpg`, or
+- setting `UV_FORMAT='OPEN_EXR'` — float, straight alpha, no quantization (bigger files; needs
+  a float EXR loader, e.g. Three.js `EXRLoader`, since browsers can't decode EXR via canvas).
 
 > This script is specific to the **Thomas_Rig_Legacy** rig. Other rigs would require
 > adjusting `RIG_ID_VALUE`, `SLIM_CONTROL`, `SELECTION_FORCE_OFF`, `MESH_COLLECTION_PREFIX`,
