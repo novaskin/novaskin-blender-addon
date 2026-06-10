@@ -207,7 +207,7 @@ COMPOSITE_BASE_LABELS = ["head", "body",
                          "leg_left", "leg_right"]
 
 # Web wallpaper tool (the panel has a button that opens this URL in the browser).
-WALLPAPER_TOOL_URL = "http://minecraft.novaskin.me/wallpapers/tools/blender/"
+WALLPAPER_TOOL_URL = "https://minecraft.novaskin.me/wallpapers/tools/blender/"
 # ------------------------------------------------------------------
 
 
