@@ -133,7 +133,7 @@ Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key o
 | Key | Purpose |
 |---|---|
 | `OUT_DIR` | Output folder (default `//novaskin/`) |
-| `PLAYER_FOLDER_SCHEME` | Per-player subfolder name: `index` (`player1`, `player2`, …) or `armature` (object name). The manifest records both + a `visible_bbox` (top-left px + normalized) of each player's rendered silhouette |
+| `PLAYER_FOLDER_SCHEME` | Per-player subfolder name: `index` (`player1`, `player2`, …) or `armature` (object name). The manifest records both, a player `visible_bbox`, and `part_bboxes` (per-part bbox) — all top-left px + normalized |
 | `MASK_ARM_VARIANTS` | Arm variants exported (`classic`/`slim`) |
 | `UV_DEPTH_IN_BLUE` | Write normalized depth into the UV's B channel |
 | `EXPORT_BACKFACE_UV` | Also export the back-face UVs |

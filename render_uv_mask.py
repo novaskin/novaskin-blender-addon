@@ -965,17 +965,7 @@ def export_character_mask_variant(player, vname, vval, sess, all_players=None):
         path = os.path.join(_abs(OUT_DIR), player["label"],
                             f"mask_{vname}.png")
         _save_image(out.reshape(-1), W, H, path)
-        # bbox of the visible silhouette, in TOP-LEFT pixel coords (the saved PNG is
-        # top-left; the Viewer array is bottom-left, so flip the rows).
-        mm = m.reshape(H, W)
-        ys, xs = np.nonzero(mm >= 0.5)
-        if xs.size:
-            x0, x1 = int(xs.min()), int(xs.max())
-            rb0, rb1 = int(ys.min()), int(ys.max())
-            bbox = (x0, H - 1 - rb1, x1, H - 1 - rb0)   # (x0, y0, x1, y1) inclusive
-        else:
-            bbox = None
-        return path, bbox, W, H
+        return path, _topleft_bbox(m >= 0.5, W, H), W, H
     finally:
         for d in muted:
             d.mute = False
@@ -1308,6 +1298,17 @@ def _player_camera_depth(player):
     return float(-(inv @ centroid).z)   # camera depth (larger = further back)
 
 
+def _topleft_bbox(flat_mask, W, H):
+    """Bbox (x0,y0,x1,y1 inclusive, TOP-LEFT pixels, matching the saved PNG) of the True
+    pixels in a flat bottom-left mask (the Viewer array is bottom-left). None if empty."""
+    ys, xs = np.nonzero(np.asarray(flat_mask).reshape(H, W))
+    if not xs.size:
+        return None
+    x0, x1 = int(xs.min()), int(xs.max())
+    rb0, rb1 = int(ys.min()), int(ys.max())
+    return (x0, H - 1 - rb1, x1, H - 1 - rb0)
+
+
 def _bbox_dict(bbox, size):
     """Format an inclusive top-left pixel bbox (x0,y0,x1,y1) + (W,H) for the manifest:
     pixels {x,y,w,h} and normalized {x,y,w,h} (0..1), origin top-left. None if no bbox."""
@@ -1381,6 +1382,8 @@ def _write_manifest(players, out_path):
                 "uv_parts": {lab: obj for obj, lab in
                              sorted((p.get("uv_labels") or {o.name: o.name for o in p["uv_parts"]}).items(),
                                     key=lambda kv: kv[1])},
+                "part_bboxes": {lab: _bbox_dict(bb, p.get("render_size"))
+                                for lab, bb in sorted((p.get("part_bboxes") or {}).items())},
                 "base_layer": ([COMPOSITE_OUTPUT_NAME.format(variant=v) + UV_EXT
                                 for v, _ in MASK_ARM_VARIANTS] if COMPOSITE_BASE_LAYER else None),
                 "masks": [v for v, _ in MASK_ARM_VARIANTS],
@@ -1527,6 +1530,8 @@ def _render_steps(players, op=None):
                         continue
                     path, out, cov, light, cW, cH = res
                     results[p["label"]]["uv"][part.name] = path
+                    p.setdefault("part_bboxes", {})[lab] = _topleft_bbox(cov, cW, cH)
+                    p["render_size"] = (cW, cH)
                     if COMPOSITE_BASE_LAYER:
                         for v in variant_names:
                             if lab not in base_sets[v]:
