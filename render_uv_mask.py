@@ -1600,6 +1600,9 @@ def _apply_settings(scene):
 # ----------------------- Operator + menu + panel -----------------------
 # Live progress for the panel (updated by the modal operator, read by the panel draw).
 _PROGRESS = {"running": False, "frac": 0.0, "msg": ""}
+# Key in bpy.app.driver_namespace (survives script reloads) holding the running modal
+# operator, so unregister()/reload can restore the scene if a batch is mid-render.
+_ACTIVE_KEY = "_novaskin_active_op"
 
 
 def _set_progress_header(text):
@@ -1647,6 +1650,7 @@ class RENDER_OT_novaskin(bpy.types.Operator):
         self._timer = self._wm.event_timer_add(0.001, window=context.window)
         self._wm.modal_handler_add(self)
         _PROGRESS.update(running=True, frac=0.0, msg="starting...")
+        bpy.app.driver_namespace[_ACTIVE_KEY] = self   # for teardown on reload/unregister
         context.workspace.status_text_set("NovaSkin: starting... (Esc to cancel)")
         _set_progress_header("NovaSkin: starting... (Esc to cancel)")
         return {'RUNNING_MODAL'}
@@ -1672,11 +1676,17 @@ class RENDER_OT_novaskin(bpy.types.Operator):
             return {'RUNNING_MODAL'}
         return {'PASS_THROUGH'}
 
+    def cancel(self, context):
+        # Blender ends the modal by itself (file load, area close, add-on reload...). Restore.
+        self._finish(context, cancelled=True)
+
     def _finish(self, context, cancelled):
+        bpy.app.driver_namespace.pop(_ACTIVE_KEY, None)
+        wm = getattr(self, "_wm", None) or context.window_manager
         if getattr(self, "_timer", None) is not None:
-            self._wm.event_timer_remove(self._timer)
+            wm.event_timer_remove(self._timer)
             self._timer = None
-        self._wm.progress_end()
+        wm.progress_end()
         _PROGRESS.update(running=False, frac=0.0, msg="")
         context.workspace.status_text_set(None)
         _set_progress_header(None)
@@ -1764,6 +1774,20 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 _classes = (NovaSkinSettings, RENDER_OT_novaskin, VIEW3D_PT_novaskin)
 
 
+def _teardown_active_batch():
+    """If a modal batch is mid-render, finish it (restoring the scene) before unregistering
+    -- otherwise a reload would orphan the modal operator and leave the scene with the temp
+    materials/visibility/render settings. Stored in driver_namespace, so it survives reloads."""
+    op = bpy.app.driver_namespace.pop(_ACTIVE_KEY, None)
+    if op is None:
+        return
+    try:
+        print("NovaSkin: a batch was running -- restoring the scene before reload.")
+        op._finish(bpy.context, cancelled=True)
+    except Exception as e:
+        print("NovaSkin: teardown on unregister failed:", repr(e))
+
+
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
@@ -1772,6 +1796,7 @@ def register():
 
 
 def unregister():
+    _teardown_active_batch()
     bpy.types.TOPBAR_MT_render.remove(_menu_draw)
     if hasattr(bpy.types.Scene, "novaskin"):
         del bpy.types.Scene.novaskin
