@@ -1,0 +1,30 @@
+name: Build add-on zip
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build extension zip
+        run: python3 build_addon.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: novaskin_export-zip
+          path: dist/*.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip

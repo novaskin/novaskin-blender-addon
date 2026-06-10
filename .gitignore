@@ -1,7 +1,19 @@
-# Track only the NovaSkin add-on sources; ignore everything else (incl. dist/).
-*
-!.gitignore
-!render_uv_mask.py
-!README.md
-!blender_manifest.toml
-!build_addon.py
+# Build output
+/dist/
+
+# Python
+__pycache__/
+*.pyc
+
+# Blender / rig assets (not part of the add-on)
+*.blend
+*.blend1
+*.blend2
+/textures/
+
+# Render outputs
+/novaskin/
+/render/
+
+# macOS
+.DS_Store
