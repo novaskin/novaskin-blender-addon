@@ -179,6 +179,7 @@ PNG_BIT_DEPTH = 8                  # 8 or 16
 # files are bigger and need a float EXR loader to read (browsers can't decode EXR via canvas).
 UV_FORMAT = 'PNG'                  # 'PNG' or 'OPEN_EXR'
 EXR_HALF = True                    # half-float (16-bit) EXR -> smaller; else 32-bit float
+EXR_CODEC = 'ZIP'                  # lossless: ZIP/ZIPS/PIZ/PXR24/RLE/NONE; lossy: DWAA/DWAB/B44A
 UV_EXT = '.exr' if UV_FORMAT == 'OPEN_EXR' else '.png'
 # Illum (light) + shadow do not need PNG; JPEG keeps the files much smaller.
 LIGHTSHADOW_FORMAT = 'JPEG'        # 'JPEG' or 'PNG'
@@ -186,10 +187,11 @@ JPEG_QUALITY = 90                  # 0..100 (JPEG only)
 LIGHTSHADOW_EXT = '.jpg' if LIGHTSHADOW_FORMAT == 'JPEG' else '.png'
 
 # Pack a single "lightness" channel (luminance of the illum pass, sRGB-encoded) into the
-# UV file's alpha channel (otherwise unused). The per-part file then carries
-# (R=U, G=V, B=depth, A=light) and is named "<part>_UVDL.png". The illum is rendered first
-# to provide the light; requires EXPORT_PLAYER_ILLUM_SHADOW. Off -> "<part>_UV.png", A=1.
-UV_ALPHA_LIGHT = True
+# UV file's alpha channel (otherwise unused) -> "<part>_UVDL.png" (R=U, G=V, B=depth, A=light).
+# OFF by default (A=1, "<part>_UV.png"): a variable alpha gets CORRUPTED if the consumer reads
+# the PNG through an HTML 2D canvas (premultiply round-trip mangles U/V where the light is
+# dark). Turn ON only if you read straight-alpha (GPU/EXR loader). Light is also in illum_*.
+UV_ALPHA_LIGHT = False
 
 # After a player's parts are exported, composite the BASE layers (no overlays, no back
 # faces) into one UVDL image PER arm variant, nearest pixel (smallest depth) winning. All
@@ -498,8 +500,27 @@ def _save_image(arr_flat, W, H, path, colorspace='Non-Color',
     img.filepath_raw = path
     img.file_format = file_format
     if file_format == 'OPEN_EXR':
-        img.use_half_precision = EXR_HALF
-        img.save()
+        # img.save() writes uncompressed 32-bit EXR (huge); use save_render to control the
+        # codec + half precision. color_management OVERRIDE + 'Raw' view writes raw values.
+        sc = bpy.context.scene
+        ims = sc.render.image_settings
+        snap = (ims.file_format, ims.color_depth, ims.exr_codec, ims.color_management)
+        vt = None
+        try:
+            ims.file_format = 'OPEN_EXR'
+            ims.color_depth = '16' if EXR_HALF else '32'
+            ims.exr_codec = EXR_CODEC
+            ims.color_management = 'OVERRIDE'
+            vt = ims.view_settings.view_transform
+            ims.view_settings.view_transform = 'Raw'
+            img.save_render(path, scene=sc)
+        finally:
+            ims.file_format, ims.color_depth, ims.exr_codec, ims.color_management = snap
+            if vt is not None:
+                try:
+                    ims.view_settings.view_transform = vt
+                except Exception:
+                    pass
     elif file_format == 'JPEG':
         img.save(quality=JPEG_QUALITY if quality is None else quality)
     else:

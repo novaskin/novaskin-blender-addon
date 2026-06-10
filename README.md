@@ -95,9 +95,10 @@ materials), even on cancel or error.
 ```
 <.blend dir>/novaskin/
 ├── <armature>/                      # one per player (e.g. Thomas_rig, Thomas_rig.001, ...)
-│   ├── <part>_UVDL.png              # R=U, G=V, B=depth, A=light; <part> = MC label; 8-bit
-│   ├── <part>_UV_back.png           # back faces (R=U, G=V, B=depth; no light)
-│   ├── base_layer_classic.png       # base parts composited per variant (nearest wins), UVDL
+│   ├── <part>_UV.png                # R=U, G=V, B=depth, A=1; <part> = MC label; 8-bit
+│   │                                #   (A=light, "<part>_UVDL.png", if UV_ALPHA_LIGHT=True)
+│   ├── <part>_UV_back.png           # back faces (R=U, G=V, B=depth)
+│   ├── base_layer_classic.png       # base parts composited per variant (nearest wins)
 │   ├── base_layer_slim.png
 │   ├── ...
 │   ├── mask_classic.png    # 8-bit PNG
@@ -126,8 +127,8 @@ Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key o
 | `FIX_2LAYER_POSITION` | Snap the head's outer layer (`2_Layer_Extrusion`), parked above the head by default, back onto `NoFace_Head` before export (position only; persistent) |
 | `ILLUM_SAMPLES` / `ILLUM_COLORSPACE` | Illum quality/encoding |
 | `PNG_BIT_DEPTH` | Bit depth of UV/mask PNGs (default `8`; 256 levels, enough for MC skins) |
-| `UV_ALPHA_LIGHT` | Pack illum lightness into the UV's alpha (`_UVDL.png`); needs the illum pass |
-| `UV_FORMAT` / `EXR_HALF` | UV + base_layer format: `PNG` (default) or `OPEN_EXR` (float; see note below) |
+| `UV_ALPHA_LIGHT` | Pack illum lightness into the UV's alpha (`_UVDL.png`). **Default `False`** — see note below |
+| `UV_FORMAT` / `EXR_HALF` / `EXR_CODEC` | UV + base_layer format: `PNG` (default) or `OPEN_EXR` (half-float, `ZIP` ≈ PNG size, lossless; see note) |
 | `COMPOSITE_BASE_LAYER` / `COMPOSITE_BASE_LABELS` | Composite base parts into `base_layer.png` (nearest pixel wins) |
 | `LIGHTSHADOW_FORMAT` / `JPEG_QUALITY` | Illum + shadow file format (default `JPEG`, quality `90`) |
 | `RIG_ID_PROP` / `RIG_ID_VALUE` | How players are detected |
@@ -143,15 +144,19 @@ disable and keep raw object names, set `RENAME_UV_PARTS = False`.
 
 ### Reading the UV alpha (light): mind premultiplied alpha
 
-`<part>_UVDL.png` packs the light in the alpha channel. If you read it through an HTML
-**2D canvas** (`drawImage` + `getImageData`), the canvas stores premultiplied alpha and
-un-premultiplies on read — which **corrupts U/V wherever the light (alpha) is dark**
-(8-bit, so the lost precision is gone). Avoid it by either:
-- uploading the `ImageBitmap` straight to the GPU unpremultiplied (WebGL
+By **default `UV_ALPHA_LIGHT=False`**, so the UV alpha is a constant `1` and the file is
+`<part>_UV.png` — safe to read anywhere, including an HTML 2D canvas. Take the light from
+the separate `illum_*.jpg`.
+
+If you turn `UV_ALPHA_LIGHT=True` (light packed in alpha, `<part>_UVDL.png`), **do not read
+it through a 2D canvas** (`drawImage` + `getImageData`): the canvas stores premultiplied
+alpha and un-premultiplies on read, which **corrupts U/V wherever the light is dark**. Then
+either:
+- upload the `ImageBitmap` straight to the GPU unpremultiplied (WebGL
   `UNPACK_PREMULTIPLY_ALPHA_WEBGL=false`; Three.js texture from the bitmap, no `getImageData`), or
-- setting `UV_ALPHA_LIGHT=False` (alpha=1, lossless) and taking the light from `illum_*.jpg`, or
-- setting `UV_FORMAT='OPEN_EXR'` — float, straight alpha, no quantization (bigger files; needs
-  a float EXR loader, e.g. Three.js `EXRLoader`, since browsers can't decode EXR via canvas).
+- set `UV_FORMAT='OPEN_EXR'` — float, straight alpha, no quantization. With `EXR_HALF=True`
+  + `EXR_CODEC='ZIP'` it is lossless and ≈ PNG file size (~90 KB at 1080p), but needs a float
+  EXR loader (e.g. Three.js `EXRLoader`) since browsers can't decode EXR via canvas.
 
 > This script is specific to the **Thomas_Rig_Legacy** rig. Other rigs would require
 > adjusting `RIG_ID_VALUE`, `SLIM_CONTROL`, `SELECTION_FORCE_OFF`, `MESH_COLLECTION_PREFIX`,
