@@ -3,7 +3,8 @@
 Outputs (one subfolder per player):
   - <OUT_DIR>/<armature>/<part>_UVDL.png      (PNG, RAW/Non-Color; 8-bit by default)
         R=U, G=V, B=depth(per character), A=light (sRGB lightness from the illum pass).
-        Named "<part>_UV.png" (A=1) if UV_ALPHA_LIGHT / the illum pass is off.
+        Named "<part>_UV.png" with A=coverage (1 inside the part, 0 outside) if
+        UV_ALPHA_LIGHT / the illum pass is off.
         <part> is a Minecraft-style label (head/hat, body/jacket, arm/sleeve, leg/pant,
         with _left/_right and _classic/_slim where relevant). See MC_PART_MAP; the manifest
         records the label -> object-name mapping.
@@ -752,11 +753,14 @@ def export_part_uv(part, sess, out_subdir, tag="_UV", depth_range=None, label=No
             b = np.zeros(z.shape, dtype='float32')
             b[cov] = np.clip((z[cov] - zmin) / (zmax - zmin), 0.0, 1.0)
             out[:, 2] = b                 # B = normalized depth (0=near, 1=far)
-    # A = light: lightness sampled from the illum, only on covered pixels (else 0).
+    # A = coverage (1 inside the part, 0 outside) -- or the light, packed only on covered
+    # pixels, when UV_ALPHA_LIGHT is on. Either way uncovered pixels get alpha 0.
     if light_map is not None and light_map.shape[0] == out.shape[0]:
         a = np.zeros(out.shape[0], dtype='float32')
         a[cov] = np.clip(light_map[cov], 0.0, 1.0)
         out[:, 3] = a
+    else:
+        out[:, 3] = cov.astype('float32')   # coverage mask in alpha (0 outside the part)
     path = os.path.join(_abs(OUT_DIR), out_subdir, stem + tag + UV_EXT)
     _save_image(out.reshape(-1), W, H, path, file_format=UV_FORMAT)
     return path, out, cov, W, H
@@ -1094,7 +1098,8 @@ def _write_manifest(players, out_path):
                 ("R=U, G=V, B=depth(0=near,1=far) normalized per character"
                  if UV_DEPTH_IN_BLUE else "R=U, G=V, B=1.0")
                 + (", A=light (sRGB lightness)"
-                   if (UV_ALPHA_LIGHT and EXPORT_PLAYER_ILLUM_SHADOW) else ", A=1.0")),
+                   if (UV_ALPHA_LIGHT and EXPORT_PLAYER_ILLUM_SHADOW)
+                   else ", A=coverage (1 in part, 0 outside)")),
             "base_layer": ([COMPOSITE_OUTPUT_NAME.format(variant=v) + UV_EXT
                             for v, _ in MASK_ARM_VARIANTS] if COMPOSITE_BASE_LAYER else None),
             "base_layer_parts": (COMPOSITE_BASE_LABELS if COMPOSITE_BASE_LAYER else None),

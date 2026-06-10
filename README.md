@@ -101,7 +101,7 @@ materials), even on cancel or error.
 ```
 <.blend dir>/novaskin/
 ├── <armature>/                      # one per player (e.g. Thomas_rig, Thomas_rig.001, ...)
-│   ├── <part>_UV.png                # R=U, G=V, B=depth, A=1; <part> = MC label; 8-bit
+│   ├── <part>_UV.png                # R=U, G=V, B=depth, A=coverage(0 outside); MC label; 8-bit
 │   │                                #   (A=light, "<part>_UVDL.png", if UV_ALPHA_LIGHT=True)
 │   ├── <part>_UV_back.png           # back faces (R=U, G=V, B=depth)
 │   ├── base_layer_classic.png       # base parts composited per variant (nearest wins)
