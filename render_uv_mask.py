@@ -204,6 +204,9 @@ COMPOSITE_OUTPUT_NAME = "base_layer_{variant}"   # extension added from UV_EXT
 COMPOSITE_BASE_LABELS = ["head", "body",
                          "arm_left_{variant}", "arm_right_{variant}",
                          "leg_left", "leg_right"]
+
+# Web wallpaper tool (the panel has a button that opens this URL in the browser).
+WALLPAPER_TOOL_URL = "http://dev.novaskin.me:5174/wallpapers/tools/blender/index.html"
 # ------------------------------------------------------------------
 
 
@@ -1508,6 +1511,10 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         col = layout.column()
         col.scale_y = 1.5
         col.operator("render.novaskin", icon='RENDER_STILL')
+
+        if WALLPAPER_TOOL_URL:
+            layout.operator("wm.url_open", text="Open Wallpaper Tool",
+                            icon='URL').url = WALLPAPER_TOOL_URL
 
         box = layout.box()
         box.label(text="Output", icon='FILE_FOLDER')
