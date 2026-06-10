@@ -89,8 +89,9 @@ Ways to update:
 
 When launched from the panel/menu (modal), the progress shows in three places: a **progress
 bar in the NovaSkin panel** (replacing the run button while it works), the **3D Viewport
-header**, and the **status bar** (`NovaSkin 42% - UV front: Thomas_rig / head`). Press
-**Esc** (mouse in the viewport) to cancel — the scene is restored to its original state.
+header**, and the **status bar** (`NovaSkin 42% - UV front: Thomas_rig / head`). Cancel with
+the **Cancel button** in the panel, or **Esc** (mouse in the viewport) — either way the
+scene is restored to its original state (it takes effect at the next step boundary).
 
 > The UI is responsive **between** steps, but each individual render still blocks briefly
 > while it runs. `bpy` is single-threaded and not thread-safe, so there is no way to render

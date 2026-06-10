@@ -1661,7 +1661,7 @@ def _apply_settings(scene):
 
 # ----------------------- Operator + menu + panel -----------------------
 # Live progress for the panel (updated by the modal operator, read by the panel draw).
-_PROGRESS = {"running": False, "frac": 0.0, "msg": ""}
+_PROGRESS = {"running": False, "frac": 0.0, "msg": "", "cancel": False}
 # Key in bpy.app.driver_namespace (survives script reloads) holding the running modal
 # operator, so unregister()/reload can restore the scene if a batch is mid-render.
 _ACTIVE_KEY = "_novaskin_active_op"
@@ -1711,7 +1711,7 @@ class RENDER_OT_novaskin(bpy.types.Operator):
         self._wm.progress_begin(0.0, 1.0)
         self._timer = self._wm.event_timer_add(0.001, window=context.window)
         self._wm.modal_handler_add(self)
-        _PROGRESS.update(running=True, frac=0.0, msg="starting...")
+        _PROGRESS.update(running=True, frac=0.0, msg="starting...", cancel=False)
         bpy.app.driver_namespace[_ACTIVE_KEY] = self   # for teardown on reload/unregister
         context.workspace.status_text_set("NovaSkin: starting... (Esc to cancel)")
         _set_progress_header("NovaSkin: starting... (Esc to cancel)")
@@ -1721,6 +1721,8 @@ class RENDER_OT_novaskin(bpy.types.Operator):
         if event.type == 'ESC':
             return self._finish(context, cancelled=True)
         if event.type == 'TIMER':
+            if _PROGRESS.get("cancel"):           # Cancel button in the panel
+                return self._finish(context, cancelled=True)
             try:
                 frac, msg = next(self._gen)
             except StopIteration as e:
@@ -1749,7 +1751,7 @@ class RENDER_OT_novaskin(bpy.types.Operator):
             wm.event_timer_remove(self._timer)
             self._timer = None
         wm.progress_end()
-        _PROGRESS.update(running=False, frac=0.0, msg="")
+        _PROGRESS.update(running=False, frac=0.0, msg="", cancel=False)
         context.workspace.status_text_set(None)
         _set_progress_header(None)
         if cancelled and getattr(self, "_gen", None) is not None:
@@ -1766,6 +1768,16 @@ class RENDER_OT_novaskin(bpy.types.Operator):
         # Non-interactive launch (e.g. bpy.ops.render.novaskin() from a script): run the
         # whole batch synchronously and block until done.
         return {'FINISHED'} if render_all(op=self) is not None else {'CANCELLED'}
+
+
+class RENDER_OT_novaskin_cancel(bpy.types.Operator):
+    """Cancel the running NovaSkin export (the scene is restored)"""
+    bl_idname = "render.novaskin_cancel"
+    bl_label = "Cancel NovaSkin export"
+
+    def execute(self, context):
+        _PROGRESS["cancel"] = True   # the modal operator picks this up on its next tick
+        return {'FINISHED'}
 
 
 def _menu_draw(self, context):
@@ -1792,7 +1804,10 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                              text=f"{pct:.0f}%  -  {_PROGRESS['msg']}", type='BAR')
             except (AttributeError, TypeError):   # older Blender without UILayout.progress
                 col.label(text=f"NovaSkin  {pct:.0f}%  -  {_PROGRESS['msg']}")
-            col.label(text="Esc (in the viewport) to cancel", icon='CANCEL')
+            row = col.row()
+            row.scale_y = 1.3
+            row.operator("render.novaskin_cancel", text="Cancel", icon='CANCEL')
+            col.label(text="(or Esc in the viewport)")
         else:
             col = layout.column()
             col.scale_y = 1.5
@@ -1832,7 +1847,8 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         box.prop(st, "fix_2layer_position")
 
 
-_classes = (NovaSkinSettings, RENDER_OT_novaskin, VIEW3D_PT_novaskin)
+_classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_cancel,
+            VIEW3D_PT_novaskin)
 
 
 def _teardown_active_batch():
