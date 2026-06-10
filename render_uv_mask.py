@@ -263,8 +263,9 @@ def _lin_to_srgb(x):
 
 
 def _light_for_label(light_maps, player_label, part_label):
-    """Pick the per-pixel light map for a part: arm parts use their own variant's illum,
-    everything else uses the first variant's. Returns None if no light is available."""
+    """Pick the per-pixel light map for a part: the right arm variant, and the BASE render
+    for base parts (head/body/arm/leg) or the FULL render for overlay parts (hat/jacket/
+    sleeve/pant) -- each lit where its layer is front-most. None if no light is available."""
     if not light_maps:
         return None
     if "classic" in part_label:
@@ -273,7 +274,11 @@ def _light_for_label(light_maps, player_label, part_label):
         vname = "slim"
     else:
         vname = MASK_ARM_VARIANTS[0][0]
-    return light_maps.get((player_label, vname))
+    maps = light_maps.get((player_label, vname))
+    if not maps:
+        return None
+    base_set = {lab.format(variant=vname) for lab in COMPOSITE_BASE_LABELS}
+    return maps.get("base" if part_label in base_set else "full")
 
 
 def _hide_render_drivers():
@@ -1111,18 +1116,17 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                         o.visible_diffuse = False   # pure shadow, but loses self-bounce
                 bpy.context.view_layer.update()
                 try:
-                    print(f"[ILLUM] {p['label']} / {vname}")
-                    comb, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)   # full -> illum
+                    print(f"[ILLUM full] {p['label']} / {vname}")
+                    comb_full, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)  # overlay light + illum image
 
-                    # SHADOW render: base layer only, and the player is INVISIBLE to the
-                    # camera (visible_camera=False) but still casts shadow -- so the shadow
-                    # behind/under the player is captured, not blocked by its own body.
+                    # Hide the overlays (hat/jacket/sleeve/pant): the BASE light and the
+                    # shadow are both for the base layer only.
                     base_set = base_sets[vname]
                     labels = p.get("uv_labels") or {}
                     overlays = [o for o in p["uv_parts"]
                                 if o.name in labels and labels[o.name] not in base_set]
-                    sh_muted, sh_hidden, sh_cam = [], [], {}
-                    for o in overlays:                      # hide overlays (no shadow)
+                    sh_muted, sh_hidden = [], []
+                    for o in overlays:
                         if o.animation_data:
                             for d in o.animation_data.drivers:
                                 if d.data_path == "hide_render" and not d.mute:
@@ -1130,16 +1134,27 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                                     sh_muted.append(d)
                         sh_hidden.append((o, o.hide_render))
                         o.hide_render = True
-                    for o in p["char_all"]:                 # cast shadow, but unseen by camera
-                        sh_cam[o] = o.visible_camera
-                        o.visible_camera = False
                     bpy.context.view_layer.update()
                     try:
-                        print(f"[SHADOW] {p['label']} / {vname} (base only, no-camera)")
-                        comb_sh, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+                        # BASE light: base layer visible -> the base's own lighting even where
+                        # the overlays would occlude it in the full render.
+                        print(f"[ILLUM base] {p['label']} / {vname}")
+                        comb_base, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+
+                        # SHADOW: base layer INVISIBLE to the camera (but still casting), so
+                        # the shadow behind/under the player is captured, not blocked.
+                        sh_cam = {}
+                        for o in p["char_all"]:
+                            sh_cam[o] = o.visible_camera
+                            o.visible_camera = False
+                        bpy.context.view_layer.update()
+                        try:
+                            print(f"[SHADOW] {p['label']} / {vname} (base only, no-camera)")
+                            comb_sh, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+                        finally:
+                            for o, c in sh_cam.items():
+                                o.visible_camera = c
                     finally:
-                        for o, c in sh_cam.items():
-                            o.visible_camera = c
                         for o, hr in sh_hidden:
                             o.hide_render = hr
                         for d in sh_muted:
@@ -1156,8 +1171,8 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                 mask = _load_gray_channel(mpath, W, H)
                 body = (mask > 0.5) if mask is not None else np.zeros(W * H, dtype=bool)
 
-                # illum = lit body (masked by the player's mask) -- unchanged
-                illum = comb.copy()
+                # illum image = the full lit body, masked by the player's silhouette
+                illum = comb_full.copy()
                 illum[~body] = 0.0
                 illum[:, 3] = 1.0
                 _save_image(illum.reshape(-1), W, H,
@@ -1165,10 +1180,14 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                                          f"illum_{vname}{LIGHTSHADOW_EXT}"),
                             colorspace=ILLUM_COLORSPACE, file_format=LIGHTSHADOW_FORMAT)
 
-                # keep the sRGB RGB light map (embedded as a 'light' layer in EXR UVs)
+                # Per-layer light maps (sRGB): base parts use the base-only render, overlay
+                # parts the full render -- each lit where its layer is front-most. cov in
+                # export_part_uv picks each part's own pixels.
                 if light_maps is not None:
-                    light_maps[(p["label"], vname)] = \
-                        _lin_to_srgb(illum[:, :3]).astype('float32')   # (N, 3)
+                    light_maps[(p["label"], vname)] = {
+                        "base": _lin_to_srgb(comb_base[:, :3]).astype('float32'),
+                        "full": _lin_to_srgb(comb_full[:, :3]).astype('float32'),
+                    }
 
                 # shadow = ratio vs the clean scene, from the base-only no-camera render. No
                 # body masking: the body isn't in the render, so the contact shadow under/
