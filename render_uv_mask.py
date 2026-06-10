@@ -280,15 +280,20 @@ def _has_hide_render_driver(o):
         d.data_path == "hide_render" for d in o.animation_data.drivers))
 
 
+def _basename(name):
+    """Object name with the Blender ".NNN" duplicate suffix stripped."""
+    return re.sub(r"\.\d+$", "", name)
+
+
 def _force_player_parts_visible(players):
-    """Clear MANUAL (non-driven) hide_render on the players' meshes so the masks/illum
-    actually render them (some duplicate rigs leave whole parts -- body/legs -- with
-    hide_render=True). Driver-hidden parts (fingers/3x3) are left alone. Must run BEFORE the
-    _Session snapshot so the change sticks across restore_visibility(). Returns the meshes
-    changed, so the caller can put the original hide_render back at the very end."""
+    """Clear MANUAL (non-driven) hide_render on the players' SELECTED parts (uv_parts) so the
+    masks/illum actually render them -- this only touches real export parts that the cross-rig
+    reconciliation added back (body/legs a cancelled render left hidden), never helpers or
+    driver-hidden parts. Must run BEFORE the _Session snapshot so it sticks across
+    restore_visibility(). Returns the meshes changed, to restore at the very end."""
     forced = []
     for p in players:
-        for o in p["char_all"]:
+        for o in p["uv_parts"]:
             if o.hide_render and not _has_hide_render_driver(o):
                 o.hide_render = False
                 forced.append(o)
@@ -332,13 +337,6 @@ def _select_uv_parts(arm, char):
             o.update_tag()
         bpy.context.view_layer.update()
 
-    # A MANUAL (non-driven) hide_render on a real part must NOT exclude it -- only the
-    # driver/prop-based hiding (fingers/3x3) should. Some duplicate rigs leave body/legs
-    # hide_render=True; temporarily clear that so they are selected.
-    manual_hidden = [o for o in meshes if o.hide_render and not _has_hide_render_driver(o)]
-    for o in manual_hidden:
-        o.hide_render = False
-
     # force fingers/3x3 off (preserving the value type)
     saved = {}
     for bn, k in SELECTION_FORCE_OFF:
@@ -369,8 +367,6 @@ def _select_uv_parts(arm, char):
                 pb[k] = v
         if slim_pb is not None and slim_orig is not None:
             slim_pb[slim_key] = slim_orig
-        for o in manual_hidden:
-            o.hide_render = True
         _upd()
     return [o for o in meshes if o.name in visible]
 
@@ -399,6 +395,25 @@ def discover_players():
         uv_parts = _select_uv_parts(arm, char_all)
         players.append({"label": arm.name, "rig_id": arm[RIG_ID_PROP], "arm": arm,
                         "char_all": char_all, "uv_parts": uv_parts})
+
+    # Cross-rig reconciliation: a part visible (in the basic look) on ANY rig is a real
+    # export part on EVERY rig. This adds back parts left MANUALLY hide_render=True (no
+    # driver) on a rig -- e.g. body/legs that a cancelled/interrupted render left hidden --
+    # WITHOUT pulling in helpers (Head_Boolean_Eyes, ...) that are hidden on all rigs, nor
+    # parts genuinely toggled off by a DRIVER (an overlay disabled for that player).
+    canonical = set()
+    for p in players:
+        for o in p["uv_parts"]:
+            canonical.add(_basename(o.name))
+    for p in players:
+        have = {o.name for o in p["uv_parts"]}
+        for o in p["char_all"]:
+            if (o.name not in have and o.type == 'MESH'
+                    and _basename(o.name) in canonical
+                    and o.hide_render and not _has_hide_render_driver(o)):
+                p["uv_parts"].append(o)
+                print(f"[reconcile] {p['label']}: re-added '{o.name}' "
+                      f"(visible on another rig, here left manually hidden)")
     return players
 
 
