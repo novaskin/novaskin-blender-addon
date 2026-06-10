@@ -274,6 +274,31 @@ def _hide_render_drivers():
     return out
 
 
+def _has_hide_render_driver(o):
+    """True if hide_render is controlled by a driver (the rig's visibility logic)."""
+    return bool(o.animation_data and any(
+        d.data_path == "hide_render" for d in o.animation_data.drivers))
+
+
+def _force_player_parts_visible(players):
+    """Clear MANUAL (non-driven) hide_render on the players' meshes so the masks/illum
+    actually render them (some duplicate rigs leave whole parts -- body/legs -- with
+    hide_render=True). Driver-hidden parts (fingers/3x3) are left alone. Must run BEFORE the
+    _Session snapshot so the change sticks across restore_visibility(). Returns the meshes
+    changed, so the caller can put the original hide_render back at the very end."""
+    forced = []
+    for p in players:
+        for o in p["char_all"]:
+            if o.hide_render and not _has_hide_render_driver(o):
+                o.hide_render = False
+                forced.append(o)
+    if forced:
+        bpy.context.view_layer.update()
+        print(f"[VISIBLE] force-rendered {len(forced)} manually-hidden part(s): "
+              f"{[o.name for o in forced]}")
+    return forced
+
+
 def _node(node_type):
     ng = getattr(bpy.context.scene, "compositing_node_group", None)
     if not ng:
@@ -307,6 +332,13 @@ def _select_uv_parts(arm, char):
             o.update_tag()
         bpy.context.view_layer.update()
 
+    # A MANUAL (non-driven) hide_render on a real part must NOT exclude it -- only the
+    # driver/prop-based hiding (fingers/3x3) should. Some duplicate rigs leave body/legs
+    # hide_render=True; temporarily clear that so they are selected.
+    manual_hidden = [o for o in meshes if o.hide_render and not _has_hide_render_driver(o)]
+    for o in manual_hidden:
+        o.hide_render = False
+
     # force fingers/3x3 off (preserving the value type)
     saved = {}
     for bn, k in SELECTION_FORCE_OFF:
@@ -337,6 +369,8 @@ def _select_uv_parts(arm, char):
                 pb[k] = v
         if slim_pb is not None and slim_orig is not None:
             slim_pb[slim_key] = slim_orig
+        for o in manual_hidden:
+            o.hide_render = True
         _upd()
     return [o for o in meshes if o.name in visible]
 
@@ -1198,6 +1232,9 @@ def _render_steps(players, op=None):
     inside try/finally, so closing the generator (modal cancel) still restores the scene."""
     if FIX_2LAYER_POSITION:
         _fix_2layer_positions(players)
+    # Make manually render-hidden parts visible BEFORE the _Session snapshot, so masks/illum
+    # render them; their original hide_render is put back in the finally below.
+    forced_visible = _force_player_parts_visible(players)
     for p in players:
         os.makedirs(os.path.join(_abs(OUT_DIR), p["label"]), exist_ok=True)
 
@@ -1350,6 +1387,8 @@ def _render_steps(players, op=None):
         yield prog("Manifest")
     finally:
         sess.restore()
+        for o in forced_visible:   # put back the original manual hide_render
+            o.hide_render = True
     return results
 
 
