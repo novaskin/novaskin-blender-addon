@@ -170,15 +170,18 @@ EXPORT_BACKGROUND = True
 # export res so it aligns with the shadow maps.)
 BACKGROUND_USE_SCENE_SETTINGS = True
 
-# OPTIONAL LAYERS: scenery objects marked by the user (panel button "Mark Selected as
-# Layer", which toggles the LAYER_ID_PROP custom property) are exported as independent
-# toggleable layers in <OUT_DIR>/layers/: the object rendered alone with a transparent
-# background ("<name>.png", real materials, display-encoded like background.png), the shadow
-# it casts on the scenery ("<name>_shadow.<ext>", display multiply), and -- if
-# EXPORT_LAYER_UV -- its UV + light ("<name>_UV.png" + "<name>_light.<ext>") for generic
-# retexturing. Marked objects are HIDDEN from the background and from the whole player
-# pipeline (masks/illum/shadow), so the player light is independent of the layer toggles
-# (trade-off: a layer's shadow never falls on a player).
+# OPTIONAL LAYERS: scenery marked by the user (panel "Mark Selected as Layer" / "Mark Active
+# Collection", which toggle the LAYER_ID_PROP custom property) are exported as independent
+# toggleable layers in <OUT_DIR>/layers/. The marker can sit on a COLLECTION (all its meshes
+# = one layer), an ARMATURE (the rig's meshes = one layer) or a standalone MESH -- a group's
+# meshes render TOGETHER (self-occluding), so a rigged object is one whole layer. Each group
+# exports: the meshes rendered alone over a transparent background ("<name>.png", real
+# materials, display-encoded like background.png, OCCLUDED by the scenery), the shadow they
+# cast ("<name>_shadow.<ext>", display multiply), and -- single-mesh groups only, if
+# EXPORT_LAYER_UV -- its UV + light ("<name>_UV.png" + "<name>_light.<ext>") for retexturing.
+# Marked meshes are HIDDEN from the background and the whole player pipeline, so the player
+# light is independent of the layer toggles (trade-off: a layer's shadow never falls on a
+# player).
 LAYER_ID_PROP = "novaskin_layer"
 EXPORT_LAYER_UV = True
 
@@ -516,13 +519,57 @@ def discover_players():
     return players
 
 
+def _mesh_rig_armature(o):
+    """The armature a mesh is bound to (parented to, or skinned via an Armature modifier),
+    or None. Used to treat a whole rig as one layer."""
+    if o.parent is not None and o.parent.type == 'ARMATURE':
+        return o.parent
+    for m in o.modifiers:
+        if m.type == 'ARMATURE' and m.object is not None:
+            return m.object
+    return None
+
+
+def _rig_meshes(arm):
+    """Every mesh bound to this armature (child OR skinned) -- the rig's renderable parts."""
+    return [o for o in bpy.context.scene.objects
+            if o.type == 'MESH' and (o.parent == arm
+                                     or any(m.type == 'ARMATURE' and m.object == arm
+                                            for m in o.modifiers))]
+
+
 def discover_layers():
-    """Optional-layer objects = meshes carrying the LAYER_ID_PROP custom property (toggled
-    by the panel's "Mark Selected as Layer" button)."""
-    out = [o for o in bpy.context.scene.objects
-           if o.type == 'MESH' and LAYER_ID_PROP in o.keys()]
-    out.sort(key=lambda o: o.name)
-    return out
+    """Optional layers as GROUPS. Each group is ONE independently-toggleable layer made of
+    1+ meshes, marked with the LAYER_ID_PROP custom property on:
+      - a COLLECTION  -> the group is every mesh in it (recursive);
+      - an ARMATURE   -> the group is the rig's meshes (children + skinned);
+      - a standalone MESH -> the group is just that mesh.
+    A mesh already claimed by a marked collection/armature is not also emitted on its own.
+    Returns a list of {name, object, kind, meshes:[...]} sorted by name."""
+    scene = bpy.context.scene
+    scene_meshes = {o.name for o in scene.objects if o.type == 'MESH'}
+    groups, claimed = [], set()
+
+    def _add(name, source_name, kind, meshes):
+        meshes = [m for m in meshes if m.name in scene_meshes and m.name not in claimed]
+        if meshes:
+            groups.append({"name": _layer_safe_name(name), "object": source_name,
+                           "kind": kind, "meshes": meshes})
+            claimed.update(m.name for m in meshes)
+
+    for coll in bpy.data.collections:               # 1) marked collections
+        if LAYER_ID_PROP in coll.keys():
+            _add(coll.name, coll.name, "collection",
+                 [o for o in coll.all_objects if o.type == 'MESH'])
+    for o in scene.objects:                          # 2) marked armatures (whole rig)
+        if o.type == 'ARMATURE' and LAYER_ID_PROP in o.keys():
+            _add(o.name, o.name, "armature", _rig_meshes(o))
+    for o in scene.objects:                          # 3) standalone marked meshes
+        if o.type == 'MESH' and LAYER_ID_PROP in o.keys():
+            _add(o.name, o.name, "mesh", [o])
+
+    groups.sort(key=lambda g: g["name"])
+    return groups
 
 
 def _layer_safe_name(name):
@@ -543,6 +590,12 @@ def _object_camera_depth(o):
     for corner in ev.bound_box:
         c += mw @ mathutils.Vector(corner)
     return float(-(cam.matrix_world.inverted() @ (c / 8.0)).z)
+
+
+def _group_camera_depth(meshes):
+    """Average camera depth over a group's meshes (None if no camera/empty)."""
+    ds = [d for d in (_object_camera_depth(o) for o in meshes) if d is not None]
+    return sum(ds) / len(ds) if ds else None
 
 
 def _fix_2layer_positions(players):
@@ -1230,29 +1283,33 @@ def _render_background(players, sess):
         sess.restore_visibility()   # unmute drivers + original visibility
 
 
-def _layer_steps(players, layer_objs, sess, prog, layer_infos):
-    """Export each optional-layer object independently into <OUT_DIR>/layers/: beauty over a
+def _layer_steps(players, groups, sess, prog, layer_infos):
+    """Export each optional-layer GROUP independently into <OUT_DIR>/layers/: beauty over a
     transparent background (display-encoded, same look as background.png), the shadow it
-    casts on the scenery, and -- if EXPORT_LAYER_UV -- its UV + light for generic
-    retexturing. Players and the other layers stay hidden (they can be toggled off in the
-    wallpaper, so the layer must be whole with respect to them), but the SCENERY OCCLUDES
-    the layer (it is always behind the composite): in the beauty render the scenery is a
-    HOLDOUT -- it cuts the alpha where it is in front while still lighting/shadowing the
-    object -- and the same occlusion is ANDed into the UV coverage. Only players render
-    unoccluded."""
+    casts on the scenery, and -- for a single-mesh group, if EXPORT_LAYER_UV -- its UV +
+    light for generic retexturing. A group's meshes render TOGETHER (they self-occlude),
+    so a rigged object (armature/collection of meshes) is one whole layer. Players and the
+    OTHER groups stay hidden (they can be toggled off in the wallpaper, so the layer must be
+    whole with respect to them), but the SCENERY OCCLUDES the layer (it is always behind the
+    composite): in the beauty render the scenery is a HOLDOUT -- it cuts the alpha where it
+    is in front while still lighting/shadowing the object -- and the same occlusion is ANDed
+    into the UV coverage. Only players render unoccluded. Multi-mesh groups skip the UV/light
+    retexture (the meshes don't share one UV/texture space)."""
     s = sess.s
     out_dir = os.path.join(_abs(OUT_DIR), "layers")
     os.makedirs(out_dir, exist_ok=True)
     char_names = set(o.name for p in players for o in p["char_all"])
+    layer_mesh_names = set(m.name for g in groups for m in g["meshes"])
 
-    def _isolate(layer):
-        """Only this layer visible (players hidden; other layers stay force_hidden)."""
+    def _isolate(group_meshes):
+        """Only this group's meshes visible (players + other groups stay hidden)."""
         sess.restore_visibility()
         sess.mute_drivers(True)
         for o in s.objects:
             if o.name in char_names:
                 o.hide_render = True
-        layer.hide_render = False
+        for m in group_meshes:
+            m.hide_render = False
         bpy.context.view_layer.update()
 
     # CLEAN scene (no players, no layers) -- the baseline for the layer shadow ratios
@@ -1268,23 +1325,30 @@ def _layer_steps(players, layer_objs, sess, prog, layer_infos):
         clean_disp = _to_display(clean) if SHADOW_DISPLAY_RATIO else clean[:, :3]
         yield prog("Layers: clean scene")
 
-    for ly in layer_objs:
-        safe = _layer_safe_name(ly.name)
-        info = {"name": safe, "object": ly.name}
+    for g in groups:
+        meshes = g["meshes"]
+        safe = g["name"]
+        group_names = set(m.name for m in meshes)
+        info = {"name": safe, "object": g["object"], "kind": g["kind"],
+                "meshes": [m.name for m in meshes]}
+        label = f"{g['object']} ({len(meshes)} mesh)" if len(meshes) > 1 else g["object"]
+        # real scenery that occludes (not this group, not players/other layers -- hidden)
+        scenery = [o for o in s.objects if o.type == 'MESH'
+                   and o.name not in group_names and o.name not in char_names
+                   and o.name not in layer_mesh_names]
 
-        # BEAUTY: layer alone over a transparent film, OCCLUDED by the scenery. The scenery
-        # is a holdout: camera rays hitting it cut the alpha (zero where it is in front of
-        # the layer) but it still lights/shadows the object -- the lighting stays real.
-        # Un-premultiply in linear, then encode to display. Final look -> scene settings
-        # (engine/samples/denoise), like background.png.
-        _isolate(ly)
-        scenery = [o for o in s.objects if o.type == 'MESH' and o is not ly]
+        # BEAUTY: the group alone over a transparent film, OCCLUDED by the scenery. The
+        # scenery is a holdout: camera rays hitting it cut the alpha (zero where it is in
+        # front of the group) but it still lights/shadows the meshes -- the lighting stays
+        # real. Un-premultiply in linear, then encode to display. Final look -> scene
+        # settings (engine/samples/denoise), like background.png.
+        _isolate(meshes)
         sc = {o: o.is_holdout for o in scenery}
         for o in scenery:
             o.is_holdout = True
         bpy.context.view_layer.update()
         try:
-            print(f"[LAYER beauty] {ly.name}")
+            print(f"[LAYER beauty] {label}")
             comb, W, H = _render_combined_array(
                 sess, ILLUM_RES_PCT, transparent=True,
                 use_scene_settings=BACKGROUND_USE_SCENE_SETTINGS and not DRAFT_MODE)
@@ -1301,19 +1365,21 @@ def _layer_steps(players, layer_objs, sess, prog, layer_infos):
         info["image"] = f"layers/{safe}.png"
         info["bbox"] = _bbox_dict(_topleft_bbox(alpha > 0.004, W, H), (W, H))
         occl = alpha > 0.5      # visible-pixel mask: clips the UV coverage the same way
-        yield prog(f"Layer: {ly.name}")
+        yield prog(f"Layer: {label}")
 
-        # SHADOW: layer camera-invisible (still casting), scenery visible.
+        # SHADOW: the group camera-invisible (still casting), scenery visible.
         if EXPORT_SHADOW:
-            _isolate(ly)
-            cam_save = ly.visible_camera
-            ly.visible_camera = False
+            _isolate(meshes)
+            cam_save = {m: m.visible_camera for m in meshes}
+            for m in meshes:
+                m.visible_camera = False
             bpy.context.view_layer.update()
             try:
-                print(f"[LAYER shadow] {ly.name}")
+                print(f"[LAYER shadow] {label}")
                 comb_sh, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
             finally:
-                ly.visible_camera = cam_save
+                for m, c in cam_save.items():
+                    m.visible_camera = c
             sh_d = _to_display(comb_sh) if SHADOW_DISPLAY_RATIO else comb_sh[:, :3]
             ratio = np.clip(sh_d / np.clip(clean_disp, 1e-4, None), 0.0, 1.0)
             shadow = np.empty((ratio.shape[0], 4), dtype='float32')
@@ -1323,15 +1389,17 @@ def _layer_steps(players, layer_objs, sess, prog, layer_infos):
                         os.path.join(out_dir, safe + "_shadow" + LIGHTSHADOW_EXT),
                         file_format=LIGHTSHADOW_FORMAT)
             info["shadow"] = f"layers/{safe}_shadow{LIGHTSHADOW_EXT}"
-            yield prog(f"Layer shadow: {ly.name}")
+            yield prog(f"Layer shadow: {label}")
 
-        # UV + LIGHT (generic retexture): gray render for the light (only if the Illum
-        # toggle is on -- same switch as the players' light), then the UV pass. The UV
-        # coverage is clipped by the beauty's occlusion (scenery in front -> not covered).
-        if EXPORT_LAYER_UV:
+        # UV + LIGHT (generic retexture) -- SINGLE-mesh groups only: a multi-mesh group's
+        # meshes don't share one UV/texture space, so a combined UV is meaningless (the
+        # beauty already bakes their real materials). gray render for the light (only if the
+        # Illum toggle is on), then the UV pass clipped by the beauty's occlusion.
+        if EXPORT_LAYER_UV and len(meshes) == 1:
+            ly = meshes[0]
             lmap = None
             if EXPORT_ILLUM:
-                _isolate(ly)
+                _isolate(meshes)
                 sv = _swap_materials([ly], _gray_diffuse_material())
                 # light must be UNOCCLUDED (camera-invisible scenery, still lighting): the
                 # occluded pixels are simply outside the coverage and never sampled.
@@ -1371,7 +1439,7 @@ def _layer_steps(players, layer_objs, sess, prog, layer_infos):
                 print(f"[LAYER uv] {ly.name}: no UV coverage (missing UV map?), skipped")
             yield prog(f"Layer UV: {ly.name}")
 
-        cd = _object_camera_depth(ly)
+        cd = _group_camera_depth(meshes)
         info["camera_depth"] = round(cd, 4) if cd is not None else None
         layer_infos.append(info)
 
@@ -1745,9 +1813,11 @@ def _write_manifest(players, out_path, layer_infos=None):
             for p in players
         ],
         "layers": (layer_infos or None),
-        "layers_note": ("layer beauty/UV are OCCLUDED by the scenery (players and other "
-                        "layers excluded -- they can be toggled off); only players render "
-                        "unoccluded" if layer_infos else None),
+        "layers_note": ("each layer is a GROUP of meshes (marked collection/armature/mesh) "
+                        "rendered together; beauty/UV are OCCLUDED by the scenery (players "
+                        "and other layers excluded -- they can be toggled off); only "
+                        "players render unoccluded. Multi-mesh groups have no UV/light "
+                        "(meshes don't share one texture space)" if layer_infos else None),
         "draw_order_back_to_front": draw_order or [p["label"] for p in ordered],
     }
     with open(out_path, "w") as f:
@@ -1794,16 +1864,19 @@ def _render_steps(players, op=None):
     sess = _Session()
     results = {p["label"]: {"uv": {}, "masks": {}} for p in players}
 
-    # Optional layers: kept hidden through the WHOLE player pipeline + background (their
-    # cast shadow/look is exported independently in step 6). force_hidden makes every
-    # restore_visibility() keep them hidden; the final sess.restore() puts them back.
-    layer_objs = discover_layers()
-    sess.force_hidden = {o.name for o in layer_objs}
-    for o in layer_objs:
-        o.hide_render = True
-    if layer_objs:
+    # Optional layers (as groups): kept hidden through the WHOLE player pipeline +
+    # background (their cast shadow/look is exported independently in step 6). force_hidden
+    # makes every restore_visibility() keep them hidden; the final sess.restore() puts them
+    # back. A group can be many meshes (a marked armature/collection) -> all hidden together.
+    layer_groups = discover_layers()
+    layer_meshes = [m for g in layer_groups for m in g["meshes"]]
+    sess.force_hidden = {m.name for m in layer_meshes}
+    for m in layer_meshes:
+        m.hide_render = True
+    if layer_groups:
         bpy.context.view_layer.update()
-        print(f"[LAYERS] optional layers: {[o.name for o in layer_objs]}")
+        print("[LAYERS] optional layers: "
+              + ", ".join(f"{g['object']}[{len(g['meshes'])}]" for g in layer_groups))
 
     # Opaque override active during the WHOLE process (UV and mask): the skin has alpha
     # (HASHED + alpha from a Math node), which would punch holes in both the UV pass and the
@@ -1826,9 +1899,10 @@ def _render_steps(players, op=None):
              + (n_parts if EXPORT_BACKFACE_UV else 0)              # back UVs
              + (1 if EXPORT_BACKGROUND else 0)          # background
              + (((1 if EXPORT_SHADOW else 0)                       # layers: clean baseline
-                 + len(layer_objs) * (1 + (1 if EXPORT_SHADOW else 0)
-                                      + (1 if EXPORT_LAYER_UV else 0)))
-                if layer_objs else 0)                              # optional layers
+                 + sum(1 + (1 if EXPORT_SHADOW else 0)             # beauty + shadow
+                       + (1 if (EXPORT_LAYER_UV and len(g["meshes"]) == 1) else 0)  # UV
+                       for g in layer_groups))
+                if layer_groups else 0)                            # optional layers
              + 1)                                                  # manifest
     total = max(total, 1)
     state = {"done": 0}
@@ -1968,10 +2042,10 @@ def _render_steps(players, op=None):
         if EXPORT_BACKGROUND:
             _render_background(players, sess)
             yield prog("Background")
-        # 6) optional layers (marked scenery objects), each exported independently
+        # 6) optional layers (marked scenery objects/rigs/collections), each as one group
         layer_infos = []
-        if layer_objs:
-            yield from _layer_steps(players, layer_objs, sess, prog, layer_infos)
+        if layer_groups:
+            yield from _layer_steps(players, layer_groups, sess, prog, layer_infos)
         # 7) manifest with export details + average depth to order the rigs
         for p in players:
             p["camera_depth"] = _player_camera_depth(p)
@@ -2211,49 +2285,92 @@ class RENDER_OT_novaskin_cancel(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _is_player_armature(arm):
+    """True if the armature is a player rig (Rig_ID) -- never a layer."""
+    return (arm.type == 'ARMATURE' and RIG_ID_PROP in arm.keys()
+            and (RIG_ID_VALUE is None or arm.get(RIG_ID_PROP) == RIG_ID_VALUE))
+
+
 class OBJECT_OT_novaskin_layer_toggle(bpy.types.Operator):
-    """Mark/unmark the selected mesh objects as optional NovaSkin layers (each is exported
-    as an independent toggleable layer: beauty + shadow + UV/light)"""
+    """Mark/unmark the selection as optional NovaSkin layer(s). A selected ARMATURE (or any
+    mesh bound to one) marks the WHOLE rig as one layer; standalone meshes mark individually.
+    Each layer is exported as an independent toggleable group (beauty + shadow + UV/light)"""
     bl_idname = "object.novaskin_layer_toggle"
     bl_label = "Mark Selected as Layer"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        return any(o.type == 'MESH' for o in context.selected_objects)
-
-    @staticmethod
-    def _is_player_part(o):
-        """True if the mesh is rigged to a player armature (Rig_ID) -- marking it as a layer
-        would silently break the export (hidden from masks AND exported separately)."""
-        return any(m.type == 'ARMATURE' and m.object is not None
-                   and RIG_ID_PROP in m.object.keys() for m in o.modifiers)
+        return any(o.type in {'MESH', 'ARMATURE'} for o in context.selected_objects)
 
     def execute(self, context):
-        marked = unmarked = skipped = 0
+        # Resolve the selection to mark-TARGETS: an armature (whole rig) for any
+        # armature/rigged-mesh, else the standalone mesh itself. Dedup so selecting a rig +
+        # its meshes marks the rig once.
+        targets, seen = [], set()
         for o in context.selected_objects:
-            if o.type != 'MESH':
-                continue
-            if LAYER_ID_PROP in o.keys():
-                del o[LAYER_ID_PROP]
-                unmarked += 1
-            elif self._is_player_part(o):
-                skipped += 1
-                print(f"[LAYER] '{o.name}' is part of a player rig -- not marked.")
+            if o.type == 'ARMATURE':
+                tgt = o
+            elif o.type == 'MESH':
+                tgt = _mesh_rig_armature(o) or o
             else:
-                o[LAYER_ID_PROP] = 1
+                continue
+            if tgt.name not in seen:
+                seen.add(tgt.name)
+                targets.append(tgt)
+
+        marked = unmarked = skipped = 0
+        for tgt in targets:
+            if _is_player_armature(tgt):
+                skipped += 1
+                print(f"[LAYER] '{tgt.name}' is a player rig -- not marked.")
+            elif LAYER_ID_PROP in tgt.keys():
+                del tgt[LAYER_ID_PROP]
+                unmarked += 1
+            else:
+                tgt[LAYER_ID_PROP] = 1
                 marked += 1
+                kind = "rig" if tgt.type == 'ARMATURE' else "mesh"
+                print(f"[LAYER] marked {kind} '{tgt.name}'")
         parts = []
         if marked:
             parts.append(f"{marked} marked")
         if unmarked:
             parts.append(f"{unmarked} unmarked")
         if skipped:
-            parts.append(f"{skipped} skipped (player part)")
-            self.report({'WARNING'},
-                        "NovaSkin layers: " + ", ".join(parts))
-            return {'FINISHED'}
-        self.report({'INFO'}, "NovaSkin layers: " + (", ".join(parts) or "no mesh selected"))
+            parts.append(f"{skipped} skipped (player rig)")
+        self.report({'WARNING'} if skipped else {'INFO'},
+                    "NovaSkin layers: " + (", ".join(parts) or "nothing selectable"))
+        return {'FINISHED'}
+
+
+class OBJECT_OT_novaskin_layer_toggle_collection(bpy.types.Operator):
+    """Mark/unmark the ACTIVE collection as one optional NovaSkin layer (every mesh in it is
+    exported together as a single toggleable group -- handy for a multi-object set)"""
+    bl_idname = "object.novaskin_layer_toggle_collection"
+    bl_label = "Mark Active Collection"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        c = context.collection
+        return c is not None and any(o.type == 'MESH' for o in c.all_objects)
+
+    def execute(self, context):
+        coll = context.collection
+        # refuse a collection that contains a player rig (would break the player export)
+        if any(_is_player_armature(o) for o in coll.all_objects):
+            self.report({'ERROR'},
+                        f"'{coll.name}' contains a player rig -- not marked as a layer.")
+            return {'CANCELLED'}
+        if LAYER_ID_PROP in coll.keys():
+            del coll[LAYER_ID_PROP]
+            self.report({'INFO'}, f"NovaSkin layers: unmarked collection '{coll.name}'")
+        else:
+            coll[LAYER_ID_PROP] = 1
+            n = sum(1 for o in coll.all_objects if o.type == 'MESH')
+            self.report({'INFO'},
+                        f"NovaSkin layers: marked collection '{coll.name}' ({n} mesh)")
         return {'FINISHED'}
 
 
@@ -2327,11 +2444,16 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         box = layout.box()
         box.label(text="Optional Layers", icon='OUTLINER_OB_MESH')
         box.operator("object.novaskin_layer_toggle", icon='PINNED')
-        marked = discover_layers()
-        if marked:
+        box.operator("object.novaskin_layer_toggle_collection", icon='OUTLINER_COLLECTION')
+        groups = discover_layers()
+        if groups:
             col = box.column(align=True)
-            for o in marked:
-                col.label(text=o.name, icon='LAYER_ACTIVE')
+            icons = {"collection": 'OUTLINER_COLLECTION', "armature": 'ARMATURE_DATA',
+                     "mesh": 'LAYER_ACTIVE'}
+            for g in groups:
+                n = len(g["meshes"])
+                txt = f"{g['object']}  ({n} mesh)" if n > 1 else g["object"]
+                col.label(text=txt, icon=icons.get(g["kind"], 'LAYER_ACTIVE'))
         else:
             box.label(text="none marked", icon='LAYER_USED')
 
@@ -2341,7 +2463,8 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 
 
 _classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_cancel,
-            OBJECT_OT_novaskin_layer_toggle, VIEW3D_PT_novaskin)
+            OBJECT_OT_novaskin_layer_toggle, OBJECT_OT_novaskin_layer_toggle_collection,
+            VIEW3D_PT_novaskin)
 
 
 def _teardown_active_batch():

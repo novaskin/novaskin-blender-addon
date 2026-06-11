@@ -149,14 +149,22 @@ materials), even on cancel or error.
 
 ### Optional layers
 
-Select any scenery mesh and click **“Mark Selected as Layer”** in the panel (it toggles —
-click again to unmark; marked objects are listed in the panel; player-rig meshes are
-refused). Each marked object is **hidden from the background and from the whole player
-pipeline** and exported as an independent toggleable layer in `layers/`: beauty
-(transparent background, lit by the real scene), the shadow it casts on the scenery, and
-its UV + light for generic retexturing (`EXPORT_LAYER_UV`; the light follows the Illum
-toggle). The manifest lists each layer (files, bbox, `camera_depth`,
-`depth_range_viewer`) and includes them in `draw_order_back_to_front`.
+A layer is a **group of meshes** marked with one click. Select an object and use the panel:
+
+- **“Mark Selected as Layer”** — a selected **armature** (or any mesh bound to one) marks
+  the **whole rig** as one layer; standalone meshes mark individually. Toggles (click again
+  to unmark); player rigs are refused.
+- **“Mark Active Collection”** — marks the active collection: **every mesh in it** becomes
+  one layer (handy for a non-rigged multi-object set).
+
+A group's meshes render **together** (they self-occlude), so a rigged character like a
+turtle (armature + N meshes) is one whole layer, not N. Marked meshes are **hidden from the
+background and the whole player pipeline** and exported into `layers/`: beauty (transparent
+background, lit by the real scene), the shadow the group casts, and — **single-mesh groups
+only**, since a multi-mesh group's meshes don't share one texture space — its UV + light
+for retexturing (`EXPORT_LAYER_UV`; the light follows the Illum toggle). The manifest lists
+each layer (files, bbox, `camera_depth`, `depth_range_viewer`, `kind`, `meshes`) and
+includes them in `draw_order_back_to_front`.
 
 **Occlusion:** unlike players (always rendered unoccluded, in front), a layer **is
 occluded by the scenery** — the scenery renders as a *holdout* (cuts the alpha where it
