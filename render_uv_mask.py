@@ -14,6 +14,9 @@ Outputs (one subfolder per player):
   - <OUT_DIR>/<armature>/base_layer_<classic|slim>.png  (base parts composited per arm
         variant, nearest pixel wins; + base_layer_<v>_light.jpg in the PNG pipeline)
   - <OUT_DIR>/<armature>/mask_<classic|slim>.png
+  - <OUT_DIR>/background.png                  (scene without players/optional layers)
+  - <OUT_DIR>/layers/<name>.png (+ _shadow/_UV/_light)  (optional layers: scenery objects
+        marked via the panel's "Mark Selected as Layer"; each exported independently)
 
 Multi-player
 ------------
@@ -123,7 +126,7 @@ UV_DEPTH_IN_BLUE = True
 # player casts on the scenery (ratio vs the clean scene). Independent toggles.
 EXPORT_ILLUM = True
 EXPORT_SHADOW = True
-# Compute the shadow ratio in DISPLAY space (view-transformed, like background_no_players)
+# Compute the shadow ratio in DISPLAY space (view-transformed, like background.png)
 # instead of linear, so multiplying it onto the (display) background in a 2D/sRGB canvas
 # reproduces the render -- a LINEAR ratio multiplied in display space over-darkens. True for
 # any view transform (AgX/Standard/...). Set False if you composite in linear.
@@ -150,14 +153,26 @@ ILLUM_PURE_SHADOW = False
 # (raw linear). The shadow is always Non-Color (it is a multiply factor).
 ILLUM_COLORSPACE = 'sRGB'
 
-# Render of the FULL scene WITHOUT the players (empty scene) -> background_no_players.png.
-# Caveat: it also hides the shadows the players would cast (refine later with holdout).
-EXPORT_BACKGROUND_NO_PLAYERS = True
+# Render of the FULL scene WITHOUT the players and optional layers -> background.png.
+# Caveat: it also hides the shadows they would cast (those come from the shadow maps).
+EXPORT_BACKGROUND = True
 # The background is the final beauty image (the real scenery). Use the engine/samples/denoise
 # the USER set in Blender (from the _Session snapshot) instead of the illum's gray-render
 # settings. False = use ILLUM_SAMPLES/CYCLES like the data passes. (Resolution stays at the
 # export res so it aligns with the shadow maps.)
 BACKGROUND_USE_SCENE_SETTINGS = True
+
+# OPTIONAL LAYERS: scenery objects marked by the user (panel button "Mark Selected as
+# Layer", which toggles the LAYER_ID_PROP custom property) are exported as independent
+# toggleable layers in <OUT_DIR>/layers/: the object rendered alone with a transparent
+# background ("<name>.png", real materials, display-encoded like background.png), the shadow
+# it casts on the scenery ("<name>_shadow.<ext>", display multiply), and -- if
+# EXPORT_LAYER_UV -- its UV + light ("<name>_UV.png" + "<name>_light.<ext>") for generic
+# retexturing. Marked objects are HIDDEN from the background and from the whole player
+# pipeline (masks/illum/shadow), so the player light is independent of the layer toggles
+# (trade-off: a layer's shadow never falls on a player).
+LAYER_ID_PROP = "novaskin_layer"
+EXPORT_LAYER_UV = True
 
 # Player detection: armatures that have the Rig_ID custom property.
 # RIG_ID_VALUE filters by value (None = accept any armature with Rig_ID).
@@ -290,7 +305,7 @@ def _lin_to_srgb(x):
 
 def _to_display(rgb):
     """Apply the scene's view transform (AgX/Standard/Filmic/...) to scene-linear RGB,
-    giving the DISPLAY values -- the same encoding as background_no_players. Uses OCIO so it
+    giving the DISPLAY values -- the same encoding as background.png. Uses OCIO so it
     matches any view transform; falls back to sRGB. (exposure/gamma/look not applied.)"""
     out = np.ascontiguousarray(np.clip(rgb[:, :3], 0.0, None), dtype='float32')
     try:
@@ -481,6 +496,35 @@ def discover_players():
                 print(f"[reconcile] {p['label']}: re-added '{o.name}' "
                       f"(visible on another rig, here left manually hidden)")
     return players
+
+
+def discover_layers():
+    """Optional-layer objects = meshes carrying the LAYER_ID_PROP custom property (toggled
+    by the panel's "Mark Selected as Layer" button)."""
+    out = [o for o in bpy.context.scene.objects
+           if o.type == 'MESH' and LAYER_ID_PROP in o.keys()]
+    out.sort(key=lambda o: o.name)
+    return out
+
+
+def _layer_safe_name(name):
+    """Filesystem-safe layer file stem (dots would read as extensions)."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "layer"
+
+
+def _object_camera_depth(o):
+    """Camera distance to the evaluated bound-box center, in world units (None: no camera)."""
+    import mathutils
+    cam = bpy.context.scene.camera
+    if cam is None:
+        return None
+    dg = bpy.context.evaluated_depsgraph_get()
+    ev = o.evaluated_get(dg)
+    mw = ev.matrix_world
+    c = mathutils.Vector()
+    for corner in ev.bound_box:
+        c += mw @ mathutils.Vector(corner)
+    return float(-(cam.matrix_world.inverted() @ (c / 8.0)).z)
 
 
 def _fix_2layer_positions(players):
@@ -766,17 +810,25 @@ class _Session:
         self.pass_index = {o.name: o.pass_index for o in s.objects}
         self._drivers = _hide_render_drivers()
         self.driver_mute = [d.mute for d in self._drivers]
+        # Object names kept render-hidden by restore_visibility() for the whole batch (the
+        # optional layers, excluded from the player pipeline + background). The final
+        # restore() still puts back the true original visibility.
+        self.force_hidden = set()
 
     def mute_drivers(self, mute):
         for d in self._drivers:
             d.mute = mute
 
     def restore_visibility(self):
-        """Restore the original visibility (drivers active)."""
+        """Restore the original visibility (drivers active), keeping force_hidden hidden."""
         self.mute_drivers(False)
         for o in self.s.objects:
             if o.name in self.hide:
                 o.hide_render = self.hide[o.name]
+        for name in self.force_hidden:
+            o = self.s.objects.get(name)
+            if o is not None:
+                o.hide_render = True
         bpy.context.view_layer.update()
 
     def render_pass(self, socket_name, engine, samples, res_pct):
@@ -1056,9 +1108,9 @@ def _render_illum_background(players, sess, slim_value, vname):
             _restore_arm_style(arm, p, sv)
 
 
-def _render_background_no_players(players, sess):
-    """Render the FULL scene with the players HIDDEN (real scenery materials).
-    Saves background_no_players.png. (Without the players, their shadows are gone.)"""
+def _render_background(players, sess):
+    """Render the FULL scene with the players (and optional layers) HIDDEN -- real scenery
+    materials. Saves background.png. (Their cast shadows come from the shadow maps.)"""
     s = sess.s
     sess.restore_visibility()
     sess.mute_drivers(True)        # so hide_render sticks (some are driven)
@@ -1091,7 +1143,7 @@ def _render_background_no_players(players, sess):
             sess.out_node.mute = True
         s.render.image_settings.file_format = 'PNG'
         s.render.image_settings.color_depth = str(PNG_BIT_DEPTH)   # '8' or '16'
-        path = os.path.join(_abs(OUT_DIR), "background_no_players.png")
+        path = os.path.join(_abs(OUT_DIR), "background.png")
         s.render.filepath = path[:-4]
         bpy.context.view_layer.update()
         print("[BG] full scene without players")
@@ -1104,9 +1156,133 @@ def _render_background_no_players(players, sess):
         sess.restore_visibility()   # unmute drivers + original visibility
 
 
-def _render_combined_array(sess, res_pct):
+def _layer_steps(players, layer_objs, sess, prog, layer_infos):
+    """Export each optional-layer object independently into <OUT_DIR>/layers/: beauty over a
+    transparent background (display-encoded, same look as background.png), the shadow it
+    casts on the scenery, and -- if EXPORT_LAYER_UV -- its UV + light for generic
+    retexturing. Players and the other layers stay hidden; in the beauty/light renders the
+    scenery is camera-invisible (it still lights/shadows the object)."""
+    s = sess.s
+    out_dir = os.path.join(_abs(OUT_DIR), "layers")
+    os.makedirs(out_dir, exist_ok=True)
+    char_names = set(o.name for p in players for o in p["char_all"])
+
+    def _isolate(layer):
+        """Only this layer visible (players hidden; other layers stay force_hidden)."""
+        sess.restore_visibility()
+        sess.mute_drivers(True)
+        for o in s.objects:
+            if o.name in char_names:
+                o.hide_render = True
+        layer.hide_render = False
+        bpy.context.view_layer.update()
+
+    # CLEAN scene (no players, no layers) -- the baseline for the layer shadow ratios
+    sess.restore_visibility()
+    sess.mute_drivers(True)
+    for o in s.objects:
+        if o.name in char_names:
+            o.hide_render = True
+    bpy.context.view_layer.update()
+    clean, W, H = _render_combined_array(sess, ILLUM_RES_PCT)
+    clean_disp = _to_display(clean) if SHADOW_DISPLAY_RATIO else clean[:, :3]
+    yield prog("Layers: clean scene")
+
+    for ly in layer_objs:
+        safe = _layer_safe_name(ly.name)
+        info = {"name": safe, "object": ly.name}
+
+        # BEAUTY: layer alone over a transparent film; scenery camera-invisible but still
+        # lighting/shadowing it. Un-premultiply in linear, then encode to display.
+        _isolate(ly)
+        scenery = [o for o in s.objects if o.type == 'MESH' and o is not ly]
+        sc = {o: o.visible_camera for o in scenery}
+        for o in scenery:
+            o.visible_camera = False
+        bpy.context.view_layer.update()
+        try:
+            print(f"[LAYER beauty] {ly.name}")
+            comb, W, H = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+        finally:
+            for o, c in sc.items():
+                o.visible_camera = c
+        alpha = np.clip(comb[:, 3], 0.0, 1.0)
+        straight = np.where(alpha[:, None] > 1e-4,
+                            comb[:, :3] / np.maximum(alpha[:, None], 1e-4), 0.0)
+        beauty = np.empty((comb.shape[0], 4), dtype='float32')
+        beauty[:, :3] = _to_display(straight)
+        beauty[:, 3] = alpha
+        _save_image(beauty.reshape(-1), W, H, os.path.join(out_dir, safe + ".png"))
+        info["image"] = f"layers/{safe}.png"
+        info["bbox"] = _bbox_dict(_topleft_bbox(alpha > 0.004, W, H), (W, H))
+        yield prog(f"Layer: {ly.name}")
+
+        # SHADOW: layer camera-invisible (still casting), scenery visible.
+        if EXPORT_SHADOW:
+            _isolate(ly)
+            cam_save = ly.visible_camera
+            ly.visible_camera = False
+            bpy.context.view_layer.update()
+            try:
+                print(f"[LAYER shadow] {ly.name}")
+                comb_sh, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+            finally:
+                ly.visible_camera = cam_save
+            sh_d = _to_display(comb_sh) if SHADOW_DISPLAY_RATIO else comb_sh[:, :3]
+            ratio = np.clip(sh_d / np.clip(clean_disp, 1e-4, None), 0.0, 1.0)
+            shadow = np.empty((ratio.shape[0], 4), dtype='float32')
+            shadow[:, :3] = ratio
+            shadow[:, 3] = 1.0
+            _save_image(shadow.reshape(-1), W, H,
+                        os.path.join(out_dir, safe + "_shadow" + LIGHTSHADOW_EXT),
+                        file_format=LIGHTSHADOW_FORMAT)
+            info["shadow"] = f"layers/{safe}_shadow{LIGHTSHADOW_EXT}"
+            yield prog(f"Layer shadow: {ly.name}")
+
+        # UV + LIGHT (generic retexture): gray render for the light, then the UV pass.
+        if EXPORT_LAYER_UV:
+            lmap = None
+            _isolate(ly)
+            sv = _swap_materials([ly], _gray_diffuse_material())
+            sc = {o: o.visible_camera for o in scenery}
+            for o in scenery:
+                o.visible_camera = False
+            bpy.context.view_layer.update()
+            try:
+                print(f"[LAYER light] {ly.name}")
+                comb_l, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+                lmap = _lin_to_srgb(comb_l[:, :3]).astype('float32')
+            finally:
+                for o, c in sc.items():
+                    o.visible_camera = c
+                _restore_materials(sv)
+            dr = (_rendered_depth_range({"uv_parts": [ly]}, sess, _opaque_mask_material())
+                  if UV_DEPTH_IN_BLUE else None)
+            sv = _swap_materials([ly], _opaque_mask_material())
+            try:
+                tag = "_UVDL" if UV_FORMAT == 'OPEN_EXR' else "_UV"
+                res = export_part_uv(ly, sess, "layers", tag=tag, label=safe,
+                                     depth_range=dr, light_map=lmap)
+            finally:
+                _restore_materials(sv)
+            if res is not None:
+                info["uv"] = f"layers/{os.path.basename(res[0])}"
+                # res[3] is the masked light actually used; None if the light render's
+                # resolution didn't match the UV render (then no light file was written).
+                if UV_FORMAT != 'OPEN_EXR' and EXPORT_PART_LIGHT and res[3] is not None:
+                    info["light"] = f"layers/{safe}_light{LIGHTSHADOW_EXT}"
+            else:
+                print(f"[LAYER uv] {ly.name}: no UV coverage (missing UV map?), skipped")
+            yield prog(f"Layer UV: {ly.name}")
+
+        cd = _object_camera_depth(ly)
+        info["camera_depth"] = round(cd, 4) if cd is not None else None
+        layer_infos.append(info)
+
+
+def _render_combined_array(sess, res_pct, transparent=False):
     """Render the Combined pass (beauty, with denoise) -> linear RGBA array, read via the
-    Viewer."""
+    Viewer. transparent=True renders over a transparent film (alpha = coverage)."""
     s = sess.s
     ng = sess.ng
     vin = sess.viewer.inputs[0]
@@ -1121,7 +1297,7 @@ def _render_combined_array(sess, res_pct):
         s.cycles.samples = ILLUM_SAMPLES
         s.cycles.use_denoising = True
     s.render.resolution_percentage = res_pct
-    s.render.film_transparent = False
+    s.render.film_transparent = transparent
     s.render.use_compositing = True
     bpy.context.view_layer.update()
     bpy.ops.render.render(write_still=False)
@@ -1367,10 +1543,16 @@ def _bbox_dict(bbox, size):
     return out
 
 
-def _write_manifest(players, out_path):
+def _write_manifest(players, out_path, layer_infos=None):
     s = bpy.context.scene
     ordered = sorted((p for p in players if p.get("camera_depth") is not None),
                      key=lambda p: p["camera_depth"], reverse=True)  # back -> front
+    # back-to-front order mixing players and optional layers (by camera depth)
+    entries = ([(p["label"], p["camera_depth"]) for p in players
+                if p.get("camera_depth") is not None]
+               + [(li["name"], li["camera_depth"]) for li in (layer_infos or [])
+                  if li.get("camera_depth") is not None])
+    draw_order = [name for name, _ in sorted(entries, key=lambda e: e[1], reverse=True)]
     manifest = {
         "render": {
             "resolution": [s.render.resolution_x, s.render.resolution_y],
@@ -1403,8 +1585,7 @@ def _write_manifest(players, out_path):
             "lightshadow_format": LIGHTSHADOW_FORMAT,
             "illum_backgrounds": ([f"illum_{v}{LIGHTSHADOW_EXT}" for v, _ in MASK_ARM_VARIANTS]
                                   if EXPORT_ILLUM_BACKGROUND else None),
-            "background_no_players": ("background_no_players.png"
-                                      if EXPORT_BACKGROUND_NO_PLAYERS else None),
+            "background": ("background.png" if EXPORT_BACKGROUND else None),
             "player_illum_shadow": ({
                 "illum": ([f"illum_{v}{LIGHTSHADOW_EXT}" for v, _ in MASK_ARM_VARIANTS]
                           if EXPORT_ILLUM else None),
@@ -1437,7 +1618,8 @@ def _write_manifest(players, out_path):
             }
             for p in players
         ],
-        "draw_order_back_to_front": [p["label"] for p in ordered],
+        "layers": (layer_infos or None),
+        "draw_order_back_to_front": draw_order or [p["label"] for p in ordered],
     }
     with open(out_path, "w") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
@@ -1483,6 +1665,17 @@ def _render_steps(players, op=None):
     sess = _Session()
     results = {p["label"]: {"uv": {}, "masks": {}} for p in players}
 
+    # Optional layers: kept hidden through the WHOLE player pipeline + background (their
+    # cast shadow/look is exported independently in step 6). force_hidden makes every
+    # restore_visibility() keep them hidden; the final sess.restore() puts them back.
+    layer_objs = discover_layers()
+    sess.force_hidden = {o.name for o in layer_objs}
+    for o in layer_objs:
+        o.hide_render = True
+    if layer_objs:
+        bpy.context.view_layer.update()
+        print(f"[LAYERS] optional layers: {[o.name for o in layer_objs]}")
+
     # Opaque override active during the WHOLE process (UV and mask): the skin has alpha
     # (HASHED + alpha from a Math node), which would punch holes in both the UV pass and the
     # Object Index where the texture is transparent. UV/Object Index ignore color -> only
@@ -1502,7 +1695,9 @@ def _render_steps(players, op=None):
              + n_parts                                             # front UVs
              + (len(players) * n_variants if COMPOSITE_BASE_LAYER else 0)  # base composites
              + (n_parts if EXPORT_BACKFACE_UV else 0)              # back UVs
-             + (1 if EXPORT_BACKGROUND_NO_PLAYERS else 0)          # background
+             + (1 if EXPORT_BACKGROUND else 0)          # background
+             + ((1 + len(layer_objs) * (3 if EXPORT_LAYER_UV else 2))
+                if layer_objs else 0)                              # optional layers
              + 1)                                                  # manifest
     total = max(total, 1)
     state = {"done": 0}
@@ -1636,14 +1831,19 @@ def _render_steps(players, op=None):
                         yield prog(f"UV back: {p['label']} / {lab}")
             finally:
                 _restore_materials(saved_mats)
-        # 5) background of the scene without players (empty scene)
-        if EXPORT_BACKGROUND_NO_PLAYERS:
-            _render_background_no_players(players, sess)
-            yield prog("Background (no players)")
-        # 6) manifest with export details + average depth to order the rigs
+        # 5) background of the scene without players/layers (empty scene)
+        if EXPORT_BACKGROUND:
+            _render_background(players, sess)
+            yield prog("Background")
+        # 6) optional layers (marked scenery objects), each exported independently
+        layer_infos = []
+        if layer_objs:
+            yield from _layer_steps(players, layer_objs, sess, prog, layer_infos)
+        # 7) manifest with export details + average depth to order the rigs
         for p in players:
             p["camera_depth"] = _player_camera_depth(p)
-        _write_manifest(players, os.path.join(_abs(OUT_DIR), "manifest.json"))
+        _write_manifest(players, os.path.join(_abs(OUT_DIR), "manifest.json"),
+                        layer_infos)
         yield prog("Manifest")
     finally:
         sess.restore()
@@ -1706,7 +1906,7 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
     export_illum: BoolProperty(name="Illum", default=True)
     export_shadow: BoolProperty(name="Shadow", default=True)
     composite_base_layer: BoolProperty(name="Base Layer Composite", default=True)
-    export_background_no_players: BoolProperty(name="Background (no players)", default=True)
+    export_background: BoolProperty(name="Background (no players/layers)", default=True)
     fix_2layer_position: BoolProperty(
         name="Fix Hat Position and Scale", default=True,
         description="Snap the hat (2_Layer_Extrusion) onto the head and scale it to the "
@@ -1731,7 +1931,7 @@ def _apply_settings(scene):
     g["EXPORT_ILLUM"] = st.export_illum
     g["EXPORT_SHADOW"] = st.export_shadow
     g["COMPOSITE_BASE_LAYER"] = st.composite_base_layer
-    g["EXPORT_BACKGROUND_NO_PLAYERS"] = st.export_background_no_players
+    g["EXPORT_BACKGROUND"] = st.export_background
     g["FIX_2LAYER_POSITION"] = st.fix_2layer_position
     g["ILLUM_SAMPLES"] = st.illum_samples
     g["LIGHTSHADOW_FORMAT"] = st.lightshadow_format
@@ -1861,6 +2061,37 @@ class RENDER_OT_novaskin_cancel(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OBJECT_OT_novaskin_layer_toggle(bpy.types.Operator):
+    """Mark/unmark the selected mesh objects as optional NovaSkin layers (each is exported
+    as an independent toggleable layer: beauty + shadow + UV/light)"""
+    bl_idname = "object.novaskin_layer_toggle"
+    bl_label = "Mark Selected as Layer"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type == 'MESH' for o in context.selected_objects)
+
+    def execute(self, context):
+        marked = unmarked = 0
+        for o in context.selected_objects:
+            if o.type != 'MESH':
+                continue
+            if LAYER_ID_PROP in o.keys():
+                del o[LAYER_ID_PROP]
+                unmarked += 1
+            else:
+                o[LAYER_ID_PROP] = 1
+                marked += 1
+        parts = []
+        if marked:
+            parts.append(f"{marked} marked")
+        if unmarked:
+            parts.append(f"{unmarked} unmarked")
+        self.report({'INFO'}, "NovaSkin layers: " + (", ".join(parts) or "no mesh selected"))
+        return {'FINISHED'}
+
+
 def _menu_draw(self, context):
     self.layout.operator(RENDER_OT_novaskin.bl_idname, icon='RENDER_STILL')
 
@@ -1914,7 +2145,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         box.prop(st, "export_illum")
         box.prop(st, "export_shadow")
         box.prop(st, "composite_base_layer")
-        box.prop(st, "export_background_no_players")
+        box.prop(st, "export_background")
 
         box = layout.box()
         box.label(text="Quality", icon='SETTINGS')
@@ -1925,12 +2156,23 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             row.prop(st, "jpeg_quality", text="Q")
 
         box = layout.box()
+        box.label(text="Optional Layers", icon='OUTLINER_OB_MESH')
+        box.operator("object.novaskin_layer_toggle", icon='PINNED')
+        marked = discover_layers()
+        if marked:
+            col = box.column(align=True)
+            for o in marked:
+                col.label(text=o.name, icon='LAYER_ACTIVE')
+        else:
+            box.label(text="none marked", icon='LAYER_USED')
+
+        box = layout.box()
         box.label(text="Rig", icon='ARMATURE_DATA')
         box.prop(st, "fix_2layer_position")
 
 
 _classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_cancel,
-            VIEW3D_PT_novaskin)
+            OBJECT_OT_novaskin_layer_toggle, VIEW3D_PT_novaskin)
 
 
 def _teardown_active_batch():

@@ -120,9 +120,26 @@ materials), even on cancel or error.
 │   ├── illum_classic.jpg / illum_slim.jpg     # JPEG (light)
 │   └── shadow_classic.jpg / shadow_slim.jpg   # JPEG (multiply)
 ├── illum_classic.jpg / illum_slim.jpg  # (only if EXPORT_ILLUM_BACKGROUND)
-├── background_no_players.png
+├── background.png                   # scene without players and optional layers
+├── layers/                          # optional layers (objects marked in the panel)
+│   ├── <name>.png                   # the object alone, transparent bg, display-encoded
+│   ├── <name>_shadow.jpg            # shadow it casts on the scenery (display multiply)
+│   ├── <name>_UV.png                # generic UV (retexture); EXR mode: <name>_UVDL.exr
+│   └── <name>_light.jpg             # its light map (PNG pipeline)
 └── manifest.json                    # resolution, engine, draw_order (back→front), etc.
 ```
+
+### Optional layers
+
+Select any scenery mesh and click **“Mark Selected as Layer”** in the panel (it toggles —
+click again to unmark; marked objects are listed in the panel). Each marked object is
+**hidden from the background and from the whole player pipeline** and exported as an
+independent toggleable layer in `layers/`: beauty (transparent background, lit by the real
+scene — the scenery is camera-invisible but still lights/shadows it), the shadow it casts
+on the scenery, and its UV + light for generic retexturing (`EXPORT_LAYER_UV`). The
+manifest lists each layer (files, bbox, `camera_depth`) and includes them in
+`draw_order_back_to_front`. Trade-off: a layer's shadow never falls on a player (the player
+light is independent of layer toggles).
 
 ---
 
@@ -138,7 +155,8 @@ Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key o
 | `UV_DEPTH_IN_BLUE` | Write normalized depth into the UV's B channel |
 | `EXPORT_BACKFACE_UV` | Also export the back-face UVs |
 | `EXPORT_ILLUM` / `EXPORT_SHADOW` | Per-player light (per-part + illum image) and cast shadow — independent toggles |
-| `EXPORT_BACKGROUND_NO_PLAYERS` | Render the scenery without players |
+| `EXPORT_BACKGROUND` | Render the scenery without players/layers (`background.png`) |
+| `LAYER_ID_PROP` / `EXPORT_LAYER_UV` | Optional layers: marker property name; also export each layer's UV + light |
 | `FIX_2LAYER_POSITION` / `HAT_SCALE_RATIO` | Snap the hat (`2_Layer_Extrusion`) onto `NoFace_Head` and scale it to the Minecraft hat size (`1.125`× the head) before export (persistent) |
 | `ILLUM_SAMPLES` / `ILLUM_COLORSPACE` | Illum quality/encoding |
 | `PNG_BIT_DEPTH` | Bit depth of UV/mask PNGs (default `8`; 256 levels, enough for MC skins) |
