@@ -1258,6 +1258,10 @@ def _layer_steps(players, layer_objs, sess, prog, layer_infos):
                 _restore_materials(sv)
             dr = (_rendered_depth_range({"uv_parts": [ly]}, sess, _opaque_mask_material())
                   if UV_DEPTH_IN_BLUE else None)
+            # Same scale/key as the players' "depth_range_viewer": the UV's B decodes to an
+            # absolute (Viewer-scale) depth via zmin + B*(zmax-zmin) -- comparable across
+            # players and layers for per-pixel depth-checked compositing.
+            info["depth_range_viewer"] = ([round(x, 5) for x in dr] if dr else None)
             sv = _swap_materials([ly], _opaque_mask_material())
             try:
                 tag = "_UVDL" if UV_FORMAT == 'OPEN_EXR' else "_UV"
@@ -1578,6 +1582,10 @@ def _write_manifest(players, out_path, layer_infos=None):
             "uv_decode_note": ("PNG U/V byte = floor(u * %d); texel = floor(byte * texW / "
                                "%d) (== byte for a %d-wide skin). EXR stores the raw float."
                                % (UV_TEXEL_BINS, UV_TEXEL_BINS, UV_TEXEL_BINS)),
+            "depth_decode_note": ("absolute depth = zmin + B*(zmax - zmin), with "
+                                  "[zmin, zmax] = depth_range_viewer (players and layers "
+                                  "share the same scale -> comparable for depth-checked "
+                                  "compositing)"),
             "base_layer": ([COMPOSITE_OUTPUT_NAME.format(variant=v) + UV_EXT
                             for v, _ in MASK_ARM_VARIANTS] if COMPOSITE_BASE_LAYER else None),
             "base_layer_parts": (COMPOSITE_BASE_LABELS if COMPOSITE_BASE_LAYER else None),
