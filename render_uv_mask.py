@@ -233,13 +233,16 @@ PNG_BIT_DEPTH = 8                  # 8 or 16
 # mostly-transparent frame still costs ~36 KB; 90 cuts data PNGs ~70% (byte-exact). Saved
 # via save_render (img.save ignores this). Only applies to data (Non-Color) PNGs.
 PNG_COMPRESSION = 90
-# UV + base_layer format: 'PNG' (8/16-bit) or 'OPEN_EXR' (float). EXR avoids the 2D-canvas
-# premultiply problem (when alpha carries the light) AND removes 8-bit quantization, but the
-# files are bigger and need a float EXR loader to read (browsers can't decode EXR via canvas).
-UV_FORMAT = 'PNG'                  # 'PNG' or 'OPEN_EXR'
+# UV + base_layer format: 'PNG' (8/16-bit), 'WEBP' (8-bit LOSSLESS -- quality=100 switches
+# libwebp to lossless mode; ~60% smaller than PNG, browser-decodable; verified byte-exact
+# inside the coverage, the alpha-0 RGB is premultiply-zeroed on save but never read) or
+# 'OPEN_EXR' (float). EXR avoids the 2D-canvas premultiply problem (when alpha carries the
+# light) AND removes 8-bit quantization, but the files are bigger and need a float EXR
+# loader to read (browsers can't decode EXR via canvas).
+UV_FORMAT = 'PNG'                  # 'PNG', 'WEBP' or 'OPEN_EXR'
 EXR_HALF = True                    # half-float (16-bit) EXR -> smaller; else 32-bit float
 EXR_CODEC = 'ZIP'                  # lossless: ZIP/ZIPS/PIZ/PXR24/RLE/NONE; lossy: DWAA/DWAB/B44A
-UV_EXT = '.exr' if UV_FORMAT == 'OPEN_EXR' else '.png'
+UV_EXT = {'OPEN_EXR': '.exr', 'WEBP': '.webp'}.get(UV_FORMAT, '.png')
 # 8-bit PNG: quantize U/V with FLOOR into texel bins (byte = texel index) instead of the
 # default round-to-nearest, so a value inside texel i stays in texel i (round pushes the
 # upper half of a texel into the next one -- an off-by-one at HD 256px, where 8-bit = exactly
@@ -688,13 +691,15 @@ def _remove_stale_variants(path):
 
 
 def _save_image(arr_flat, W, H, path, colorspace='Non-Color',
-                file_format='PNG', bit_depth=None, quality=None):
+                file_format='PNG', bit_depth=None, quality=None, lossless=False):
     """Save flat RGBA pixels (scene-linear float) to an image file. No view transform is
     applied; the colorspace controls encoding: 'Non-Color' = raw linear values (UV/Depth/
     shadow), 'sRGB' = sRGB curve on encode (illum -> display look).
-    PNG honors bit_depth (default PNG_BIT_DEPTH; 8 or 16). JPEG is always 8-bit and drops
-    the alpha channel; quality defaults to JPEG_QUALITY. OPEN_EXR is float (half if
-    EXR_HALF) and preserves the exact values -- no premultiply/quantization."""
+    PNG honors bit_depth (default PNG_BIT_DEPTH; 8 or 16). JPEG/WEBP are 8-bit; quality
+    defaults to JPEG_QUALITY. lossless=True + WEBP forces quality=100 (libwebp's lossless
+    mode -- for data like the UVs; byte-exact where alpha=1, the alpha-0 RGB is
+    premultiply-zeroed). OPEN_EXR is float (half if EXR_HALF) and preserves the exact
+    values -- no premultiply/quantization."""
     if bit_depth is None:
         bit_depth = PNG_BIT_DEPTH
     # float buffer -> 16-bit PNG / float EXR
@@ -721,6 +726,28 @@ def _save_image(arr_flat, W, H, path, colorspace='Non-Color',
             img.save_render(path, scene=sc)
         finally:
             ims.file_format, ims.color_depth, ims.exr_codec, ims.color_management = snap
+            if vt is not None:
+                try:
+                    ims.view_settings.view_transform = vt
+                except Exception:
+                    pass
+    elif file_format == 'WEBP' and lossless:
+        # Data WebP: quality=100 switches libwebp to LOSSLESS mode (q<100 is lossy VP8 and
+        # corrupts the values -- never use it for data). Saved via save_render with
+        # color_management OVERRIDE + 'Raw' so the bytes are written untransformed.
+        sc = bpy.context.scene
+        ims = sc.render.image_settings
+        snap = (ims.file_format, ims.quality, ims.color_management)
+        vt = None
+        try:
+            ims.file_format = 'WEBP'
+            ims.quality = 100
+            ims.color_management = 'OVERRIDE'
+            vt = ims.view_settings.view_transform
+            ims.view_settings.view_transform = 'Raw'
+            img.save_render(path, scene=sc)
+        finally:
+            ims.file_format, ims.quality, ims.color_management = snap
             if vt is not None:
                 try:
                     ims.view_settings.view_transform = vt
@@ -1035,7 +1062,7 @@ def export_part_uv(part, sess, out_subdir, tag="_UV", depth_range=None, label=No
         _save_exr_uvdl(out, light, W, H, path)
         _remove_stale_variants(path)
     else:
-        _save_image(out.reshape(-1), W, H, path, file_format=UV_FORMAT)
+        _save_image(out.reshape(-1), W, H, path, file_format=UV_FORMAT, lossless=True)
         if light is not None and EXPORT_PART_LIGHT:
             la = np.ones((light.shape[0], 4), dtype='float32')
             la[:, :3] = light
@@ -1669,8 +1696,9 @@ def _write_manifest(players, out_path, layer_infos=None):
             "uv_png_texel_bins": (UV_TEXEL_BINS
                                   if (UV_FORMAT != 'OPEN_EXR' and UV_PNG_FLOOR_TEXELS)
                                   else None),
-            "uv_decode_note": ("PNG U/V byte = floor(u * %d); texel = floor(byte * texW / "
-                               "%d) (== byte for a %d-wide skin). EXR stores the raw float."
+            "uv_decode_note": ("PNG/WebP U/V byte = floor(u * %d); texel = floor(byte * "
+                               "texW / %d) (== byte for a %d-wide skin). WebP is lossless "
+                               "(quality 100). EXR stores the raw float."
                                % (UV_TEXEL_BINS, UV_TEXEL_BINS, UV_TEXEL_BINS)),
             "depth_decode_note": ("absolute depth = zmin + B*(zmax - zmin), with "
                                   "[zmin, zmax] = depth_range_viewer (players and layers "
@@ -1909,7 +1937,8 @@ def _render_steps(players, op=None):
                             _save_exr_uvdl(comp, clight, cW, cH, cpath)
                             _remove_stale_variants(cpath)
                         else:
-                            _save_image(comp.reshape(-1), cW, cH, cpath, file_format=UV_FORMAT)
+                            _save_image(comp.reshape(-1), cW, cH, cpath,
+                                        file_format=UV_FORMAT, lossless=True)
                             if clight is not None and EXPORT_PART_LIGHT:
                                 la = np.ones((clight.shape[0], 4), dtype='float32')
                                 la[:, :3] = clight
@@ -1998,6 +2027,8 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
     uv_format: EnumProperty(
         name="UV Format",
         items=[('PNG', "PNG", "8/16-bit PNG"),
+               ('WEBP', "WebP (lossless)",
+                "8-bit lossless WebP -- ~60% smaller than PNG, browser-decodable"),
                ('OPEN_EXR', "EXR (float)", "Float EXR -- straight alpha, no quantization")],
         default='PNG')
     exr_half: BoolProperty(name="Half float", default=True,
@@ -2048,7 +2079,7 @@ def _apply_settings(scene):
     g["FIX_2LAYER_POSITION"] = st.fix_2layer_position
     g["LIGHTSHADOW_FORMAT"] = st.lightshadow_format
     g["JPEG_QUALITY"] = st.jpeg_quality
-    g["UV_EXT"] = '.exr' if st.uv_format == 'OPEN_EXR' else '.png'
+    g["UV_EXT"] = {'OPEN_EXR': '.exr', 'WEBP': '.webp'}.get(st.uv_format, '.png')
     g["LIGHTSHADOW_EXT"] = {'JPEG': '.jpg', 'WEBP': '.webp'}.get(st.lightshadow_format,
                                                                  '.png')
     # Draft mode: all render resolutions MUST stay equal (UV/mask/illum/shadow/background
