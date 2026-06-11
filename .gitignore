@@ -13,6 +13,7 @@ __pycache__/
 
 # Render outputs
 /novaskin/
+/novaskin_4k/
 /render/
 
 # macOS

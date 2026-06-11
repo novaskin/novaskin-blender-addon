@@ -61,7 +61,7 @@ Outputs go to <blend_dir>/novaskin/.
 bl_info = {
     "name": "NovaSkin Export (Thomas_Rig_Legacy)",
     "author": "saviski",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
     "location": "Top bar > Render > Render for NovaSkin",
     "description": "Export per-part UV + occlusion mask + illum/shadow per player.",
