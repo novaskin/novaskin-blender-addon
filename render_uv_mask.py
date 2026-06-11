@@ -153,6 +153,11 @@ ILLUM_COLORSPACE = 'sRGB'
 # Render of the FULL scene WITHOUT the players (empty scene) -> background_no_players.png.
 # Caveat: it also hides the shadows the players would cast (refine later with holdout).
 EXPORT_BACKGROUND_NO_PLAYERS = True
+# The background is the final beauty image (the real scenery). Use the engine/samples/denoise
+# the USER set in Blender (from the _Session snapshot) instead of the illum's gray-render
+# settings. False = use ILLUM_SAMPLES/CYCLES like the data passes. (Resolution stays at the
+# export res so it aligns with the shadow maps.)
+BACKGROUND_USE_SCENE_SETTINGS = True
 
 # Player detection: armatures that have the Rig_ID custom property.
 # RIG_ID_VALUE filters by value (None = accept any armature with Rig_ID).
@@ -1066,11 +1071,20 @@ def _render_background_no_players(players, sess):
     saved_fmt = s.render.image_settings.file_format
     saved_depth = s.render.image_settings.color_depth
     try:
-        s.render.engine = 'CYCLES'
-        if hasattr(s, 'cycles'):
-            s.cycles.samples = ILLUM_SAMPLES
-            s.cycles.use_denoising = True
-        s.render.resolution_percentage = ILLUM_RES_PCT
+        if BACKGROUND_USE_SCENE_SETTINGS:
+            # the user's engine/samples/denoise (snapshot taken before the batch changed them)
+            s.render.engine = sess.engine
+            if hasattr(s, 'cycles'):
+                if sess.samples is not None:
+                    s.cycles.samples = sess.samples
+                if sess.denoise is not None:
+                    s.cycles.use_denoising = sess.denoise
+        else:
+            s.render.engine = 'CYCLES'
+            if hasattr(s, 'cycles'):
+                s.cycles.samples = ILLUM_SAMPLES
+                s.cycles.use_denoising = True
+        s.render.resolution_percentage = ILLUM_RES_PCT   # align with the shadow maps
         s.render.film_transparent = False
         s.render.use_compositing = False
         if sess.out_node:
