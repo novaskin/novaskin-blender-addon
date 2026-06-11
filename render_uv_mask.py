@@ -77,6 +77,14 @@ from bpy.props import (BoolProperty, IntProperty, EnumProperty,
                        StringProperty, PointerProperty)
 
 # ----------------------------- CONFIG -----------------------------
+# Add-on version stamped into manifest.json ("addon_version"). Keep in sync with bl_info
+# and blender_manifest.toml -- bl_info must stay a literal (Blender parses it via ast) and
+# is STRIPPED from the extension zip, so the manifest can't read it at run time.
+ADDON_VERSION = "1.1.0"
+# Version of the manifest.json FORMAT (bump when keys/semantics change, so the web tool
+# can branch). Absent in manifests written before this key existed.
+MANIFEST_VERSION = 1
+
 OUT_DIR = "//novaskin/"
 
 # Per-player output subfolder name: 'index' -> player1, player2, ... (PLAYER_FOLDER_PREFIX,
@@ -239,10 +247,17 @@ UV_EXT = '.exr' if UV_FORMAT == 'OPEN_EXR' else '.png'
 # divide 256). EXR keeps the raw float (the consumer floors the exact value).
 UV_PNG_FLOOR_TEXELS = True
 UV_TEXEL_BINS = 256
-# Illum (light) + shadow do not need PNG; JPEG keeps the files much smaller.
-LIGHTSHADOW_FORMAT = 'JPEG'        # 'JPEG' or 'PNG'
-JPEG_QUALITY = 90                  # 0..100 (JPEG only)
-LIGHTSHADOW_EXT = '.jpg' if LIGHTSHADOW_FORMAT == 'JPEG' else '.png'
+# Illum (light) + shadow do not need PNG; JPEG/WebP keep the files much smaller (WebP is
+# ~30% smaller than JPEG at the same quality and every browser decodes it).
+LIGHTSHADOW_FORMAT = 'JPEG'        # 'JPEG', 'WEBP' or 'PNG'
+JPEG_QUALITY = 90                  # 0..100 (JPEG/WebP only)
+LIGHTSHADOW_EXT = {'JPEG': '.jpg', 'WEBP': '.webp'}.get(LIGHTSHADOW_FORMAT, '.png')
+
+# Draft mode (panel toggle): renders everything at 50% resolution with few samples, for
+# fast iteration on framing/marking before the real export. The manifest records it.
+DRAFT_MODE = False
+DRAFT_RES_PCT = 50
+DRAFT_SAMPLES = 8
 
 # The default RGBA of every UV file is (R=U, G=V, B=depth, A=coverage). When exporting as
 # EXR (UV_FORMAT='OPEN_EXR') and the illum pass is on, the RGB light is ALSO embedded in the
@@ -693,7 +708,7 @@ def _save_image(arr_flat, W, H, path, colorspace='Non-Color',
                     ims.view_settings.view_transform = vt
                 except Exception:
                     pass
-    elif file_format == 'JPEG':
+    elif file_format in ('JPEG', 'WEBP'):
         img.save(quality=JPEG_QUALITY if quality is None else quality)
     elif colorspace == 'Non-Color':
         # Data PNG: img.save() ignores PNG compression (stuck on Blender's low default), so
@@ -944,11 +959,13 @@ def _rendered_depth_range(player, sess, gray_mat, _back_mat=None):
 
 
 def export_part_uv(part, sess, out_subdir, tag="_UV", depth_range=None, label=None,
-                   light_map=None):
+                   light_map=None, occlusion=None):
     """Render one part's UV and save it. The file is RGBA = (R=U, G=V, B=depth, A=coverage);
-    if light_map (N,3 sRGB) is given AND UV_FORMAT is EXR, the light is embedded as an extra
-    'light' layer. Returns (path, out(N,4), cov, light(N,3) or None, W, H) for the base-layer
-    composite -- or None if the part is empty."""
+    if light_map (N,3 sRGB; float 0-1 or uint8) is given AND UV_FORMAT is EXR, the light is
+    embedded as an extra 'light' layer. occlusion (N,) bool, if given, is ANDed into the
+    coverage (pixels hidden behind the scenery -- used by the optional layers). Returns
+    (path, out(N,4), cov, light(N,3) or None, W, H) for the base-layer composite -- or None
+    if the part is empty."""
     stem = label if label is not None else part.name
     s = sess.s
     sess.mute_drivers(True)
@@ -957,14 +974,16 @@ def export_part_uv(part, sess, out_subdir, tag="_UV", depth_range=None, label=No
     part.hide_render = False
     sess.vl.use_pass_uv = True
     print(f"[UV] {out_subdir} / {stem}{tag}  ({part.name})")
-    uv, W, H = sess.render_pass('UV', 'CYCLES', UV_SAMPLES, 100)
+    uv, W, H = sess.render_pass('UV', 'CYCLES', UV_SAMPLES, MASK_RES_PCT)
     if uv is None:
         return None
     out = uv.copy()                       # R=U, G=V, B=1.0 (coverage), A=1
     cov = uv[:, 2] > 0.5                   # coverage: UV pass B = 1 on geometry
+    if occlusion is not None and occlusion.shape == cov.shape:
+        cov &= occlusion
     if UV_DEPTH_IN_BLUE and depth_range is not None:
         sess.vl.use_pass_z = True
-        dep, _, _ = sess.render_pass('Depth', 'CYCLES', UV_SAMPLES, 100)
+        dep, _, _ = sess.render_pass('Depth', 'CYCLES', UV_SAMPLES, MASK_RES_PCT)
         if dep is not None:
             zmin, zmax = depth_range
             z = dep[:, 0]
@@ -983,7 +1002,10 @@ def export_part_uv(part, sess, out_subdir, tag="_UV", depth_range=None, label=No
     if (light_map is not None and getattr(light_map, "ndim", 0) == 2
             and light_map.shape == (out.shape[0], 3)):
         light = np.zeros((out.shape[0], 3), dtype='float32')
-        light[cov] = np.clip(light_map[cov], 0.0, 1.0)
+        vals = light_map[cov]
+        if vals.dtype == np.uint8:        # light_maps are stored as uint8 to save RAM
+            vals = vals.astype('float32') / 255.0
+        light[cov] = np.clip(vals, 0.0, 1.0)
     path = os.path.join(_abs(OUT_DIR), out_subdir, stem + tag + UV_EXT)
     if UV_FORMAT == 'OPEN_EXR' and light is not None:
         _save_exr_uvdl(out, light, W, H, path)
@@ -1092,10 +1114,10 @@ def _render_illum_background(players, sess, slim_value, vname):
         if sess.out_node:
             sess.out_node.mute = True
         s.render.image_settings.file_format = LIGHTSHADOW_FORMAT
-        if LIGHTSHADOW_FORMAT == 'JPEG':
+        if LIGHTSHADOW_FORMAT in ('JPEG', 'WEBP'):
             s.render.image_settings.quality = JPEG_QUALITY
         path = os.path.join(_abs(OUT_DIR), "illum_" + vname + LIGHTSHADOW_EXT)
-        s.render.filepath = path[:-4]
+        s.render.filepath = os.path.splitext(path)[0]
         bpy.context.view_layer.update()
         print(f"[ILLUM] full scene, {vname} arms")
         bpy.ops.render.render(write_still=True)
@@ -1123,7 +1145,7 @@ def _render_background(players, sess):
     saved_fmt = s.render.image_settings.file_format
     saved_depth = s.render.image_settings.color_depth
     try:
-        if BACKGROUND_USE_SCENE_SETTINGS:
+        if BACKGROUND_USE_SCENE_SETTINGS and not DRAFT_MODE:
             # the user's engine/samples/denoise (snapshot taken before the batch changed them)
             s.render.engine = sess.engine
             if hasattr(s, 'cycles'):
@@ -1144,7 +1166,7 @@ def _render_background(players, sess):
         s.render.image_settings.file_format = 'PNG'
         s.render.image_settings.color_depth = str(PNG_BIT_DEPTH)   # '8' or '16'
         path = os.path.join(_abs(OUT_DIR), "background.png")
-        s.render.filepath = path[:-4]
+        s.render.filepath = os.path.splitext(path)[0]
         bpy.context.view_layer.update()
         print("[BG] full scene without players")
         bpy.ops.render.render(write_still=True)
@@ -1160,8 +1182,12 @@ def _layer_steps(players, layer_objs, sess, prog, layer_infos):
     """Export each optional-layer object independently into <OUT_DIR>/layers/: beauty over a
     transparent background (display-encoded, same look as background.png), the shadow it
     casts on the scenery, and -- if EXPORT_LAYER_UV -- its UV + light for generic
-    retexturing. Players and the other layers stay hidden; in the beauty/light renders the
-    scenery is camera-invisible (it still lights/shadows the object)."""
+    retexturing. Players and the other layers stay hidden (they can be toggled off in the
+    wallpaper, so the layer must be whole with respect to them), but the SCENERY OCCLUDES
+    the layer (it is always behind the composite): in the beauty render the scenery is a
+    HOLDOUT -- it cuts the alpha where it is in front while still lighting/shadowing the
+    object -- and the same occlusion is ANDed into the UV coverage. Only players render
+    unoccluded."""
     s = sess.s
     out_dir = os.path.join(_abs(OUT_DIR), "layers")
     os.makedirs(out_dir, exist_ok=True)
@@ -1178,34 +1204,41 @@ def _layer_steps(players, layer_objs, sess, prog, layer_infos):
         bpy.context.view_layer.update()
 
     # CLEAN scene (no players, no layers) -- the baseline for the layer shadow ratios
-    sess.restore_visibility()
-    sess.mute_drivers(True)
-    for o in s.objects:
-        if o.name in char_names:
-            o.hide_render = True
-    bpy.context.view_layer.update()
-    clean, W, H = _render_combined_array(sess, ILLUM_RES_PCT)
-    clean_disp = _to_display(clean) if SHADOW_DISPLAY_RATIO else clean[:, :3]
-    yield prog("Layers: clean scene")
+    clean_disp = None
+    if EXPORT_SHADOW:
+        sess.restore_visibility()
+        sess.mute_drivers(True)
+        for o in s.objects:
+            if o.name in char_names:
+                o.hide_render = True
+        bpy.context.view_layer.update()
+        clean, W, H = _render_combined_array(sess, ILLUM_RES_PCT)
+        clean_disp = _to_display(clean) if SHADOW_DISPLAY_RATIO else clean[:, :3]
+        yield prog("Layers: clean scene")
 
     for ly in layer_objs:
         safe = _layer_safe_name(ly.name)
         info = {"name": safe, "object": ly.name}
 
-        # BEAUTY: layer alone over a transparent film; scenery camera-invisible but still
-        # lighting/shadowing it. Un-premultiply in linear, then encode to display.
+        # BEAUTY: layer alone over a transparent film, OCCLUDED by the scenery. The scenery
+        # is a holdout: camera rays hitting it cut the alpha (zero where it is in front of
+        # the layer) but it still lights/shadows the object -- the lighting stays real.
+        # Un-premultiply in linear, then encode to display. Final look -> scene settings
+        # (engine/samples/denoise), like background.png.
         _isolate(ly)
         scenery = [o for o in s.objects if o.type == 'MESH' and o is not ly]
-        sc = {o: o.visible_camera for o in scenery}
+        sc = {o: o.is_holdout for o in scenery}
         for o in scenery:
-            o.visible_camera = False
+            o.is_holdout = True
         bpy.context.view_layer.update()
         try:
             print(f"[LAYER beauty] {ly.name}")
-            comb, W, H = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+            comb, W, H = _render_combined_array(
+                sess, ILLUM_RES_PCT, transparent=True,
+                use_scene_settings=BACKGROUND_USE_SCENE_SETTINGS and not DRAFT_MODE)
         finally:
             for o, c in sc.items():
-                o.visible_camera = c
+                o.is_holdout = c
         alpha = np.clip(comb[:, 3], 0.0, 1.0)
         straight = np.where(alpha[:, None] > 1e-4,
                             comb[:, :3] / np.maximum(alpha[:, None], 1e-4), 0.0)
@@ -1215,6 +1248,7 @@ def _layer_steps(players, layer_objs, sess, prog, layer_infos):
         _save_image(beauty.reshape(-1), W, H, os.path.join(out_dir, safe + ".png"))
         info["image"] = f"layers/{safe}.png"
         info["bbox"] = _bbox_dict(_topleft_bbox(alpha > 0.004, W, H), (W, H))
+        occl = alpha > 0.5      # visible-pixel mask: clips the UV coverage the same way
         yield prog(f"Layer: {ly.name}")
 
         # SHADOW: layer camera-invisible (still casting), scenery visible.
@@ -1239,23 +1273,28 @@ def _layer_steps(players, layer_objs, sess, prog, layer_infos):
             info["shadow"] = f"layers/{safe}_shadow{LIGHTSHADOW_EXT}"
             yield prog(f"Layer shadow: {ly.name}")
 
-        # UV + LIGHT (generic retexture): gray render for the light, then the UV pass.
+        # UV + LIGHT (generic retexture): gray render for the light (only if the Illum
+        # toggle is on -- same switch as the players' light), then the UV pass. The UV
+        # coverage is clipped by the beauty's occlusion (scenery in front -> not covered).
         if EXPORT_LAYER_UV:
             lmap = None
-            _isolate(ly)
-            sv = _swap_materials([ly], _gray_diffuse_material())
-            sc = {o: o.visible_camera for o in scenery}
-            for o in scenery:
-                o.visible_camera = False
-            bpy.context.view_layer.update()
-            try:
-                print(f"[LAYER light] {ly.name}")
-                comb_l, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
-                lmap = _lin_to_srgb(comb_l[:, :3]).astype('float32')
-            finally:
-                for o, c in sc.items():
-                    o.visible_camera = c
-                _restore_materials(sv)
+            if EXPORT_ILLUM:
+                _isolate(ly)
+                sv = _swap_materials([ly], _gray_diffuse_material())
+                # light must be UNOCCLUDED (camera-invisible scenery, still lighting): the
+                # occluded pixels are simply outside the coverage and never sampled.
+                sc = {o: o.visible_camera for o in scenery}
+                for o in scenery:
+                    o.visible_camera = False
+                bpy.context.view_layer.update()
+                try:
+                    print(f"[LAYER light] {ly.name}")
+                    comb_l, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+                    lmap = _lin_to_srgb(comb_l[:, :3]).astype('float32')
+                finally:
+                    for o, c in sc.items():
+                        o.visible_camera = c
+                    _restore_materials(sv)
             dr = (_rendered_depth_range({"uv_parts": [ly]}, sess, _opaque_mask_material())
                   if UV_DEPTH_IN_BLUE else None)
             # Same scale/key as the players' "depth_range_viewer": the UV's B decodes to an
@@ -1264,9 +1303,10 @@ def _layer_steps(players, layer_objs, sess, prog, layer_infos):
             info["depth_range_viewer"] = ([round(x, 5) for x in dr] if dr else None)
             sv = _swap_materials([ly], _opaque_mask_material())
             try:
-                tag = "_UVDL" if UV_FORMAT == 'OPEN_EXR' else "_UV"
+                tag = ("_UVDL" if (UV_FORMAT == 'OPEN_EXR' and lmap is not None)
+                       else "_UV")
                 res = export_part_uv(ly, sess, "layers", tag=tag, label=safe,
-                                     depth_range=dr, light_map=lmap)
+                                     depth_range=dr, light_map=lmap, occlusion=occl)
             finally:
                 _restore_materials(sv)
             if res is not None:
@@ -1284,9 +1324,11 @@ def _layer_steps(players, layer_objs, sess, prog, layer_infos):
         layer_infos.append(info)
 
 
-def _render_combined_array(sess, res_pct, transparent=False):
+def _render_combined_array(sess, res_pct, transparent=False, use_scene_settings=False):
     """Render the Combined pass (beauty, with denoise) -> linear RGBA array, read via the
-    Viewer. transparent=True renders over a transparent film (alpha = coverage)."""
+    Viewer. transparent=True renders over a transparent film (alpha = coverage).
+    use_scene_settings=True renders with the USER's engine/samples/denoise (from the
+    _Session snapshot) -- for final-look images (layer beauty), like background.png."""
     s = sess.s
     ng = sess.ng
     vin = sess.viewer.inputs[0]
@@ -1296,10 +1338,18 @@ def _render_combined_array(sess, res_pct, transparent=False):
     ng.links.new(img_sock, vin)
     if sess.out_node:
         sess.out_node.mute = True
-    s.render.engine = 'CYCLES'
-    if hasattr(s, 'cycles'):
-        s.cycles.samples = ILLUM_SAMPLES
-        s.cycles.use_denoising = True
+    if use_scene_settings:
+        s.render.engine = sess.engine
+        if hasattr(s, 'cycles'):
+            if sess.samples is not None:
+                s.cycles.samples = sess.samples
+            if sess.denoise is not None:
+                s.cycles.use_denoising = sess.denoise
+    else:
+        s.render.engine = 'CYCLES'
+        if hasattr(s, 'cycles'):
+            s.cycles.samples = ILLUM_SAMPLES
+            s.cycles.use_denoising = True
     s.render.resolution_percentage = res_pct
     s.render.film_transparent = transparent
     s.render.use_compositing = True
@@ -1458,9 +1508,12 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                                              f"illum_{vname}{LIGHTSHADOW_EXT}"),
                                 colorspace=ILLUM_COLORSPACE, file_format=LIGHTSHADOW_FORMAT)
                     if light_maps is not None:
+                        # uint8: these stay in RAM for the whole batch (2 maps per player/
+                        # variant; float32 would be ~800 MB at 4K with 2 players) and end up
+                        # in 8-bit files anyway. export_part_uv converts back to float.
                         light_maps[(p["label"], vname)] = {
-                            "base": _lin_to_srgb(comb_base[:, :3]).astype('float32'),
-                            "full": _lin_to_srgb(comb_full[:, :3]).astype('float32'),
+                            "base": (_lin_to_srgb(comb_base[:, :3]) * 255.0 + 0.5).astype('uint8'),
+                            "full": (_lin_to_srgb(comb_full[:, :3]) * 255.0 + 0.5).astype('uint8'),
                         }
 
                 # SHADOW output: ratio vs the clean scene (no body masking -- the body isn't
@@ -1558,9 +1611,13 @@ def _write_manifest(players, out_path, layer_infos=None):
                   if li.get("camera_depth") is not None])
     draw_order = [name for name, _ in sorted(entries, key=lambda e: e[1], reverse=True)]
     manifest = {
+        "manifest_version": MANIFEST_VERSION,
+        "addon_version": ADDON_VERSION,
         "render": {
             "resolution": [s.render.resolution_x, s.render.resolution_y],
             "engine": s.render.engine,
+            "draft": DRAFT_MODE or None,
+            "res_pct": MASK_RES_PCT,
             "uv_samples": UV_SAMPLES,
             "mask_samples": MASK_SAMPLES,
             "mask_res_pct": MASK_RES_PCT,
@@ -1627,6 +1684,9 @@ def _write_manifest(players, out_path, layer_infos=None):
             for p in players
         ],
         "layers": (layer_infos or None),
+        "layers_note": ("layer beauty/UV are OCCLUDED by the scenery (players and other "
+                        "layers excluded -- they can be toggled off); only players render "
+                        "unoccluded" if layer_infos else None),
         "draw_order_back_to_front": draw_order or [p["label"] for p in ordered],
     }
     with open(out_path, "w") as f:
@@ -1704,7 +1764,9 @@ def _render_steps(players, op=None):
              + (len(players) * n_variants if COMPOSITE_BASE_LAYER else 0)  # base composites
              + (n_parts if EXPORT_BACKFACE_UV else 0)              # back UVs
              + (1 if EXPORT_BACKGROUND else 0)          # background
-             + ((1 + len(layer_objs) * (3 if EXPORT_LAYER_UV else 2))
+             + (((1 if EXPORT_SHADOW else 0)                       # layers: clean baseline
+                 + len(layer_objs) * (1 + (1 if EXPORT_SHADOW else 0)
+                                      + (1 if EXPORT_LAYER_UV else 0)))
                 if layer_objs else 0)                              # optional layers
              + 1)                                                  # manifest
     total = max(total, 1)
@@ -1921,8 +1983,17 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
                     "Minecraft hat size (a bit bigger than the head)")
     illum_samples: IntProperty(name="Illum samples", default=48, min=1, max=4096)
     lightshadow_format: EnumProperty(
-        name="Illum/Shadow", items=[('JPEG', "JPEG", ""), ('PNG', "PNG", "")], default='JPEG')
-    jpeg_quality: IntProperty(name="JPEG quality", default=90, min=1, max=100)
+        name="Illum/Shadow",
+        items=[('JPEG', "JPEG", ""),
+               ('WEBP', "WebP", "Smaller than JPEG at the same quality; browser-friendly"),
+               ('PNG', "PNG", "")],
+        default='JPEG')
+    jpeg_quality: IntProperty(name="Quality", default=90, min=1, max=100,
+                              description="JPEG/WebP quality")
+    draft: BoolProperty(
+        name="Draft (fast preview)", default=False,
+        description="Render everything at 50% resolution with few samples -- fast "
+                    "iteration on framing/marking; not for the final export")
 
 
 def _apply_settings(scene):
@@ -1941,11 +2012,17 @@ def _apply_settings(scene):
     g["COMPOSITE_BASE_LAYER"] = st.composite_base_layer
     g["EXPORT_BACKGROUND"] = st.export_background
     g["FIX_2LAYER_POSITION"] = st.fix_2layer_position
-    g["ILLUM_SAMPLES"] = st.illum_samples
     g["LIGHTSHADOW_FORMAT"] = st.lightshadow_format
     g["JPEG_QUALITY"] = st.jpeg_quality
     g["UV_EXT"] = '.exr' if st.uv_format == 'OPEN_EXR' else '.png'
-    g["LIGHTSHADOW_EXT"] = '.jpg' if st.lightshadow_format == 'JPEG' else '.png'
+    g["LIGHTSHADOW_EXT"] = {'JPEG': '.jpg', 'WEBP': '.webp'}.get(st.lightshadow_format,
+                                                                 '.png')
+    # Draft mode: all render resolutions MUST stay equal (UV/mask/illum/shadow/background
+    # align pixel-for-pixel), so the percentage is set globally here.
+    g["DRAFT_MODE"] = st.draft
+    g["ILLUM_SAMPLES"] = min(DRAFT_SAMPLES, st.illum_samples) if st.draft else st.illum_samples
+    g["MASK_RES_PCT"] = DRAFT_RES_PCT if st.draft else 100
+    g["ILLUM_RES_PCT"] = DRAFT_RES_PCT if st.draft else 100
 
 
 # ----------------------- Operator + menu + panel -----------------------
@@ -2080,14 +2157,24 @@ class OBJECT_OT_novaskin_layer_toggle(bpy.types.Operator):
     def poll(cls, context):
         return any(o.type == 'MESH' for o in context.selected_objects)
 
+    @staticmethod
+    def _is_player_part(o):
+        """True if the mesh is rigged to a player armature (Rig_ID) -- marking it as a layer
+        would silently break the export (hidden from masks AND exported separately)."""
+        return any(m.type == 'ARMATURE' and m.object is not None
+                   and RIG_ID_PROP in m.object.keys() for m in o.modifiers)
+
     def execute(self, context):
-        marked = unmarked = 0
+        marked = unmarked = skipped = 0
         for o in context.selected_objects:
             if o.type != 'MESH':
                 continue
             if LAYER_ID_PROP in o.keys():
                 del o[LAYER_ID_PROP]
                 unmarked += 1
+            elif self._is_player_part(o):
+                skipped += 1
+                print(f"[LAYER] '{o.name}' is part of a player rig -- not marked.")
             else:
                 o[LAYER_ID_PROP] = 1
                 marked += 1
@@ -2096,6 +2183,11 @@ class OBJECT_OT_novaskin_layer_toggle(bpy.types.Operator):
             parts.append(f"{marked} marked")
         if unmarked:
             parts.append(f"{unmarked} unmarked")
+        if skipped:
+            parts.append(f"{skipped} skipped (player part)")
+            self.report({'WARNING'},
+                        "NovaSkin layers: " + ", ".join(parts))
+            return {'FINISHED'}
         self.report({'INFO'}, "NovaSkin layers: " + (", ".join(parts) or "no mesh selected"))
         return {'FINISHED'}
 
@@ -2140,6 +2232,9 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         box = layout.box()
         box.label(text="Output", icon='FILE_FOLDER')
         box.prop(st, "out_dir")
+        if os.path.isdir(_abs(st.out_dir)):
+            box.operator("wm.path_open", text="Open Output Folder",
+                         icon='FOLDER_REDIRECT').filepath = _abs(st.out_dir)
         box.prop(st, "uv_format")
         if st.uv_format == 'OPEN_EXR':
             row = box.row(align=True)
@@ -2157,10 +2252,11 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 
         box = layout.box()
         box.label(text="Quality", icon='SETTINGS')
+        box.prop(st, "draft", icon='MOD_FLUID')
         box.prop(st, "illum_samples")
         row = box.row(align=True)
         row.prop(st, "lightshadow_format", text="")
-        if st.lightshadow_format == 'JPEG':
+        if st.lightshadow_format in {'JPEG', 'WEBP'}:
             row.prop(st, "jpeg_quality", text="Q")
 
         box = layout.box()

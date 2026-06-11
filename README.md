@@ -143,20 +143,28 @@ materials), even on cancel or error.
 │   ├── <name>_shadow.jpg            # shadow it casts on the scenery (display multiply)
 │   ├── <name>_UV.png                # generic UV (retexture); EXR mode: <name>_UVDL.exr
 │   └── <name>_light.jpg             # its light map (PNG pipeline)
-└── manifest.json                    # resolution, engine, draw_order (back→front), etc.
+└── manifest.json                    # manifest_version, addon_version, resolution,
+                                     #   draw_order (back→front), bboxes, depth ranges, etc.
 ```
 
 ### Optional layers
 
 Select any scenery mesh and click **“Mark Selected as Layer”** in the panel (it toggles —
-click again to unmark; marked objects are listed in the panel). Each marked object is
-**hidden from the background and from the whole player pipeline** and exported as an
-independent toggleable layer in `layers/`: beauty (transparent background, lit by the real
-scene — the scenery is camera-invisible but still lights/shadows it), the shadow it casts
-on the scenery, and its UV + light for generic retexturing (`EXPORT_LAYER_UV`). The
-manifest lists each layer (files, bbox, `camera_depth`) and includes them in
-`draw_order_back_to_front`. Trade-off: a layer's shadow never falls on a player (the player
-light is independent of layer toggles).
+click again to unmark; marked objects are listed in the panel; player-rig meshes are
+refused). Each marked object is **hidden from the background and from the whole player
+pipeline** and exported as an independent toggleable layer in `layers/`: beauty
+(transparent background, lit by the real scene), the shadow it casts on the scenery, and
+its UV + light for generic retexturing (`EXPORT_LAYER_UV`; the light follows the Illum
+toggle). The manifest lists each layer (files, bbox, `camera_depth`,
+`depth_range_viewer`) and includes them in `draw_order_back_to_front`.
+
+**Occlusion:** unlike players (always rendered unoccluded, in front), a layer **is
+occluded by the scenery** — the scenery renders as a *holdout* (cuts the alpha where it
+is in front while still lighting/shadowing the object) and the UV coverage is clipped
+the same way. Players and the **other layers** are excluded from the render instead
+(they can be toggled off in the wallpaper, so the layer must be whole with respect to
+them). Trade-off: a layer's shadow never falls on a player (the player light is
+independent of layer toggles).
 
 ---
 
@@ -185,7 +193,8 @@ Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key o
 | `PNG_BIT_DEPTH` | Bit depth of UV/mask PNGs (default `8`; 256 levels, enough for MC skins) |
 | `UV_FORMAT` / `EXR_HALF` / `EXR_CODEC` | UV + base_layer format: `PNG` (default) or `OPEN_EXR` (half-float, `ZIP` ≈ PNG size, lossless). As EXR + illum, the RGB light is embedded as an extra `light.*` layer — see note |
 | `COMPOSITE_BASE_LAYER` / `COMPOSITE_BASE_LABELS` | Composite base parts into `base_layer.png` (nearest pixel wins) |
-| `LIGHTSHADOW_FORMAT` / `JPEG_QUALITY` | Illum + shadow file format (default `JPEG`, quality `90`) |
+| `LIGHTSHADOW_FORMAT` / `JPEG_QUALITY` | Illum + shadow file format: `JPEG` (default), `WEBP` (~30% smaller, browser-friendly) or `PNG`; quality `90` |
+| `DRAFT_MODE` (panel: *Draft*) | Everything at 50% resolution with few samples — fast preview, recorded in the manifest |
 | `RIG_ID_PROP` / `RIG_ID_VALUE` | How players are detected |
 | `RENAME_UV_PARTS` / `MC_PART_MAP` | Rename UV files to Minecraft labels (head/hat, body/jacket, arm/sleeve, leg/pant, `_left`/`_right`, `_classic`/`_slim`) |
 
