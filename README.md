@@ -3,13 +3,17 @@
 A Blender add-on/script that exports, per player, the data layers of a
 **Thomas_Rig_Legacy** rig for downstream compositing:
 
-- **UV** per part (R=U, G=V, B=normalized depth), front and back, 16-bit raw.
+- **UV** per part (R=U, G=V, B=normalized depth, A=coverage), front and back, raw 8-bit
+  PNG (or float EXR), named with Minecraft labels (`head`, `hat`, `body`, `jacket`, …).
 - **Character mask** (Object Index), occluded by scenery **and** by other players,
   in both arm variants (`classic` = Steve arms, `slim` = Alex arms).
-- **Illum + shadow** per player/variant (resolves occlusion between players).
-- **Background without players** + `manifest.json` with the rigs' depth order.
+- **Per-layer light** (base parts lit from a base-only render, overlays from the full one)
+  + **cast shadow** per player/variant, and `base_layer_*` composites.
+- **Background** (scene without players/layers), **optional layers** (marked scenery
+  objects exported independently), and a `manifest.json` with bboxes + draw order.
 
-Output: `<.blend dir>/novaskin/` (one subfolder per player + scene-level files).
+Output: `<.blend dir>/novaskin/` (one subfolder per player — `player1`, `player2`, … —
+plus `layers/` and scene-level files).
 
 ---
 
@@ -72,16 +76,19 @@ Ways to update:
 
 1. **Reinstall** — *Install from Disk* again pointing at the new file (overwrites the
    copy). Simple, but manual on every change.
-2. **Link via a Script Directory** *(best if you edit often)* —
-   `Edit > Preferences > File Paths > Script Directories` → **Add** pointing at a folder
-   that contains an `addons/` subfolder with `render_uv_mask.py` (e.g. this repo with
-   `addons/render_uv_mask.py`). Blender loads it straight from disk; after editing, use
-   **F3 → “Reload Scripts”** (or restart) to reload.
+2. **Symlink into the add-ons folder** *(best if you edit often)* — link the repo file
+   into Blender's user add-ons dir, e.g. on macOS:
+   ```
+   ln -s /path/to/repo/render_uv_mask.py \
+     "~/Library/Application Support/Blender/<ver>/scripts/addons/render_uv_mask.py"
+   ```
+   Blender loads it straight from the repo; after editing, **F3 → “Reload Scripts”**
+   (or restart) reloads it.
 3. **Scripting workspace (Option B)** — during development, this always runs the current
    version of the open file; no reinstall needed.
 
 > Summary: for stable use, **Option A** (reinstall when it changes). For heavy iteration,
-> **Script Directory** or **Scripting** avoid reinstalling on every edit.
+> the **symlink** or **Scripting** avoid reinstalling on every edit.
 
 ---
 
@@ -89,7 +96,7 @@ Ways to update:
 
 When launched from the panel/menu (modal), the progress shows in three places: a **progress
 bar in the NovaSkin panel** (replacing the run button while it works), the **3D Viewport
-header**, and the **status bar** (`NovaSkin 42% - UV front: Thomas_rig / head`). Cancel with
+header**, and the **status bar** (`NovaSkin 42% - UV front: player1 / head`). Cancel with
 the **Cancel button** in the panel, or **Esc** (mouse in the viewport) — either way the
 scene is restored to its original state (it takes effect at the next step boundary).
 
@@ -107,7 +114,7 @@ materials), even on cancel or error.
 
 ```
 <.blend dir>/novaskin/
-├── <armature>/                      # one per player (e.g. Thomas_rig, Thomas_rig.001, ...)
+├── player1/                         # one per player (sorted by armature name)
 │   ├── <part>_UV.png                # R=U, G=V, B=depth, A=coverage(0 outside); MC label; 8-bit
 │   │                                #   (EXR "<part>_UVDL.exr" packs the light in a layer)
 │   ├── <part>_light.jpg             # per-part light (base parts: base render; overlays: full)
@@ -156,7 +163,13 @@ Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key o
 | `EXPORT_BACKFACE_UV` | Also export the back-face UVs |
 | `EXPORT_ILLUM` / `EXPORT_SHADOW` | Per-player light (per-part + illum image) and cast shadow — independent toggles |
 | `EXPORT_BACKGROUND` | Render the scenery without players/layers (`background.png`) |
-| `LAYER_ID_PROP` / `EXPORT_LAYER_UV` | Optional layers: marker property name; also export each layer's UV + light |
+| `LAYER_ID_PROP` / `EXPORT_LAYER_UV` | Optional layers: marker property name; `EXPORT_LAYER_UV` (default **on**) also exports each layer's UV + light |
+| `EXPORT_PART_LIGHT` | Save the per-part light images (`<part>_light.jpg`, PNG pipeline; default on) |
+| `SHADOW_DISPLAY_RATIO` | Shadow ratio in display space (view-transformed) so multiplying it onto the background matches the render (default on) |
+| `ILLUM_HIDE_SCENERY_FROM_CAMERA` | Light renders: scenery camera-invisible so foreground objects don't bleed into the player light (default on) |
+| `BACKGROUND_USE_SCENE_SETTINGS` | Background renders with the user's engine/samples/denoise (default on) |
+| `PNG_COMPRESSION` | zlib level for data PNGs (default `90`; byte-exact) |
+| `UV_PNG_FLOOR_TEXELS` / `UV_TEXEL_BINS` | PNG U/V quantized with `floor` into texel bins (byte = texel index @256) |
 | `FIX_2LAYER_POSITION` / `HAT_SCALE_RATIO` | Snap the hat (`2_Layer_Extrusion`) onto `NoFace_Head` and scale it to the Minecraft hat size (`1.125`× the head) before export (persistent) |
 | `ILLUM_SAMPLES` / `ILLUM_COLORSPACE` | Illum quality/encoding |
 | `PNG_BIT_DEPTH` | Bit depth of UV/mask PNGs (default `8`; 256 levels, enough for MC skins) |
@@ -164,21 +177,34 @@ Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key o
 | `COMPOSITE_BASE_LAYER` / `COMPOSITE_BASE_LABELS` | Composite base parts into `base_layer.png` (nearest pixel wins) |
 | `LIGHTSHADOW_FORMAT` / `JPEG_QUALITY` | Illum + shadow file format (default `JPEG`, quality `90`) |
 | `RIG_ID_PROP` / `RIG_ID_VALUE` | How players are detected |
-| `RENAME_UV_PARTS` / `MC_PART_MAP` | Rename UV files to Minecraft labels (head/hat, body/jacket, arm/sleeve, leg/pant, `_l`/`_r`, `_classic`/`_slim`) |
+| `RENAME_UV_PARTS` / `MC_PART_MAP` | Rename UV files to Minecraft labels (head/hat, body/jacket, arm/sleeve, leg/pant, `_left`/`_right`, `_classic`/`_slim`) |
 
 UV part filenames use Minecraft-style labels: `head`, `hat`, `body`, `jacket`,
 `arm_{left,right}_{classic,slim}`, `sleeve_{left,right}_{classic,slim}`,
-`leg_{left,right}`, `pant_{left,right}`. Front files are `<part>_UVDL.png`
-(R=U, G=V, B=depth, A=light); `base_layer_{classic,slim}.png` composite the base parts.
+`leg_{left,right}`, `pant_{left,right}`. Front files are `<part>_UV.png`
+(R=U, G=V, B=depth, A=coverage; `<part>_UVDL.exr` with a `light` layer in EXR mode);
+`base_layer_{classic,slim}.png` composite the base parts (nearest depth wins).
 Unmapped meshes fall back to a sanitized object name, and duplicate labels get a `_2`/`_3`
 suffix. The mapping (label → object name) is recorded in `manifest.json` per player. To
 disable and keep raw object names, set `RENAME_UV_PARTS = False`.
+
+### Applying the light and shadow
+
+- **Light** (`<part>_light.jpg` / EXR `light` layer): the scene lighting captured on a
+  **0.5 gray** Lambertian body (sRGB). Relight a part with
+  `lit = skin × (light / 0.5)` (in linear; ≈ multiply + 2× exposure in a 2D canvas). Base
+  parts are lit from a base-only render, overlays from the full render — each layer is lit
+  where it is front-most. Self-shadowing is already in the light; `shadow_*` is only the
+  shadow cast on the scenery.
+- **Shadow** (`shadow_*.jpg`, players and layers): a **display-space multiply** map
+  (white = no shadow). Combine multiple shadows with *darken* (per-pixel min), then
+  *multiply* the result onto `background.png` — this reproduces the Blender render.
 
 ### Reading the UV alpha (light): mind premultiplied alpha
 
 **PNG** files are `<part>_UV.png` with RGBA = (U, V, depth, coverage) — alpha is `0`/`1`
 (coverage), so they read fine anywhere, including an HTML 2D canvas. The light is the
-separate `illum_*.jpg`.
+separate `<part>_light.jpg` (and the full-body `illum_*.jpg`).
 
 **EXR** files (`UV_FORMAT='OPEN_EXR'`) keep the same RGBA = (U, V, depth, coverage) and,
 when the illum pass is on, embed the **RGB light** as an extra `light.*` channel layer
