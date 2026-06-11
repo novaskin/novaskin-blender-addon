@@ -137,7 +137,7 @@ Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key o
 | `MASK_ARM_VARIANTS` | Arm variants exported (`classic`/`slim`) |
 | `UV_DEPTH_IN_BLUE` | Write normalized depth into the UV's B channel |
 | `EXPORT_BACKFACE_UV` | Also export the back-face UVs |
-| `EXPORT_PLAYER_ILLUM_SHADOW` | Illum + shadow per player |
+| `EXPORT_ILLUM` / `EXPORT_SHADOW` | Per-player light (per-part + illum image) and cast shadow — independent toggles |
 | `EXPORT_BACKGROUND_NO_PLAYERS` | Render the scenery without players |
 | `FIX_2LAYER_POSITION` / `HAT_SCALE_RATIO` | Snap the hat (`2_Layer_Extrusion`) onto `NoFace_Head` and scale it to the Minecraft hat size (`1.125`× the head) before export (persistent) |
 | `ILLUM_SAMPLES` / `ILLUM_COLORSPACE` | Illum quality/encoding |

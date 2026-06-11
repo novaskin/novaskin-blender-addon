@@ -118,11 +118,11 @@ EXPORT_BACKFACE_UV = True
 # by the CHARACTER's depth range (camera Z); otherwise B stays 1.0.
 UV_DEPTH_IN_BLUE = True
 
-# Per-PLAYER illum + shadow (solves occlusion between players). Renders the scene with
-# only 1 player in gray at a time (others hidden), per arm variant; from the SAME render
-# we extract the body's illumination (masked by the player's mask) AND the shadow it casts
-# on the scenery (ratio vs the clean scene). Replaces the global illum.
-EXPORT_PLAYER_ILLUM_SHADOW = True
+# Per-PLAYER illum + shadow (renders 1 player in gray at a time, others hidden, per arm
+# variant). ILLUM = the per-part light + the full-body illum image; SHADOW = the shadow the
+# player casts on the scenery (ratio vs the clean scene). Independent toggles.
+EXPORT_ILLUM = True
+EXPORT_SHADOW = True
 # Also save the per-part light as its own image next to the UV ("<part>_light.<ext>", the
 # illum/shadow format). Needed for the PNG pipeline (the light can't go in the UV alpha --
 # canvas premultiply). With EXR the light is embedded in the UV's 'light' layer instead.
@@ -1114,18 +1114,20 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
     all_char = [o for p in players for o in p["char_all"]]
     char_names = set(o.name for o in all_char)
 
-    # 1) CLEAN scene (all players hidden) -- basis for the shadow ratio
-    sess.restore_visibility()
-    sess.mute_drivers(True)
-    for o in s.objects:
-        if o.name in char_names:
-            o.hide_render = True
-    bpy.context.view_layer.update()
-    clean, W, H = _render_combined_array(sess, ILLUM_RES_PCT)
-    yield prog("Illum/shadow: clean scene")
+    # CLEAN scene (all players hidden) -- the shadow ratio's baseline (SHADOW only)
+    clean = None
+    W = H = None
+    if EXPORT_SHADOW:
+        sess.restore_visibility()
+        sess.mute_drivers(True)
+        for o in s.objects:
+            if o.name in char_names:
+                o.hide_render = True
+        bpy.context.view_layer.update()
+        clean, W, H = _render_combined_array(sess, ILLUM_RES_PCT)
+        yield prog("Shadow: clean scene")
 
-    # Base-layer label set per arm variant (the shadow is cast by the base only -- no hat/
-    # jacket/sleeve/pant overlays).
+    # Base-layer label set per arm variant (the base light and the shadow are base-only).
     base_sets = {v: {lab.format(variant=v) for lab in COMPOSITE_BASE_LABELS}
                  for v, _ in MASK_ARM_VARIANTS}
 
@@ -1154,22 +1156,24 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                             if o.type == 'MESH' and o.name not in active_names]
                            if ILLUM_HIDE_SCENERY_FROM_CAMERA else [])
                 bpy.context.view_layer.update()
+                comb_full = comb_base = comb_sh = None
                 try:
-                    # FULL light: scenery invisible to the camera (player not occluded by
-                    # foreground objects; their light/shadow contribution stays).
-                    sc = {o: o.visible_camera for o in scenery}
-                    for o in scenery:
-                        o.visible_camera = False
-                    bpy.context.view_layer.update()
-                    try:
-                        print(f"[ILLUM full] {p['label']} / {vname}")
-                        comb_full, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
-                    finally:
-                        for o, c in sc.items():
-                            o.visible_camera = c
+                    # FULL light (illum): overlays visible, scenery invisible to the camera
+                    # (player not occluded by foreground; their light/shadow stays).
+                    if EXPORT_ILLUM:
+                        sc = {o: o.visible_camera for o in scenery}
+                        for o in scenery:
+                            o.visible_camera = False
+                        bpy.context.view_layer.update()
+                        try:
+                            print(f"[ILLUM full] {p['label']} / {vname}")
+                            comb_full, W, H = _render_combined_array(sess, ILLUM_RES_PCT)
+                        finally:
+                            for o, c in sc.items():
+                                o.visible_camera = c
 
-                    # Hide the overlays (hat/jacket/sleeve/pant): the BASE light and the
-                    # shadow are both for the base layer only.
+                    # Hide the overlays (hat/jacket/sleeve/pant): base light + shadow are
+                    # base-only.
                     base_set = base_sets[vname]
                     labels = p.get("uv_labels") or {}
                     overlays = [o for o in p["uv_parts"]
@@ -1185,32 +1189,31 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                         o.hide_render = True
                     bpy.context.view_layer.update()
                     try:
-                        # BASE light: base visible (its own lighting even where overlays would
-                        # occlude it), scenery again invisible to the camera.
-                        sc = {o: o.visible_camera for o in scenery}
-                        for o in scenery:
-                            o.visible_camera = False
-                        bpy.context.view_layer.update()
-                        try:
-                            print(f"[ILLUM base] {p['label']} / {vname}")
-                            comb_base, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
-                        finally:
-                            for o, c in sc.items():
-                                o.visible_camera = c
-
-                        # SHADOW: base layer INVISIBLE to the camera (still casting), scenery
-                        # VISIBLE (the shadow falls on it).
-                        sh_cam = {}
-                        for o in p["char_all"]:
-                            sh_cam[o] = o.visible_camera
-                            o.visible_camera = False
-                        bpy.context.view_layer.update()
-                        try:
-                            print(f"[SHADOW] {p['label']} / {vname} (base only, no-camera)")
-                            comb_sh, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
-                        finally:
-                            for o, c in sh_cam.items():
-                                o.visible_camera = c
+                        if EXPORT_ILLUM:
+                            # BASE light: base visible, scenery invisible to the camera.
+                            sc = {o: o.visible_camera for o in scenery}
+                            for o in scenery:
+                                o.visible_camera = False
+                            bpy.context.view_layer.update()
+                            try:
+                                print(f"[ILLUM base] {p['label']} / {vname}")
+                                comb_base, W, H = _render_combined_array(sess, ILLUM_RES_PCT)
+                            finally:
+                                for o, c in sc.items():
+                                    o.visible_camera = c
+                        if EXPORT_SHADOW:
+                            # SHADOW: base INVISIBLE to the camera (still casting), scenery
+                            # VISIBLE (the shadow falls on it).
+                            sh_cam = {o: o.visible_camera for o in p["char_all"]}
+                            for o in p["char_all"]:
+                                o.visible_camera = False
+                            bpy.context.view_layer.update()
+                            try:
+                                print(f"[SHADOW] {p['label']} / {vname} (base only, no-camera)")
+                                comb_sh, W, H = _render_combined_array(sess, ILLUM_RES_PCT)
+                            finally:
+                                for o, c in sh_cam.items():
+                                    o.visible_camera = c
                     finally:
                         for o, hr in sh_hidden:
                             o.hide_render = hr
@@ -1224,40 +1227,36 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                         d.mute = False
                     _restore_arm_style(arm, p, saved_arm)
 
-                mpath = os.path.join(_abs(OUT_DIR), p["label"], f"mask_{vname}.png")
-                mask = _load_gray_channel(mpath, W, H)
-                body = (mask > 0.5) if mask is not None else np.zeros(W * H, dtype=bool)
+                # ILLUM outputs: full-body illum image (masked) + per-layer light maps
+                if EXPORT_ILLUM:
+                    mpath = os.path.join(_abs(OUT_DIR), p["label"], f"mask_{vname}.png")
+                    mask = _load_gray_channel(mpath, W, H)
+                    body = (mask > 0.5) if mask is not None else np.zeros(W * H, dtype=bool)
+                    illum = comb_full.copy()
+                    illum[~body] = 0.0
+                    illum[:, 3] = 1.0
+                    _save_image(illum.reshape(-1), W, H,
+                                os.path.join(_abs(OUT_DIR), p["label"],
+                                             f"illum_{vname}{LIGHTSHADOW_EXT}"),
+                                colorspace=ILLUM_COLORSPACE, file_format=LIGHTSHADOW_FORMAT)
+                    if light_maps is not None:
+                        light_maps[(p["label"], vname)] = {
+                            "base": _lin_to_srgb(comb_base[:, :3]).astype('float32'),
+                            "full": _lin_to_srgb(comb_full[:, :3]).astype('float32'),
+                        }
 
-                # illum image = the full lit body, masked by the player's silhouette
-                illum = comb_full.copy()
-                illum[~body] = 0.0
-                illum[:, 3] = 1.0
-                _save_image(illum.reshape(-1), W, H,
-                            os.path.join(_abs(OUT_DIR), p["label"],
-                                         f"illum_{vname}{LIGHTSHADOW_EXT}"),
-                            colorspace=ILLUM_COLORSPACE, file_format=LIGHTSHADOW_FORMAT)
-
-                # Per-layer light maps (sRGB): base parts use the base-only render, overlay
-                # parts the full render -- each lit where its layer is front-most. cov in
-                # export_part_uv picks each part's own pixels.
-                if light_maps is not None:
-                    light_maps[(p["label"], vname)] = {
-                        "base": _lin_to_srgb(comb_base[:, :3]).astype('float32'),
-                        "full": _lin_to_srgb(comb_full[:, :3]).astype('float32'),
-                    }
-
-                # shadow = ratio vs the clean scene, from the base-only no-camera render. No
-                # body masking: the body isn't in the render, so the contact shadow under/
-                # around it is kept (the character is composited on top later).
-                ratio = np.clip(comb_sh[:, :3] / np.clip(clean[:, :3], 1e-4, None), 0.0, 1.0)
-                shadow = np.empty((ratio.shape[0], 4), dtype='float32')
-                shadow[:, :3] = ratio
-                shadow[:, 3] = 1.0
-                _save_image(shadow.reshape(-1), W, H,
-                            os.path.join(_abs(OUT_DIR), p["label"],
-                                         f"shadow_{vname}{LIGHTSHADOW_EXT}"),
-                            file_format=LIGHTSHADOW_FORMAT)
-                yield prog(f"Illum+shadow: {p['label']} / {vname}")
+                # SHADOW output: ratio vs the clean scene (no body masking -- the body isn't
+                # in the render, so the contact shadow under/around it is kept).
+                if EXPORT_SHADOW:
+                    ratio = np.clip(comb_sh[:, :3] / np.clip(clean[:, :3], 1e-4, None), 0.0, 1.0)
+                    shadow = np.empty((ratio.shape[0], 4), dtype='float32')
+                    shadow[:, :3] = ratio
+                    shadow[:, 3] = 1.0
+                    _save_image(shadow.reshape(-1), W, H,
+                                os.path.join(_abs(OUT_DIR), p["label"],
+                                             f"shadow_{vname}{LIGHTSHADOW_EXT}"),
+                                file_format=LIGHTSHADOW_FORMAT)
+                yield prog(f"Light: {p['label']} / {vname}")
     finally:
         _restore_materials(saved_mats)
 
@@ -1339,7 +1338,7 @@ def _write_manifest(players, out_path):
             "uv_depth_in_blue": UV_DEPTH_IN_BLUE,
             "export_backface_uv": EXPORT_BACKFACE_UV,
             "uv_file_suffix": ("_UVDL" if (UV_FORMAT == 'OPEN_EXR'
-                                           and EXPORT_PLAYER_ILLUM_SHADOW) else "_UV"),
+                                           and EXPORT_ILLUM) else "_UV"),
             "uv_format": UV_FORMAT,
             "uv_ext": UV_EXT,
             "uv_channels": (
@@ -1347,7 +1346,7 @@ def _write_manifest(players, out_path):
                  if UV_DEPTH_IN_BLUE else "R=U, G=V, B=1.0")
                 + ", A=coverage (1 in part, 0 outside)"
                 + (" + light layer (light.R/G/B, sRGB)"
-                   if (UV_FORMAT == 'OPEN_EXR' and EXPORT_PLAYER_ILLUM_SHADOW) else "")),
+                   if (UV_FORMAT == 'OPEN_EXR' and EXPORT_ILLUM) else "")),
             "uv_png_texel_bins": (UV_TEXEL_BINS
                                   if (UV_FORMAT != 'OPEN_EXR' and UV_PNG_FLOOR_TEXELS)
                                   else None),
@@ -1363,11 +1362,13 @@ def _write_manifest(players, out_path):
                                   if EXPORT_ILLUM_BACKGROUND else None),
             "background_no_players": ("background_no_players.png"
                                       if EXPORT_BACKGROUND_NO_PLAYERS else None),
-            "player_illum_shadow": (
-                {"illum": [f"illum_{v}{LIGHTSHADOW_EXT}" for v, _ in MASK_ARM_VARIANTS],
-                 "shadow": [f"shadow_{v}{LIGHTSHADOW_EXT}" for v, _ in MASK_ARM_VARIANTS],
-                 "note": "per player (in the subfolder); shadow is multiply (1=no shadow)"}
-                if EXPORT_PLAYER_ILLUM_SHADOW else None),
+            "player_illum_shadow": ({
+                "illum": ([f"illum_{v}{LIGHTSHADOW_EXT}" for v, _ in MASK_ARM_VARIANTS]
+                          if EXPORT_ILLUM else None),
+                "shadow": ([f"shadow_{v}{LIGHTSHADOW_EXT}" for v, _ in MASK_ARM_VARIANTS]
+                           if EXPORT_SHADOW else None),
+                "note": "per player (in the subfolder); shadow is multiply (1=no shadow)",
+            } if (EXPORT_ILLUM or EXPORT_SHADOW) else None),
         },
         "players": [
             {
@@ -1449,7 +1450,8 @@ def _render_steps(players, op=None):
     n_variants = len(MASK_ARM_VARIANTS)
     total = (len(players)                                          # depth ranges
              + len(players) * n_variants                           # masks
-             + ((1 + len(players) * n_variants) if EXPORT_PLAYER_ILLUM_SHADOW
+             + (((1 if EXPORT_SHADOW else 0) + len(players) * n_variants)
+                if (EXPORT_ILLUM or EXPORT_SHADOW)
                 else (n_variants if EXPORT_ILLUM_BACKGROUND else 0))  # illum/shadow
              + n_parts                                             # front UVs
              + (len(players) * n_variants if COMPOSITE_BASE_LAYER else 0)  # base composites
@@ -1467,7 +1469,7 @@ def _render_steps(players, op=None):
     # light_maps[(player_label, variant)] = sRGB RGB light (N,3), filled by the illum step
     # and embedded as a 'light' layer in EXR UVs. Empty if the illum step is disabled.
     light_maps = {}
-    have_light = EXPORT_PLAYER_ILLUM_SHADOW
+    have_light = EXPORT_ILLUM
     embed_light = (UV_FORMAT == 'OPEN_EXR' and have_light)   # light goes inside the EXR
     front_tag = "_UVDL" if embed_light else "_UV"
 
@@ -1497,7 +1499,7 @@ def _render_steps(players, op=None):
         finally:
             _restore_materials(saved_mats)
         # 2) ILLUM (light) + shadow FIRST, so the light can be packed into the UV alpha.
-        if EXPORT_PLAYER_ILLUM_SHADOW:
+        if EXPORT_ILLUM or EXPORT_SHADOW:
             yield from _illum_shadow_steps(players, sess, _gray_diffuse_material(), prog,
                                            light_maps)
         elif EXPORT_ILLUM_BACKGROUND:   # global illum (all together) -- legacy path
@@ -1654,12 +1656,13 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         name="EXR Codec",
         items=[(c, c, "") for c in ('ZIP', 'ZIPS', 'PIZ', 'PXR24', 'RLE', 'NONE', 'DWAA', 'DWAB')],
         default='ZIP')
-    export_backface_uv: BoolProperty(name="Back-face UVs", default=True)
-    export_player_illum_shadow: BoolProperty(name="Illum + shadow", default=True)
-    composite_base_layer: BoolProperty(name="base_layer composite", default=True)
+    export_backface_uv: BoolProperty(name="Back Faces", default=True)
+    export_illum: BoolProperty(name="Illum", default=True)
+    export_shadow: BoolProperty(name="Shadow", default=True)
+    composite_base_layer: BoolProperty(name="Base Layer Composite", default=True)
     export_background_no_players: BoolProperty(name="Background (no players)", default=True)
     fix_2layer_position: BoolProperty(
-        name="Fix hat position", default=True,
+        name="Fix Hat Position and Scale", default=True,
         description="Snap the hat (2_Layer_Extrusion) onto the head and scale it to the "
                     "Minecraft hat size (a bit bigger than the head)")
     illum_samples: IntProperty(name="Illum samples", default=48, min=1, max=4096)
@@ -1679,7 +1682,8 @@ def _apply_settings(scene):
     g["EXR_HALF"] = st.exr_half
     g["EXR_CODEC"] = st.exr_codec
     g["EXPORT_BACKFACE_UV"] = st.export_backface_uv
-    g["EXPORT_PLAYER_ILLUM_SHADOW"] = st.export_player_illum_shadow
+    g["EXPORT_ILLUM"] = st.export_illum
+    g["EXPORT_SHADOW"] = st.export_shadow
     g["COMPOSITE_BASE_LAYER"] = st.composite_base_layer
     g["EXPORT_BACKGROUND_NO_PLAYERS"] = st.export_background_no_players
     g["FIX_2LAYER_POSITION"] = st.fix_2layer_position
@@ -1861,7 +1865,8 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         box = layout.box()
         box.label(text="Layers", icon='RENDERLAYERS')
         box.prop(st, "export_backface_uv")
-        box.prop(st, "export_player_illum_shadow")
+        box.prop(st, "export_illum")
+        box.prop(st, "export_shadow")
         box.prop(st, "composite_base_layer")
         box.prop(st, "export_background_no_players")
 
