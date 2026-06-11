@@ -50,6 +50,16 @@ Then enable **“NovaSkin Export (Thomas_Rig_Legacy)”** and run it from either
 The panel exposes the common options (output folder, UV format, layers, samples, etc.);
 its values override the `CONFIG` constants in the script at run time.
 
+<p align="center">
+  <img src="blender-panel.png" alt="NovaSkin Export panel in the 3D Viewport sidebar"
+       width="300">
+</p>
+
+*The NovaSkin tab in the sidebar: render/launch buttons, output + UV format, the layer
+toggles, render quality, **Optional Layers** (the “Mark Selected as Layer” button and the
+list of marked objects), and the rig fix. The output field turns red until the `.blend`
+is saved.*
+
 ### Option B — Run from the *Scripting* workspace *(quick test / development)*
 
 1. **Scripting** tab → **Open** → open `render_uv_mask.py` → **Run Script** (▶)
