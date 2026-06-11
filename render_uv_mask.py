@@ -123,6 +123,11 @@ UV_DEPTH_IN_BLUE = True
 # player casts on the scenery (ratio vs the clean scene). Independent toggles.
 EXPORT_ILLUM = True
 EXPORT_SHADOW = True
+# Compute the shadow ratio in DISPLAY space (view-transformed, like background_no_players)
+# instead of linear, so multiplying it onto the (display) background in a 2D/sRGB canvas
+# reproduces the render -- a LINEAR ratio multiplied in display space over-darkens. True for
+# any view transform (AgX/Standard/...). Set False if you composite in linear.
+SHADOW_DISPLAY_RATIO = True
 # Also save the per-part light as its own image next to the UV ("<part>_light.<ext>", the
 # illum/shadow format). Needed for the PNG pipeline (the light can't go in the UV alpha --
 # canvas premultiply). With EXR the light is embedded in the UV's 'light' layer instead.
@@ -276,6 +281,25 @@ def _lin_to_srgb(x):
     """Encode a linear value/array to sRGB (display) in [0, 1]."""
     x = np.clip(x, 0.0, 1.0)
     return np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1.0 / 2.4) - 0.055)
+
+
+def _to_display(rgb):
+    """Apply the scene's view transform (AgX/Standard/Filmic/...) to scene-linear RGB,
+    giving the DISPLAY values -- the same encoding as background_no_players. Uses OCIO so it
+    matches any view transform; falls back to sRGB. (exposure/gamma/look not applied.)"""
+    out = np.ascontiguousarray(np.clip(rgb[:, :3], 0.0, None), dtype='float32')
+    try:
+        import PyOpenColorIO as OCIO
+        cfg = OCIO.GetCurrentConfig()
+        dt = OCIO.DisplayViewTransform()
+        dt.setSrc(OCIO.ROLE_SCENE_LINEAR)
+        dt.setDisplay(bpy.context.scene.display_settings.display_device)
+        dt.setView(bpy.context.scene.view_settings.view_transform)
+        cfg.getProcessor(dt).getDefaultCPUProcessor().applyRGB(out)
+        return np.clip(out, 0.0, 1.0)
+    except Exception as e:
+        print("[shadow] OCIO view transform unavailable, using sRGB:", repr(e))
+        return _lin_to_srgb(out)
 
 
 def _light_for_label(light_maps, player_label, part_label):
@@ -1246,9 +1270,14 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                         }
 
                 # SHADOW output: ratio vs the clean scene (no body masking -- the body isn't
-                # in the render, so the contact shadow under/around it is kept).
+                # in the render, so the contact shadow under/around it is kept). In DISPLAY
+                # space (view-transformed) so a multiply onto the display background matches.
                 if EXPORT_SHADOW:
-                    ratio = np.clip(comb_sh[:, :3] / np.clip(clean[:, :3], 1e-4, None), 0.0, 1.0)
+                    if SHADOW_DISPLAY_RATIO:
+                        sh_d, cl_d = _to_display(comb_sh), _to_display(clean)
+                    else:
+                        sh_d, cl_d = comb_sh[:, :3], clean[:, :3]
+                    ratio = np.clip(sh_d / np.clip(cl_d, 1e-4, None), 0.0, 1.0)
                     shadow = np.empty((ratio.shape[0], 4), dtype='float32')
                     shadow[:, :3] = ratio
                     shadow[:, 3] = 1.0
@@ -1367,7 +1396,10 @@ def _write_manifest(players, out_path):
                           if EXPORT_ILLUM else None),
                 "shadow": ([f"shadow_{v}{LIGHTSHADOW_EXT}" for v, _ in MASK_ARM_VARIANTS]
                            if EXPORT_SHADOW else None),
-                "note": "per player (in the subfolder); shadow is multiply (1=no shadow)",
+                "note": ("per player (in the subfolder); shadow is a DISPLAY-space multiply "
+                         "(1=no shadow) -- multiply it onto the display background."
+                         if SHADOW_DISPLAY_RATIO else
+                         "per player; shadow is a LINEAR multiply (1=no shadow)"),
             } if (EXPORT_ILLUM or EXPORT_SHADOW) else None),
         },
         "players": [
