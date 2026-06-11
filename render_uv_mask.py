@@ -2292,29 +2292,33 @@ def _is_player_armature(arm):
 
 
 class OBJECT_OT_novaskin_layer_toggle(bpy.types.Operator):
-    """Mark/unmark the selection as optional NovaSkin layer(s). A selected ARMATURE (or any
-    mesh bound to one) marks the WHOLE rig as one layer; standalone meshes mark individually.
-    Each layer is exported as an independent toggleable group (beauty + shadow + UV/light)"""
+    """Mark/unmark the selection as an optional NovaSkin layer. With objects SELECTED: an
+    armature (or any mesh bound to one) marks the WHOLE rig as one layer, standalone meshes
+    mark individually. With NOTHING selected: marks the ACTIVE collection (all its meshes =
+    one layer). Each layer exports as an independent toggleable group (beauty + shadow,
+    + UV/light for single-mesh layers)"""
     bl_idname = "object.novaskin_layer_toggle"
-    bl_label = "Mark Selected as Layer"
+    bl_label = "Mark as Optional Layer"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        return any(o.type in {'MESH', 'ARMATURE'} for o in context.selected_objects)
+        if any(o.type in {'MESH', 'ARMATURE'} for o in context.selected_objects):
+            return True
+        c = context.collection
+        return c is not None and any(o.type == 'MESH' for o in c.all_objects)
 
     def execute(self, context):
+        sel = [o for o in context.selected_objects if o.type in {'MESH', 'ARMATURE'}]
+        if not sel:
+            return self._toggle_collection(context)
+
         # Resolve the selection to mark-TARGETS: an armature (whole rig) for any
-        # armature/rigged-mesh, else the standalone mesh itself. Dedup so selecting a rig +
-        # its meshes marks the rig once.
+        # armature/rigged-mesh, else the standalone mesh. Dedup so selecting a rig + its
+        # meshes marks the rig once.
         targets, seen = [], set()
-        for o in context.selected_objects:
-            if o.type == 'ARMATURE':
-                tgt = o
-            elif o.type == 'MESH':
-                tgt = _mesh_rig_armature(o) or o
-            else:
-                continue
+        for o in sel:
+            tgt = o if o.type == 'ARMATURE' else (_mesh_rig_armature(o) or o)
             if tgt.name not in seen:
                 seen.add(tgt.name)
                 targets.append(tgt)
@@ -2330,35 +2334,22 @@ class OBJECT_OT_novaskin_layer_toggle(bpy.types.Operator):
             else:
                 tgt[LAYER_ID_PROP] = 1
                 marked += 1
-                kind = "rig" if tgt.type == 'ARMATURE' else "mesh"
-                print(f"[LAYER] marked {kind} '{tgt.name}'")
-        parts = []
-        if marked:
-            parts.append(f"{marked} marked")
-        if unmarked:
-            parts.append(f"{unmarked} unmarked")
-        if skipped:
-            parts.append(f"{skipped} skipped (player rig)")
+                print(f"[LAYER] marked {'rig' if tgt.type == 'ARMATURE' else 'mesh'} "
+                      f"'{tgt.name}'")
+        parts = ([f"{marked} marked"] if marked else []) \
+            + ([f"{unmarked} unmarked"] if unmarked else []) \
+            + ([f"{skipped} skipped (player rig)"] if skipped else [])
         self.report({'WARNING'} if skipped else {'INFO'},
                     "NovaSkin layers: " + (", ".join(parts) or "nothing selectable"))
         return {'FINISHED'}
 
-
-class OBJECT_OT_novaskin_layer_toggle_collection(bpy.types.Operator):
-    """Mark/unmark the ACTIVE collection as one optional NovaSkin layer (every mesh in it is
-    exported together as a single toggleable group -- handy for a multi-object set)"""
-    bl_idname = "object.novaskin_layer_toggle_collection"
-    bl_label = "Mark Active Collection"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        c = context.collection
-        return c is not None and any(o.type == 'MESH' for o in c.all_objects)
-
-    def execute(self, context):
+    def _toggle_collection(self, context):
+        """Nothing selected -> mark/unmark the active collection (all its meshes = 1 layer)."""
         coll = context.collection
-        # refuse a collection that contains a player rig (would break the player export)
+        if coll is None or not any(o.type == 'MESH' for o in coll.all_objects):
+            self.report({'WARNING'},
+                        "NovaSkin layers: nothing selected and the active collection is empty")
+            return {'CANCELLED'}
         if any(_is_player_armature(o) for o in coll.all_objects):
             self.report({'ERROR'},
                         f"'{coll.name}' contains a player rig -- not marked as a layer.")
@@ -2444,7 +2435,11 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         box = layout.box()
         box.label(text="Optional Layers", icon='OUTLINER_OB_MESH')
         box.operator("object.novaskin_layer_toggle", icon='PINNED')
-        box.operator("object.novaskin_layer_toggle_collection", icon='OUTLINER_COLLECTION')
+        # hint: which source the one button will act on right now
+        if not any(o.type in {'MESH', 'ARMATURE'} for o in context.selected_objects):
+            c = context.collection
+            box.label(text=f"(active collection: {c.name})" if c else "(nothing selected)",
+                      icon='OUTLINER_COLLECTION')
         groups = discover_layers()
         if groups:
             col = box.column(align=True)
@@ -2463,8 +2458,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 
 
 _classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_cancel,
-            OBJECT_OT_novaskin_layer_toggle, OBJECT_OT_novaskin_layer_toggle_collection,
-            VIEW3D_PT_novaskin)
+            OBJECT_OT_novaskin_layer_toggle, VIEW3D_PT_novaskin)
 
 
 def _teardown_active_batch():

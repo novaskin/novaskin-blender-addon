@@ -149,13 +149,14 @@ materials), even on cancel or error.
 
 ### Optional layers
 
-A layer is a **group of meshes** marked with one click. Select an object and use the panel:
+A layer is a **group of meshes** marked with one click — the panel’s **“Mark as Optional
+Layer”** button (toggles; click again to unmark; player rigs are refused):
 
-- **“Mark Selected as Layer”** — a selected **armature** (or any mesh bound to one) marks
-  the **whole rig** as one layer; standalone meshes mark individually. Toggles (click again
-  to unmark); player rigs are refused.
-- **“Mark Active Collection”** — marks the active collection: **every mesh in it** becomes
-  one layer (handy for a non-rigged multi-object set).
+- **with objects selected** — a selected **armature** (or any mesh bound to one) marks the
+  **whole rig** as one layer; standalone meshes mark individually.
+- **with nothing selected** — marks the **active collection**: every mesh in it becomes one
+  layer (handy for a non-rigged multi-object set). The panel shows which collection is
+  active when no object is selected.
 
 A group's meshes render **together** (they self-occlude), so a rigged character like a
 turtle (armature + N meshes) is one whole layer, not N. Marked meshes are **hidden from the
