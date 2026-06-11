@@ -2059,10 +2059,10 @@ def _render_steps(players, op=None):
     return results
 
 
-def render_all(op=None):
+def render_all(op=None, draft=False):
     """Synchronous full run (UI is blocked while it works). Returns the results dict, or
     None if the preflight aborts. The menu uses the modal operator instead (see invoke)."""
-    _apply_settings(bpy.context.scene)
+    _apply_settings(bpy.context.scene, draft=draft)
     players = discover_players()
     errors = _preflight(players)
     if errors:
@@ -2129,16 +2129,19 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         default='JPEG')
     jpeg_quality: IntProperty(name="Quality", default=90, min=1, max=100,
                               description="JPEG/WebP quality")
-    draft: BoolProperty(
-        name="Draft (fast preview)", default=False,
-        description="Render everything at 50% resolution with few samples -- fast "
-                    "iteration on framing/marking; not for the final export")
 
 
-def _apply_settings(scene):
-    """Copy the panel's scene properties into the module globals (no-op if absent)."""
+def _apply_settings(scene, draft=False):
+    """Copy the panel's scene properties into the module globals (no-op if absent).
+    draft=True (the 'Render Draft' button) forces low resolution + few samples."""
     st = getattr(scene, "novaskin", None)
     if st is None:
+        # still honor draft even without the panel props (e.g. bpy.ops with draft=True)
+        g = globals()
+        g["DRAFT_MODE"] = draft
+        if draft:
+            g["MASK_RES_PCT"] = g["ILLUM_RES_PCT"] = DRAFT_RES_PCT
+            g["ILLUM_SAMPLES"] = min(DRAFT_SAMPLES, ILLUM_SAMPLES)
         return
     g = globals()
     g["OUT_DIR"] = st.out_dir
@@ -2156,12 +2159,13 @@ def _apply_settings(scene):
     g["UV_EXT"] = {'OPEN_EXR': '.exr', 'WEBP': '.webp'}.get(st.uv_format, '.png')
     g["LIGHTSHADOW_EXT"] = {'JPEG': '.jpg', 'WEBP': '.webp'}.get(st.lightshadow_format,
                                                                  '.png')
-    # Draft mode: all render resolutions MUST stay equal (UV/mask/illum/shadow/background
-    # align pixel-for-pixel), so the percentage is set globally here.
-    g["DRAFT_MODE"] = st.draft
-    g["ILLUM_SAMPLES"] = min(DRAFT_SAMPLES, st.illum_samples) if st.draft else st.illum_samples
-    g["MASK_RES_PCT"] = DRAFT_RES_PCT if st.draft else 100
-    g["ILLUM_RES_PCT"] = DRAFT_RES_PCT if st.draft else 100
+    # Draft mode (the 'Render Draft' button): all render resolutions MUST stay equal
+    # (UV/mask/illum/shadow/background align pixel-for-pixel), so the percentage is set
+    # globally here.
+    g["DRAFT_MODE"] = draft
+    g["ILLUM_SAMPLES"] = min(DRAFT_SAMPLES, st.illum_samples) if draft else st.illum_samples
+    g["MASK_RES_PCT"] = DRAFT_RES_PCT if draft else 100
+    g["ILLUM_RES_PCT"] = DRAFT_RES_PCT if draft else 100
 
 
 # ----------------------- Operator + menu + panel -----------------------
@@ -2194,6 +2198,11 @@ class RENDER_OT_novaskin(bpy.types.Operator):
     bl_label = "Render for NovaSkin"
     bl_options = {'REGISTER'}
 
+    draft: BoolProperty(
+        name="Draft", default=False, options={'SKIP_SAVE'},
+        description="Fast preview: render everything at 50% resolution with few samples "
+                    "(framing/marking iteration -- not for the final export)")
+
     # Note on responsiveness: bpy is single-threaded and not thread-safe, so an actual
     # render call always blocks the main thread for its duration. The modal/timer below
     # runs the work in many small chunks and redraws + updates progress between them, and
@@ -2202,7 +2211,7 @@ class RENDER_OT_novaskin(bpy.types.Operator):
 
     def invoke(self, context, event):
         # Interactive launch (from the menu/panel): run as a modal job with a progress bar.
-        _apply_settings(context.scene)
+        _apply_settings(context.scene, draft=self.draft)
         players = discover_players()
         errors = _preflight(players)
         if errors:
@@ -2272,7 +2281,8 @@ class RENDER_OT_novaskin(bpy.types.Operator):
     def execute(self, context):
         # Non-interactive launch (e.g. bpy.ops.render.novaskin() from a script): run the
         # whole batch synchronously and block until done.
-        return {'FINISHED'} if render_all(op=self) is not None else {'CANCELLED'}
+        return {'FINISHED'} if render_all(op=self, draft=self.draft) is not None \
+            else {'CANCELLED'}
 
 
 class RENDER_OT_novaskin_cancel(bpy.types.Operator):
@@ -2366,7 +2376,9 @@ class OBJECT_OT_novaskin_layer_toggle(bpy.types.Operator):
 
 
 def _menu_draw(self, context):
-    self.layout.operator(RENDER_OT_novaskin.bl_idname, icon='RENDER_STILL')
+    self.layout.operator(RENDER_OT_novaskin.bl_idname, icon='RENDER_STILL').draft = False
+    self.layout.operator(RENDER_OT_novaskin.bl_idname, text="Render Draft (NovaSkin preview)",
+                         icon='MOD_FLUID').draft = True
 
 
 class VIEW3D_PT_novaskin(bpy.types.Panel):
@@ -2396,7 +2408,10 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         else:
             col = layout.column()
             col.scale_y = 1.5
-            col.operator("render.novaskin", icon='RENDER_STILL')
+            col.operator("render.novaskin", icon='RENDER_STILL').draft = False
+            row = layout.row()
+            row.operator("render.novaskin", text="Render Draft (fast preview)",
+                         icon='MOD_FLUID').draft = True
 
         if WALLPAPER_TOOL_URL:
             layout.operator("wm.url_open", text="Open Wallpaper Tool",
@@ -2425,7 +2440,6 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 
         box = layout.box()
         box.label(text="Quality", icon='SETTINGS')
-        box.prop(st, "draft", icon='MOD_FLUID')
         box.prop(st, "illum_samples")
         row = box.row(align=True)
         row.prop(st, "lightshadow_format", text="")

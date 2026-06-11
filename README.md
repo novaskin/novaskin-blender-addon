@@ -43,9 +43,9 @@ Two ways:
   `render_uv_mask.py` (the single file keeps its `bl_info`).
 
 Then enable **“NovaSkin Export (Thomas_Rig_Legacy)”** and run it from either:
-   - **3D Viewport sidebar** (press <kbd>N</kbd>) → **“NovaSkin”** tab — options + a
-     **Render for NovaSkin** button, or
-   - **top bar → Render → “Render for NovaSkin”**.
+   - **3D Viewport sidebar** (press <kbd>N</kbd>) → **“NovaSkin”** tab — options, a
+     **Render for NovaSkin** button and a **Render Draft (fast preview)** button, or
+   - **top bar → Render → “Render for NovaSkin”** (and its **Render Draft** variant).
 
 The panel exposes the common options (output folder, UV format, layers, samples, etc.);
 its values override the `CONFIG` constants in the script at run time.
@@ -203,7 +203,7 @@ Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key o
 | `UV_FORMAT` / `EXR_HALF` / `EXR_CODEC` | UV + base_layer format: `PNG` (default), `WEBP` (8-bit **lossless** — quality 100; ~60% smaller than PNG, browser-decodable) or `OPEN_EXR` (half-float, `ZIP` ≈ PNG size, lossless). As EXR + illum, the RGB light is embedded as an extra `light.*` layer — see note |
 | `COMPOSITE_BASE_LAYER` / `COMPOSITE_BASE_LABELS` | Composite base parts into `base_layer.png` (nearest pixel wins) |
 | `LIGHTSHADOW_FORMAT` / `JPEG_QUALITY` | Illum + shadow file format: `JPEG` (default), `WEBP` (~30% smaller, browser-friendly) or `PNG`; quality `90` |
-| `DRAFT_MODE` (panel: *Draft*) | Everything at 50% resolution with few samples — fast preview, recorded in the manifest |
+| `DRAFT_RES_PCT` / `DRAFT_SAMPLES` | The *Render Draft (fast preview)* button: everything at 50% resolution with few samples — fast framing/marking iteration, recorded in the manifest (`render.draft`) |
 | `RIG_ID_PROP` / `RIG_ID_VALUE` | How players are detected |
 | `RENAME_UV_PARTS` / `MC_PART_MAP` | Rename UV files to Minecraft labels (head/hat, body/jacket, arm/sleeve, leg/pant, `_left`/`_right`, `_classic`/`_slim`) |
 
