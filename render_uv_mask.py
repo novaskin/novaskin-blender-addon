@@ -669,6 +669,24 @@ def _restore_arm_style(arm, player, saved):
         bpy.context.view_layer.update()
 
 
+def _remove_stale_variants(path):
+    """Delete sibling files with the SAME stem but another exporter extension -- leftovers
+    from a previous run with a different output format (e.g. shadow_classic.png after
+    switching to WebP). They sit next to the fresh file at a possibly different resolution
+    and confuse the consumer."""
+    stem, cur = os.path.splitext(path)
+    for e in ('.png', '.jpg', '.webp', '.exr'):
+        if e == cur.lower():
+            continue
+        p = stem + e
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+                print(f"[clean] removed stale {os.path.basename(p)}")
+            except OSError:
+                pass
+
+
 def _save_image(arr_flat, W, H, path, colorspace='Non-Color',
                 file_format='PNG', bit_depth=None, quality=None):
     """Save flat RGBA pixels (scene-linear float) to an image file. No view transform is
@@ -735,6 +753,7 @@ def _save_image(arr_flat, W, H, path, colorspace='Non-Color',
     else:
         img.save()
     bpy.data.images.remove(img)
+    _remove_stale_variants(path)
 
 
 def _save_exr_uvdl(out4, light3, W, H, path):
@@ -1007,8 +1026,14 @@ def export_part_uv(part, sess, out_subdir, tag="_UV", depth_range=None, label=No
             vals = vals.astype('float32') / 255.0
         light[cov] = np.clip(vals, 0.0, 1.0)
     path = os.path.join(_abs(OUT_DIR), out_subdir, stem + tag + UV_EXT)
+    # Switching UV_FORMAT also switches the tag (_UV <-> _UVDL): clean every leftover of
+    # the OTHER tag (any extension), then the same-stem leftovers via the save below.
+    if tag in ("_UV", "_UVDL"):
+        _remove_stale_variants(os.path.join(_abs(OUT_DIR), out_subdir,
+                               stem + ("_UVDL" if tag == "_UV" else "_UV")))
     if UV_FORMAT == 'OPEN_EXR' and light is not None:
         _save_exr_uvdl(out, light, W, H, path)
+        _remove_stale_variants(path)
     else:
         _save_image(out.reshape(-1), W, H, path, file_format=UV_FORMAT)
         if light is not None and EXPORT_PART_LIGHT:
@@ -1610,11 +1635,19 @@ def _write_manifest(players, out_path, layer_infos=None):
                + [(li["name"], li["camera_depth"]) for li in (layer_infos or [])
                   if li.get("camera_depth") is not None])
     draw_order = [name for name, _ in sorted(entries, key=lambda e: e[1], reverse=True)]
+    # Effective EXPORT resolution (what every saved image actually measures): the real
+    # render size when available, else base * res_pct. The base scene resolution is kept
+    # separately -- consumers must compare files against "resolution".
+    eff = next((tuple(p["render_size"]) for p in players if p.get("render_size")), None)
+    if eff is None:
+        eff = (s.render.resolution_x * MASK_RES_PCT // 100,
+               s.render.resolution_y * MASK_RES_PCT // 100)
     manifest = {
         "manifest_version": MANIFEST_VERSION,
         "addon_version": ADDON_VERSION,
         "render": {
-            "resolution": [s.render.resolution_x, s.render.resolution_y],
+            "resolution": list(eff),
+            "base_resolution": [s.render.resolution_x, s.render.resolution_y],
             "engine": s.render.engine,
             "draft": DRAFT_MODE or None,
             "res_pct": MASK_RES_PCT,
@@ -1874,6 +1907,7 @@ def _render_steps(players, op=None):
                         cpath = os.path.join(_abs(OUT_DIR), p["label"], stem + UV_EXT)
                         if UV_FORMAT == 'OPEN_EXR' and clight is not None:
                             _save_exr_uvdl(comp, clight, cW, cH, cpath)
+                            _remove_stale_variants(cpath)
                         else:
                             _save_image(comp.reshape(-1), cW, cH, cpath, file_format=UV_FORMAT)
                             if clight is not None and EXPORT_PART_LIGHT:
