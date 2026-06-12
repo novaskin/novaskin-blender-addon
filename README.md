@@ -21,8 +21,13 @@ plus `layers/` and scene-level files).
 
 - **Blender with a GUI** (5.1 recommended). Does **not** run in `--background` — the
   script reads the result through the *Viewer node*.
-- A scene with the **Thomas_Rig_Legacy** rig (1+ players, identified by the `Rig_ID`
-  custom property), an **active camera**, and lights/scenery.
+- The **[Thomas Rig Legacy](https://extensions.blender.org/add-ons/thomas-rig-legacy/)**
+  rig in the scene (1+ players, identified by the `Rig_ID` custom property). This exporter
+  is built specifically for that rig — install/append it separately (Blender extensions
+  can't declare another extension as a dependency, only Python wheels, so it isn't pulled
+  in automatically). The panel shows how many players it detects, and links to the rig when
+  none is found.
+- An **active camera**, and lights/scenery.
 - The **`.blend` must be saved** (output uses `//novaskin/`, relative to the file).
 
 If anything is missing, the script aborts at startup with a clear message (preflight)

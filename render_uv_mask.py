@@ -292,6 +292,9 @@ COMPOSITE_BASE_LABELS = ["head", "body",
 
 # Web wallpaper tool (the panel has a button that opens this URL in the browser).
 WALLPAPER_TOOL_URL = "https://minecraft.novaskin.me/wallpapers/tools/blender/"
+# The rig this exporter targets. Blender extensions can't declare another extension as a
+# dependency (only Python wheels), so we surface this in the panel/README instead.
+RIG_SOURCE_URL = "https://extensions.blender.org/add-ons/thomas-rig-legacy/"
 # ------------------------------------------------------------------
 
 
@@ -520,6 +523,17 @@ def _select_uv_parts(arm, char):
             slim_pb[slim_key] = slim_orig
         _upd()
     return [o for o in meshes if o.name in visible]
+
+
+def _player_armatures():
+    """Just the player armatures (Rig_ID match), sorted -- cheap, no part selection. For the
+    panel's player count/list (running the full discover_players() every redraw would toggle
+    rig props + update the depsgraph on each UI refresh)."""
+    arms = [o for o in bpy.context.scene.objects
+            if o.type == 'ARMATURE' and RIG_ID_PROP in o.keys()
+            and (RIG_ID_VALUE is None or o[RIG_ID_PROP] == RIG_ID_VALUE)]
+    arms.sort(key=lambda a: a.name)
+    return arms
 
 
 def discover_players():
@@ -2549,6 +2563,17 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         box = layout.box()
         box.label(text="Rig", icon='ARMATURE_DATA')
         box.prop(st, "fix_2layer_position")
+        arms = _player_armatures()
+        if arms:
+            box.label(text=f"{len(arms)} player(s) detected:", icon='OUTLINER_OB_ARMATURE')
+            col = box.column(align=True)
+            for a in arms:
+                col.label(text=a.name, icon='DOT')
+        else:
+            box.label(text=f"no '{RIG_ID_VALUE or RIG_ID_PROP}' rig found", icon='ERROR')
+            box.label(text="This exporter needs the Thomas Rig Legacy.")
+            box.operator("wm.url_open", text="Get the rig (extensions.blender.org)",
+                         icon='URL').url = RIG_SOURCE_URL
 
 
 _classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_cancel,
