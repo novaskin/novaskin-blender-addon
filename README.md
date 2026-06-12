@@ -1,271 +1,122 @@
-# NovaSkin Export — `render_uv_mask.py`
+# NovaSkin Export
 
-A Blender add-on/script that exports, per player, the data layers of a
-**Thomas_Rig_Legacy** rig for downstream compositing:
-
-- **UV** per part (R=U, G=V, B=normalized depth, A=coverage), front and back, raw 8-bit
-  PNG (or float EXR), named with Minecraft labels (`head`, `hat`, `body`, `jacket`, …).
-- **Character mask** (Object Index), occluded by scenery **and** by other players,
-  in both arm variants (`classic` = Steve arms, `slim` = Alex arms).
-- **Per-layer light** (base parts lit from a base-only render, overlays from the full one)
-  + **cast shadow** per player/variant, and `base_layer_*` composites.
-- **Background** (scene without players/layers), **optional layers** (marked scenery
-  objects exported independently), and a `manifest.json` with bboxes + draw order.
-
-Output: `<.blend dir>/novaskin/` (one subfolder per player — `player1`, `player2`, … —
-plus `layers/` and scene-level files).
-
----
-
-## Requirements
-
-- **Blender with a GUI** (5.1 recommended). Does **not** run in `--background` — the
-  script reads the result through the *Viewer node*.
-- The **[Thomas Rig Legacy](https://extensions.blender.org/add-ons/thomas-rig-legacy/)**
-  rig in the scene (1+ players, identified by the `Rig_ID` custom property). This exporter
-  is built specifically for that rig, but the rig is **scene content you add to your
-  `.blend`** (not Python this add-on imports), so install/append it separately. The Blender
-  extension manifest can't auto-pull another extension anyway (it only bundles Python
-  wheels). The panel shows how many players it detects and links to the rig when none is
-  found.
-- An **active camera**, and lights/scenery.
-- The **`.blend` must be saved** (output uses `//novaskin/`, relative to the file).
-
-If anything is missing, the script aborts at startup with a clear message (preflight)
-instead of failing midway.
-
----
-
-## How to use
-
-### Option A — Install as an add-on ✅ *(recommended)*
-
-Two ways:
-
-- **Extension zip (Blender 4.2+):** build it with `python3 build_addon.py` (creates
-  `dist/novaskin_export-<version>.zip`), then **drag the `.zip` onto the Blender window**, or
-  `Edit > Preferences > Get Extensions > ⌄ > Install from Disk…`.
-- **Classic add-on:** `Edit > Preferences > Add-ons > Install…` → select
-  `render_uv_mask.py` (the single file keeps its `bl_info`).
-
-Then enable **“NovaSkin Export (Thomas_Rig_Legacy)”** and run it from either:
-   - **3D Viewport sidebar** (press <kbd>N</kbd>) → **“NovaSkin”** tab — options, a
-     **Render for NovaSkin** button and a **Render Draft (fast preview)** button, or
-   - **top bar → Render → “Render for NovaSkin”** (and its **Render Draft** variant).
-
-The panel exposes the common options (output folder, UV format, layers, samples, etc.);
-its values override the `CONFIG` constants in the script at run time.
+A Blender add-on that exports a scene built with the **Thomas Rig Legacy** Minecraft rig
+so the [NovaSkin wallpaper tool](https://minecraft.novaskin.me/wallpapers/tools/blender/)
+can re-texture the players with **any skin, directly in the browser** — without
+re-rendering. One click renders everything the web tool needs: the background, each
+player's data layers (UV/mask/light/shadow), optional toggleable scenery layers, and an
+experimental animated mode.
 
 <p align="center">
   <img src="blender-panel.png" alt="NovaSkin Export panel in the 3D Viewport sidebar"
        width="300">
 </p>
 
-*The NovaSkin tab in the sidebar: render/launch buttons, output + UV format, the layer
-toggles, render quality, **Optional Layers** (the “Mark Selected as Layer” button and the
-list of marked objects), and the rig fix. The output field turns red until the `.blend`
-is saved.*
-
-### Option B — Run from the *Scripting* workspace *(quick test / development)*
-
-1. **Scripting** tab → **Open** → open `render_uv_mask.py` → **Run Script** (▶)
-2. This **registers** the operator (does not render) and adds the menu entry
-3. Launch it via **Render → “Render for NovaSkin”**
-
-### Option C — Console / another script
-
-```python
-bpy.ops.render.novaskin()
-```
-
-(Runs **synchronously** — blocks until done. Useful for automation.)
-
 ---
 
-## Updating the script
+## What you need
 
-**Important:** *Install from Disk* **copies** the file into Blender's add-ons folder;
-it is **not linked** to the original file. Editing the original does **not** update the
-installed add-on.
+- **Blender 4.2+ with a GUI** (5.1 recommended). It does **not** run with `--background`.
+- The **[Thomas Rig Legacy](https://extensions.blender.org/add-ons/thomas-rig-legacy/)**
+  rig in your scene (1 or more players). Install/append it separately — the panel shows
+  how many players it detects, and links to the rig if none is found.
+- An **active camera** and some lights/scenery.
+- A **saved `.blend`** (the output goes to a `novaskin/` folder next to it).
 
-Ways to update:
+If something is missing, the export stops right away with a clear message instead of
+failing midway.
 
-1. **Reinstall** — *Install from Disk* again pointing at the new file (overwrites the
-   copy). Simple, but manual on every change.
-2. **Symlink into the add-ons folder** *(best if you edit often)* — link the repo file
-   into Blender's user add-ons dir, e.g. on macOS:
-   ```
-   ln -s /path/to/repo/render_uv_mask.py \
-     "~/Library/Application Support/Blender/<ver>/scripts/addons/render_uv_mask.py"
-   ```
-   Blender loads it straight from the repo; after editing, **F3 → “Reload Scripts”**
-   (or restart) reloads it.
-3. **Scripting workspace (Option B)** — during development, this always runs the current
-   version of the open file; no reinstall needed.
+## Install
 
-> Summary: for stable use, **Option A** (reinstall when it changes). For heavy iteration,
-> the **symlink** or **Scripting** avoid reinstalling on every edit.
+- **Extension zip (recommended):** download `novaskin_export-<version>.zip` from the
+  [releases](https://github.com/novaskin/novaskin-blender-addon/releases) and **drag it
+  onto the Blender window** (or `Edit > Preferences > Get Extensions > ⌄ > Install from
+  Disk…`).
+- **Classic add-on:** `Edit > Preferences > Add-ons > Install…` → pick
+  `render_uv_mask.py`.
 
----
+Then enable **“NovaSkin Export”**. Reinstall the same way to update (Install from Disk
+copies the file — editing the original does not update it).
 
-## Progress and cancellation
+## How to use
 
-When launched from the panel/menu (modal), the progress shows in three places: a **progress
-bar in the NovaSkin panel** (replacing the run button while it works), the **3D Viewport
-header**, and the **status bar** (`NovaSkin 42% - UV front: player1 / head`). Cancel with
-the **Cancel button** in the panel, or **Esc** (mouse in the viewport) — either way the
-scene is restored to its original state (it takes effect at the next step boundary).
+Open the **3D Viewport sidebar** (<kbd>N</kbd>) → **NovaSkin** tab:
 
-> The UI is responsive **between** steps, but each individual render still blocks briefly
-> while it runs. `bpy` is single-threaded and not thread-safe, so there is no way to render
-> without blocking the main thread; the modal approach splits the work into many short steps
-> with feedback and allows cancelling.
+1. Check the **Rig** section — it lists the players detected in the scene.
+2. Hit **Render Draft (fast preview)** first: a quick 50 %-resolution pass to check
+   framing and your marked layers.
+3. Hit **Render for NovaSkin** for the real export.
+4. Use **Open Output Folder** to grab the results, and the **Open Wallpaper Tool**
+   button to jump to the web tool.
 
-The scene is always restored at the end (compositor, visibility, samples, drivers,
-materials), even on cancel or error.
+Everything also lives in the top bar under **Render → Render for NovaSkin**, and
+scripts can call `bpy.ops.render.novaskin()`.
 
----
+While it runs you get a progress bar in the panel (plus the viewport header and status
+bar). Cancel any time with the **Cancel** button or <kbd>Esc</kbd> — the scene is always
+restored to exactly how it was, even on cancel or error. The UI stays responsive between
+steps, but each render step still blocks briefly (a Blender limitation).
 
-## Output layout
+### Panel options
 
-```
-<.blend dir>/novaskin/
-├── player1/                         # one per player (sorted by armature name)
-│   ├── <part>_UV.png                # R=U, G=V, B=depth, A=coverage(0 outside); MC label; 8-bit
-│   │                                #   (EXR "<part>_UVDL.exr" packs the light in a layer)
-│   ├── <part>_light.jpg             # per-part light (base parts: base render; overlays: full)
-│   ├── <part>_UV_back.png           # back faces (R=U, G=V, B=depth)
-│   ├── base_layer_classic.png       # base parts composited per variant (nearest wins)
-│   ├── base_layer_slim.png
-│   ├── ...
-│   ├── mask_classic.png    # 8-bit PNG
-│   ├── mask_slim.png
-│   ├── illum_classic.jpg / illum_slim.jpg     # JPEG (light)
-│   └── shadow_classic.jpg / shadow_slim.jpg   # JPEG (multiply)
-├── illum_classic.jpg / illum_slim.jpg  # (only if EXPORT_ILLUM_BACKGROUND)
-├── background.png                   # scene without players and optional layers
-├── layers/                          # optional layers (objects marked in the panel)
-│   ├── <name>.png                   # the object alone, transparent bg, display-encoded
-│   ├── <name>_shadow.jpg            # shadow it casts on the scenery (display multiply)
-│   ├── <name>_UV.png                # generic UV (retexture); EXR mode: <name>_UVDL.exr
-│   └── <name>_light.jpg             # its light map (PNG pipeline)
-└── manifest.json                    # manifest_version, addon_version, resolution,
-                                     #   draw_order (back→front), bboxes, depth ranges, etc.
-```
+- **Output** — destination folder and the UV file format (`PNG` default; `WebP` is
+  lossless and ~60 % smaller; `EXR` for float pipelines).
+- **Layers** — which data layers to export: back-face UVs, per-player light (*Illum*),
+  cast *Shadow*, the *Base Layer Composite*, and the *Background* image.
+- **Quality** — light/shadow render samples, and the light/shadow file format
+  (JPEG/WebP/PNG + quality).
+- **Rig** — *Fix Hat Position and Scale* snaps the rig's hat onto the head at the
+  Minecraft proportions before exporting. The rig's own "Second layer" toggle does
+  **not** matter: overlays (jacket/sleeves/pants) are always exported.
 
 ### Optional layers
 
-A layer is a **group of meshes** marked with one click — the panel’s **“Mark as Optional
-Layer”** button (toggles; click again to unmark; player rigs are refused):
+Mark scenery you want as an **independent toggle in the wallpaper** (a mob, a tree, a
+build) with the **“Mark as Optional Layer”** button:
 
-- **with objects selected** — a selected **armature** (or any mesh bound to one) marks the
-  **whole rig** as one layer; standalone meshes mark individually.
-- **with nothing selected** — marks the **active collection**: every mesh in it becomes one
-  layer (handy for a non-rigged multi-object set). The panel shows which collection is
-  active when no object is selected.
+- with objects **selected** — a selected armature (or any mesh of a rig) marks the
+  **whole rig** as one layer; a plain mesh marks just itself;
+- with **nothing selected** — marks the **active collection** (all its meshes become one
+  layer). The panel shows which collection is active.
 
-Each marked layer is listed in the panel with an **✕** button to remove it (unmark) without
-selecting it in the viewport. A group's meshes render **together** (they self-occlude), so a
-rigged character like a turtle (armature + N meshes) is one whole layer, not N. Marked meshes are **hidden from the
-background and the whole player pipeline** and exported into `layers/`: beauty (transparent
-background, lit by the real scene), the shadow the group casts, and — **single-mesh groups
-only**, since a multi-mesh group's meshes don't share one texture space — its UV + light
-for retexturing (`EXPORT_LAYER_UV`; the light follows the Illum toggle). The manifest lists
-each layer (files, bbox, `camera_depth`, `depth_range_viewer`, `kind`, `meshes`) and
-includes them in `draw_order_back_to_front`.
+Marked layers are listed in the panel with an **✕** to remove them. Player rigs are
+refused. Each layer is rendered by itself (correctly occluded by the scenery) plus the
+shadow it casts, so the web tool can toggle it on/off.
 
-**Occlusion:** unlike players (always rendered unoccluded, in front), a layer **is
-occluded by the scenery** — the scenery renders as a *holdout* (cuts the alpha where it
-is in front while still lighting/shadowing the object) and the UV coverage is clipped
-the same way. Players and the **other layers** are excluded from the render instead
-(they can be toggled off in the wallpaper, so the layer must be whole with respect to
-them). Trade-off: a layer's shadow never falls on a player (the player light is
-independent of layer toggles).
+### Animated export (beta)
 
----
+The **Animated (beta)** section exports the scene's frame range as an animated wallpaper:
+three WebM videos plus the players' animated geometry (~1 MB for 15 s), re-textured live
+in the browser. Base layer only, classic arms; optional-layer marks are ignored (those
+objects render as part of the scenery). Encoding needs `ffmpeg` installed — without it
+the PNG sequences and an `encode.sh` script are left for you to run. Start with **Export
+Animation Draft** to preview. ⚠️ A full export renders 3 passes per frame — expect it to
+take a while.
 
-## Animated export (beta)
+## What you get
 
-The panel's **Animated (beta)** section exports the scene's frame range as an animated
-wallpaper (`<OUT_DIR>/animated/`): three lossy WebM videos — background (player shadows
-baked in), per-pixel foreground occlusion layer, combined player light — plus the players'
-**base-layer geometry as a screen-space mesh stream** (`mesh.bin` + `anim.bin`, ~1 MB for
-15 s), retextured in the browser with the user's skin (`color = skin(uv) × light(screen) × 2`).
-Base layer only, classic arms, players always drawn (no per-player toggles); optional-layer
-marks are ignored (those objects render as scenery). Needs `ffmpeg` for the WebM encode
-(otherwise it writes the PNG sequences + an `encode.sh`). Design, formats and measurements:
-[docs/animated-export-plan.md](docs/animated-export-plan.md); reference web player:
-[prototype/play.html](prototype/play.html).
+A `novaskin/` folder next to your `.blend`:
 
-## Configuration
+- `background.png` — the scene without players;
+- one folder per player (`player1/`, `player2/`, …) with its UV maps, masks, light and
+  shadow images in both arm variants (classic/slim);
+- `layers/` — your optional layers;
+- `manifest.json` — everything the web tool needs to put it together;
+- `animated/` — the animated export, when used.
 
-Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key ones:
+Load that folder in the wallpaper tool and swap skins freely.
 
-| Key | Purpose |
-|---|---|
-| `OUT_DIR` | Output folder (default `//novaskin/`) |
-| `PLAYER_FOLDER_SCHEME` | Per-player subfolder name: `index` (`player1`, `player2`, …) or `armature` (object name). The manifest records both, a player `visible_bbox`, and `part_bboxes` (per-part bbox) — all top-left px + normalized |
-| `MASK_ARM_VARIANTS` | Arm variants exported (`classic`/`slim`) |
-| `UV_DEPTH_IN_BLUE` | Write normalized depth into the UV's B channel |
-| `EXPORT_BACKFACE_UV` | Also export the back-face UVs |
-| `EXPORT_ILLUM` / `EXPORT_SHADOW` | Per-player light (per-part + illum image) and cast shadow — independent toggles |
-| `EXPORT_BACKGROUND` | Render the scenery without players/layers (`background.png`) |
-| `LAYER_ID_PROP` / `EXPORT_LAYER_UV` | Optional layers: marker property name; `EXPORT_LAYER_UV` (default **on**) also exports each layer's UV + light |
-| `EXPORT_PART_LIGHT` | Save the per-part light images (`<part>_light.jpg`, PNG pipeline; default on) |
-| `SHADOW_DISPLAY_RATIO` | Shadow ratio in display space (view-transformed) so multiplying it onto the background matches the render (default on) |
-| `ILLUM_HIDE_SCENERY_FROM_CAMERA` | Light renders: scenery camera-invisible so foreground objects don't bleed into the player light (default on) |
-| `BACKGROUND_USE_SCENE_SETTINGS` | Background renders with the user's engine/samples/denoise (default on) |
-| `PNG_COMPRESSION` | zlib level for data PNGs (default `90`; byte-exact) |
-| `UV_PNG_FLOOR_TEXELS` / `UV_TEXEL_BINS` | PNG U/V quantized with `floor` into texel bins (byte = texel index @256) |
-| `FIX_2LAYER_POSITION` / `HAT_SCALE_RATIO` | Snap the hat (`2_Layer_Extrusion`) onto `NoFace_Head` and scale it to the Minecraft hat size (`1.125`× the head) before export (persistent) |
-| `SELECTION_FORCE_ON` | Rig toggles forced ON during the export so the parts they reveal are **always exported** — by default `Main_Properties["Second layer"]`, so the jacket/sleeve/pant overlays export even when the artist left the rig's *Second layer* toggle off. The original value is restored afterward |
-| `ILLUM_SAMPLES` / `ILLUM_COLORSPACE` | Illum quality/encoding |
-| `PNG_BIT_DEPTH` | Bit depth of UV/mask PNGs (default `8`; 256 levels, enough for MC skins) |
-| `UV_FORMAT` / `EXR_HALF` / `EXR_CODEC` | UV + base_layer format: `PNG` (default), `WEBP` (8-bit **lossless** — quality 100; ~60% smaller than PNG, browser-decodable) or `OPEN_EXR` (half-float, `ZIP` ≈ PNG size, lossless). As EXR + illum, the RGB light is embedded as an extra `light.*` layer — see note |
-| `COMPOSITE_BASE_LAYER` / `COMPOSITE_BASE_LABELS` | Composite base parts into `base_layer.png` (nearest pixel wins) |
-| `LIGHTSHADOW_FORMAT` / `JPEG_QUALITY` | Illum + shadow file format: `JPEG` (default), `WEBP` (~30% smaller, browser-friendly) or `PNG`; quality `90` |
-| `DRAFT_RES_PCT` / `DRAFT_SAMPLES` | The *Render Draft (fast preview)* button: everything at 50% resolution with few samples — fast framing/marking iteration, recorded in the manifest (`render.draft`) |
-| `RIG_ID_PROP` / `RIG_ID_VALUE` | How players are detected |
-| `RENAME_UV_PARTS` / `MC_PART_MAP` | Rename UV files to Minecraft labels (head/hat, body/jacket, arm/sleeve, leg/pant, `_left`/`_right`, `_classic`/`_slim`) |
+> **Integrating the output yourself?** All file formats, channel layouts and the
+> compositing math are documented in [docs/output-format.md](docs/output-format.md).
+> The animated pipeline design lives in
+> [docs/animated-export-plan.md](docs/animated-export-plan.md), with a reference web
+> player in [prototype/](prototype/).
 
-UV part filenames use Minecraft-style labels: `head`, `hat`, `body`, `jacket`,
-`arm_{left,right}_{classic,slim}`, `sleeve_{left,right}_{classic,slim}`,
-`leg_{left,right}`, `pant_{left,right}`. Front files are `<part>_UV.png`
-(R=U, G=V, B=depth, A=coverage; `<part>_UVDL.exr` with a `light` layer in EXR mode);
-`base_layer_{classic,slim}.png` composite the base parts (nearest depth wins).
-Unmapped meshes fall back to a sanitized object name, and duplicate labels get a `_2`/`_3`
-suffix. The mapping (label → object name) is recorded in `manifest.json` per player. To
-disable and keep raw object names, set `RENAME_UV_PARTS = False`.
+## For developers
 
-### Applying the light and shadow
-
-- **Light** (`<part>_light.jpg` / EXR `light` layer): the scene lighting captured on a
-  **0.5 gray** Lambertian body (sRGB). Relight a part with
-  `lit = skin × (light / 0.5)` (in linear; ≈ multiply + 2× exposure in a 2D canvas). Base
-  parts are lit from a base-only render, overlays from the full render — each layer is lit
-  where it is front-most. Self-shadowing is already in the light; `shadow_*` is only the
-  shadow cast on the scenery.
-- **Shadow** (`shadow_*.jpg`, players and layers): a **display-space multiply** map
-  (white = no shadow). Combine multiple shadows with *darken* (per-pixel min), then
-  *multiply* the result onto `background.png` — this reproduces the Blender render.
-
-### Reading the UV alpha (light): mind premultiplied alpha
-
-**PNG** files are `<part>_UV.png` with RGBA = (U, V, depth, coverage) — alpha is `0`/`1`
-(coverage), so they read fine anywhere, including an HTML 2D canvas. The light is the
-separate `<part>_light.jpg` (and the full-body `illum_*.jpg`).
-
-**EXR** files (`UV_FORMAT='OPEN_EXR'`) keep the same RGBA = (U, V, depth, coverage) and,
-when the illum pass is on, embed the **RGB light** as an extra `light.*` channel layer
-(`light.R/G/B`, sRGB) → `<part>_UVDL.exr`. Read with a float EXR loader (e.g. Three.js
-`EXRLoader`) — the default RGBA gives U/V/depth/coverage exactly like the PNG; read the
-`light` layer for the color light. With `EXR_HALF=True` + `EXR_CODEC='ZIP'` it is lossless
-and ≈ PNG file size (~110 KB at 1080p for the 7 channels). Browsers can't decode EXR via a
-2D canvas, so this also sidesteps the canvas premultiply gotcha entirely.
-
-> Light is never packed into a PNG alpha: a variable alpha gets corrupted by the 2D-canvas
-> premultiply round-trip (it un-premultiplies on read, mangling U/V where the light is dark).
-
-> This script is specific to the **Thomas_Rig_Legacy** rig. Other rigs would require
-> adjusting `RIG_ID_VALUE`, `SLIM_CONTROL`, `SELECTION_FORCE_OFF`, `MESH_COLLECTION_PREFIX`,
-> and `MASK_ARM_VARIANTS`.
+- The whole add-on is a single file, [render_uv_mask.py](render_uv_mask.py); defaults
+  live in its `CONFIG` block (the panel overrides the common ones).
+- For heavy iteration, symlink the repo file into Blender's add-ons folder and use
+  **F3 → Reload Scripts** after editing; or open it in the *Scripting* workspace and run
+  it directly.
+- `python3 build_addon.py` builds the extension zip; tags `v*` publish a release via CI.
