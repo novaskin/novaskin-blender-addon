@@ -115,11 +115,21 @@ multiply (`result = player × (1−a)`). But the player light needs more than da
 overlay fogs, it doesn't multiply). That is exactly why the player shader samples the
 light as a texture (`skin × light/0.5`).
 
+A colored semi-transparent overlay (e.g. yellow at 50 %) *does* tint the player — but it
+is the wrong kind of tint: "over" is `offset + uniform scale`, so it **lifts blacks**
+(black skin pixels acquire the overlay color and glow) and washes contrast, where real
+light is a per-channel multiply that keeps blacks black. The error is also skin-dependent
+(the skin is unknown at export time — users swap skins), while multiply is correct for any
+skin. And keeping the light separate costs ~nothing: the player is already a custom draw
+call, so sampling one more texture there is free (even a pure 2D-canvas pipeline has a
+`multiply` composite op for a masked light layer, as the static tool already uses).
+
 Packing note for a possible v2: the regions are complementary (light only matters where
 the player is visible = where the foreground is transparent), so the light could ride in
-the foreground's unused RGB and save one video decode. Rejected for v1: AA edges + lossy
-alpha bleed scenery RGB into the light exactly at occlusion contact pixels, and
-`light.webm` at half resolution is already the cheapest of the three streams.
+the foreground's unused RGB — as data for the player shader to sample, NOT as an "over"
+layer — and save one video decode. Rejected for v1: AA edges + lossy alpha bleed scenery
+RGB into the light exactly at occlusion contact pixels, and `light.webm` at half
+resolution is already the cheapest of the three streams.
 
 ## Occlusion by the scenery
 
