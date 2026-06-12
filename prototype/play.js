@@ -105,12 +105,13 @@ const meshP = prog(
   `#version 300 es
    precision highp float;
    uniform sampler2D uSkin; uniform sampler2D uLight; uniform vec2 uRes;
+   uniform bool uUseLight;
    in vec2 vUv; out vec4 frag;
    void main(){
      vec4 s=texture(uSkin,vUv);
      if(s.a<0.5) discard;
-     vec3 l=texture(uLight,gl_FragCoord.xy/uRes).rgb;
-     frag=vec4(s.rgb*l*2.0,1.0);
+     vec3 l=uUseLight ? texture(uLight,gl_FragCoord.xy/uRes).rgb*2.0 : vec3(1.0);
+     frag=vec4(s.rgb*l,1.0);
    }`);
 function tex(nearest) {
   const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
@@ -164,37 +165,47 @@ function setPositions(time) {
   gl.bufferSubData(gl.ARRAY_BUFFER, 0, posArr);
 }
 
+const ck = (id) => document.getElementById(id).checked;
 function draw() {
   upload(tBg, vBg); upload(tFg, vFg); upload(tLight, vLight);
   setPositions(vBg.currentTime);
   gl.viewport(0, 0, W, H);
   gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
-  gl.useProgram(quadP); gl.bindVertexArray(quadVao);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tBg);
-  gl.uniform1i(gl.getUniformLocation(quadP, 'uTex'), 0);
-  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-  gl.useProgram(meshP); gl.bindVertexArray(meshVao);
-  gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLight);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
-  gl.activeTexture(gl.TEXTURE0);
-  if (CH === 3) {           // v2: per-vertex camera depth -> correct self-occlusion
-    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
-    gl.clear(gl.DEPTH_BUFFER_BIT);
+  gl.clearColor(0.13, 0.13, 0.13, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  if (ck('ck_bg')) {
+    gl.useProgram(quadP); gl.bindVertexArray(quadVao);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tBg);
+    gl.uniform1i(gl.getUniformLocation(quadP, 'uTex'), 0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
-  // players stored back-to-front; each draws its own triangle range with its own skin
-  manifest.mesh.players.forEach((p, i) => {
-    gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
-    const [t0, t1] = p.tri_range;
-    gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, gl.UNSIGNED_SHORT, t0 * 3 * 2);
-  });
-  gl.disable(gl.DEPTH_TEST);
-  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-  gl.useProgram(quadP); gl.bindVertexArray(quadVao);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tFg);
-  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-  gl.disable(gl.BLEND);
+  if (ck('ck_pl')) {
+    gl.useProgram(meshP); gl.bindVertexArray(meshVao);
+    gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
+    gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
+    gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), ck('ck_li') ? 1 : 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLight);
+    gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
+    gl.activeTexture(gl.TEXTURE0);
+    if (CH === 3) {         // v2: per-vertex camera depth -> correct self-occlusion
+      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+      gl.clear(gl.DEPTH_BUFFER_BIT);
+    }
+    // players stored back-to-front; each draws its own triangle range with its own skin
+    manifest.mesh.players.forEach((p, i) => {
+      gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
+      const [t0, t1] = p.tri_range;
+      gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, gl.UNSIGNED_SHORT, t0 * 3 * 2);
+    });
+    gl.disable(gl.DEPTH_TEST);
+  }
+  if (ck('ck_fg')) {
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(quadP); gl.bindVertexArray(quadVao);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tFg);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.disable(gl.BLEND);
+  }
   requestAnimationFrame(draw);
 }
 
