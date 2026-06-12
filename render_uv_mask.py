@@ -315,18 +315,30 @@ def _mc_part_label(name):
     return re.sub(r"[^A-Za-z0-9]+", "_", base).strip("_").lower() or name
 
 
-def _assign_part_labels(parts):
+def _assign_part_labels(parts, label=None):
     """Return {object_name: unique_label} for a player's parts, disambiguating collisions
-    (e.g. duplicate meshes) with a "_2", "_3"... suffix. Deterministic (sorted by name)."""
-    used, out = {}, {}
+    (e.g. duplicate meshes) with a "_2", "_3"... suffix. Deterministic (sorted by name).
+    Warns when two parts collide on the same Minecraft label -- a common sign of a stray or
+    duplicate mesh (e.g. an arm sleeve weighted to the leg) that would otherwise slip in as
+    a "<label>_2" file silently. The mapping still works; the warning just surfaces it."""
+    used, out, first, collisions = {}, {}, {}, {}
     for o in sorted(parts, key=lambda x: x.name):
-        lab = _mc_part_label(o.name)
-        if lab in used:
-            used[lab] += 1
-            lab = f"{lab}_{used[lab]}"
+        base = _mc_part_label(o.name)
+        n = used.get(base, 0) + 1
+        used[base] = n
+        if n == 1:
+            first[base] = o.name
+            lab = base
         else:
-            used[lab] = 1
+            lab = f"{base}_{n}"
+            collisions.setdefault(base, [first[base]]).append(o.name)
         out[o.name] = lab
+    for base, names in collisions.items():
+        who = f" on {label}" if label else ""
+        print(f"[WARN] label collision{who}: {len(names)} meshes map to '{base}' "
+              f"-> {names}, disambiguated with _2/_3. This is often a stray/duplicate mesh "
+              f"(check the rig) -- '{base}' is the first by name, not necessarily the right "
+              f"one.")
     return out
 
 
@@ -2027,7 +2039,7 @@ def _render_steps(players, op=None):
             p["depth_range"] = (_depth_range_or_abort(p, sess, mask_mat, back_mat,
                                                       f"player '{p['label']}'")
                                 if UV_DEPTH_IN_BLUE else None)
-            p["uv_labels"] = _assign_part_labels(p["uv_parts"])
+            p["uv_labels"] = _assign_part_labels(p["uv_parts"], label=p["label"])
             yield prog(f"Depth range: {p['label']}")
         # 1) Character MASKS (opaque override) -- generated BEFORE illum (the shadow/illum
         #    step reads them to mask the body).
