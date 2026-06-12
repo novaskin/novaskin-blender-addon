@@ -285,6 +285,22 @@ per-player skin textures, keys lerped, no console errors.
   should match well enough; verify.
 - How many frames / fps for a wallpaper loop (size scales linearly with F).
 
+## Future discussion: the mesh stream as a STATIC format too (v2 of the static export)
+
+The screen-space mesh could replace the per-part UV images in the static pipeline as
+well — and it is arguably a better fit there: one frame of positions is ~14 KB (vs
+hundreds of KB of WebP UVs per player), resolution-independent (crisp at 4K from the
+same export), 16-bit UV precision, GPU-AA edges, per-pixel depth via the v2 z, part/
+variant toggles become triangle ranges, back faces come free (disable culling + depth
+test), and masks/bboxes/base_layer composites become unnecessary. The static variant
+would keep: TWO light images (base-only and full — each triangle range samples its
+layer's light, preserving the overlay-lighting semantics), a foreground image for
+scenery occlusion, and background/shadows as today. A single frame can afford a DENSE
+mesh (subsurf 1, ~34k verts ≈ 136 KB) — render-matching silhouettes, no AntiLag
+compromise. Cost: the web tool must render WebGL instead of 2D canvas — which the
+animated integration already requires, so the right order is: integrate animated in
+app.js first, then converge the static export onto the same renderer as K=1.
+
 ## Research notes (June 2026)
 
 - No lossless or near-lossless codec is generally available in browsers
