@@ -1601,6 +1601,13 @@ def _render_combined_array(sess, res_pct, transparent=False, use_scene_settings=
     bpy.context.view_layer.update()
     bpy.ops.render.render(write_still=False)
     vimg = bpy.data.images.get('Viewer Node')
+    if not vimg or len(vimg.pixels) == 0:
+        # transient empty Viewer (same hiccup the depth probe retries) -- retry once
+        print("[render] empty Viewer node on the combined render -- retrying once")
+        bpy.ops.render.render(write_still=False)
+        vimg = bpy.data.images.get('Viewer Node')
+        if not vimg or len(vimg.pixels) == 0:
+            raise RuntimeError("Viewer node empty after retry (combined render)")
     W, H = vimg.size
     a = np.empty(len(vimg.pixels), dtype='float32')
     vimg.pixels.foreach_get(a)
