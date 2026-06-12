@@ -158,8 +158,9 @@ Layer”** button (toggles; click again to unmark; player rigs are refused):
   layer (handy for a non-rigged multi-object set). The panel shows which collection is
   active when no object is selected.
 
-A group's meshes render **together** (they self-occlude), so a rigged character like a
-turtle (armature + N meshes) is one whole layer, not N. Marked meshes are **hidden from the
+Each marked layer is listed in the panel with an **✕** button to remove it (unmark) without
+selecting it in the viewport. A group's meshes render **together** (they self-occlude), so a
+rigged character like a turtle (armature + N meshes) is one whole layer, not N. Marked meshes are **hidden from the
 background and the whole player pipeline** and exported into `layers/`: beauty (transparent
 background, lit by the real scene), the shadow the group casts, and — **single-mesh groups
 only**, since a multi-mesh group's meshes don't share one texture space — its UV + light

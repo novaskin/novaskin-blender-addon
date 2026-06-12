@@ -2430,6 +2430,26 @@ class OBJECT_OT_novaskin_layer_toggle(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OBJECT_OT_novaskin_layer_remove(bpy.types.Operator):
+    """Remove this entry from the optional layers (unmark it)"""
+    bl_idname = "object.novaskin_layer_remove"
+    bl_label = "Remove Optional Layer"
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+
+    target: StringProperty()
+    is_collection: BoolProperty(default=False)
+
+    def execute(self, context):
+        coll = bpy.data.collections if self.is_collection else bpy.data.objects
+        db = coll.get(self.target)
+        if db is None or LAYER_ID_PROP not in db.keys():
+            self.report({'WARNING'}, f"NovaSkin: '{self.target}' is not a marked layer")
+            return {'CANCELLED'}
+        del db[LAYER_ID_PROP]
+        self.report({'INFO'}, f"NovaSkin layers: removed '{self.target}'")
+        return {'FINISHED'}
+
+
 def _menu_draw(self, context):
     self.layout.operator(RENDER_OT_novaskin.bl_idname, icon='RENDER_STILL').draft = False
     self.layout.operator(RENDER_OT_novaskin.bl_idname, text="Render Draft (NovaSkin preview)",
@@ -2517,7 +2537,12 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             for g in groups:
                 n = len(g["meshes"])
                 txt = f"{g['object']}  ({n} mesh)" if n > 1 else g["object"]
-                col.label(text=txt, icon=icons.get(g["kind"], 'LAYER_ACTIVE'))
+                row = col.row(align=True)
+                row.label(text=txt, icon=icons.get(g["kind"], 'LAYER_ACTIVE'))
+                rm = row.operator("object.novaskin_layer_remove", text="", icon='X',
+                                  emboss=False)
+                rm.target = g["object"]
+                rm.is_collection = (g["kind"] == "collection")
         else:
             box.label(text="none marked", icon='LAYER_USED')
 
@@ -2527,7 +2552,8 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 
 
 _classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_cancel,
-            OBJECT_OT_novaskin_layer_toggle, VIEW3D_PT_novaskin)
+            OBJECT_OT_novaskin_layer_toggle, OBJECT_OT_novaskin_layer_remove,
+            VIEW3D_PT_novaskin)
 
 
 def _teardown_active_batch():
