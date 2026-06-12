@@ -13,7 +13,11 @@
 <body>
 <div id="wrap"><canvas id="gl"></canvas></div>
 <div id="hud">
-  <button id="playbtn">play</button>
+  <button id="playbtn">▶</button>
+  <input id="scrub" type="range" min="0" max="1000" value="0" style="flex:1; min-width:200px;">
+  <span id="time">0.0s</span>
+</div>
+<div id="hud">
   <label><input type="checkbox" id="ck_bg" checked> background</label>
   <label><input type="checkbox" id="ck_pl" checked> players</label>
   <label><input type="checkbox" id="ck_li" checked> light</label>

@@ -59,9 +59,12 @@ const keys = [];
 }
 
 // --- videos
-function video(src) {
+async function video(src) {
+  // fetch the whole file as a blob: python http.server lacks Range support, which makes
+  // a streamed <video> unseekable -- a blob URL is fully buffered and fully seekable
+  const blob = await (await fetch(DIR + src)).blob();
   const v = document.createElement('video');
-  v.src = DIR + src; v.muted = true; v.loop = true; v.playsInline = true;
+  v.src = URL.createObjectURL(blob); v.muted = true; v.loop = true; v.playsInline = true;
   v.preload = 'auto';
   return new Promise((ok) => { v.oncanplaythrough = () => ok(v); v.load(); });
 }
@@ -228,13 +231,31 @@ function draw() {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.disable(gl.BLEND);
   }
+  if (!scrubbing) scrub.value = Math.round(vBg.currentTime / duration() * 1000) || 0;
+  timeEl.textContent = vBg.currentTime.toFixed(1) + 's';
   requestAnimationFrame(draw);
 }
 
 document.getElementById('stats').textContent =
   `${uniqueN} unique / ${welded} welded verts, ${ntris} tris, ${K} keys @ ${keysFps} fps, ` +
   `${manifest.frames} frames @ ${manifest.fps} fps, ${W}x${H}`;
-document.getElementById('playbtn').onclick = () => { vBg.play(); vFg.play(); vLight.play(); };
+const vids = [vBg, vFg, vLight];
+const playbtn = document.getElementById('playbtn');
+playbtn.onclick = () => {
+  if (vBg.paused) { vids.forEach(v => v.play()); playbtn.textContent = '❚❚'; }
+  else { vids.forEach(v => v.pause()); playbtn.textContent = '▶'; }
+};
+const scrub = document.getElementById('scrub');
+const timeEl = document.getElementById('time');
+const duration = () => (isFinite(vBg.duration) && vBg.duration > 0)
+  ? vBg.duration : manifest.frames / manifest.fps;   // streamed webm: duration=Infinity
+let scrubbing = false;
+scrub.onpointerdown = () => { scrubbing = true; };
+scrub.onpointerup = () => { scrubbing = false; };
+scrub.oninput = () => {
+  const t = (scrub.value / 1000) * duration();
+  vids.forEach(v => { v.currentTime = t; });
+};
 // debug handle (pause/seek from the console): __dbg.seek(5.0)
 window.__dbg = {
   vBg, vFg, vLight, keys, K, keysFps, setSkin,
