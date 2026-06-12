@@ -290,6 +290,21 @@ COMPOSITE_BASE_LABELS = ["head", "body",
                          "arm_left_{variant}", "arm_right_{variant}",
                          "leg_left", "leg_right"]
 
+# ---- ANIMATED EXPORT (simplified mode -- see docs/animated-export-plan.md) ----
+# Exports <OUT_DIR>/animated/: three lossy videos (background with baked player shadows,
+# per-pixel foreground occlusion layer, combined player light) + the player base-layer
+# geometry as a screen-space mesh stream (mesh.bin static + anim.bin per-frame positions).
+# Base layer only, no per-player toggles, players always drawn; optional-layer marks are
+# IGNORED here (marked objects render as plain scenery). Frame range = the scene's.
+ANIM_OUT_SUBDIR = "animated"
+ANIM_KEYS_STEP = 2          # store mesh keys every Nth video frame (24fps video -> 12fps keys)
+ANIM_QUANT = 8.0            # vertex quantization: 1/8 px (int16)
+ANIM_CRF = {"bg": 32, "fg": 32, "light": 38}   # VP9 quality per stream
+ANIM_ENCODE = True          # run ffmpeg after rendering (else keep PNG sequences + script)
+ANIM_KEEP_SEQUENCES = False  # keep seq/ PNGs after a successful encode
+ANIM_BASE_LABELS = ["head", "body", "arm_left_classic", "arm_right_classic",
+                    "leg_left", "leg_right"]
+
 # Web wallpaper tool (the panel has a button that opens this URL in the browser).
 WALLPAPER_TOOL_URL = "https://minecraft.novaskin.me/wallpapers/tools/blender/"
 # The rig this exporter targets. Blender extensions can't declare another extension as a
@@ -2213,6 +2228,339 @@ def render_all(op=None, draft=False):
     return results
 
 
+# ----------------------- ANIMATED EXPORT (docs/animated-export-plan.md) -----------------------
+
+def _anim_collect_static(players, W, H):
+    """Build the static mesh buffers at the CURRENT frame: weld vertices by
+    (part, vertex, uv) for the GPU buffers, and map each welded vert to a UNIQUE
+    (part, vertex) position index -- anim.bin only carries unique positions, mesh.bin
+    carries the static src (welded -> unique) map. Players are emitted back-to-front
+    (painter's order). Returns the dict used by _anim_frame_positions/_anim_write_mesh."""
+    dg = bpy.context.evaluated_depsgraph_get()
+    ordered = sorted(players, key=lambda p: _player_camera_depth(p) or 0.0, reverse=True)
+    base_set = set(ANIM_BASE_LABELS)
+    st = {"parts": [], "uv": [], "src": [], "tris": [], "players": [],
+          "uniq": []}                                  # uniq: list of (part_idx, vert_idx)
+    weld, uniq_keys = {}, {}
+    for p in ordered:
+        labs = p.get("uv_labels") or _assign_part_labels(p["uv_parts"], label=p["label"])
+        parts = sorted([o for o in p["uv_parts"] if labs.get(o.name) in base_set],
+                       key=lambda o: o.name)
+        w0, t0 = len(st["src"]), len(st["tris"]) // 3
+        for o in parts:
+            pi = len(st["parts"]); st["parts"].append(o.name)
+            ev = o.evaluated_get(dg); me = ev.to_mesh(); me.calc_loop_triangles()
+            uvl = me.uv_layers.active.data
+            for lt in me.loop_triangles:
+                for li, vi in zip(lt.loops, lt.vertices):
+                    u, v = uvl[li].uv
+                    k = (pi, vi, round(u * 4096), round(v * 4096))
+                    j = weld.get(k)
+                    if j is None:
+                        j = len(st["src"]); weld[k] = j
+                        uk = (pi, vi)
+                        ui = uniq_keys.get(uk)
+                        if ui is None:
+                            ui = len(st["uniq"]); uniq_keys[uk] = ui
+                            st["uniq"].append(uk)
+                        st["uv"] += [min(max(u, 0.0), 1.0), min(max(v, 0.0), 1.0)]
+                        st["src"].append(ui)
+                    st["tris"].append(j)
+            ev.to_mesh_clear()
+        st["players"].append({"label": p["label"],
+                              "welded_range": [w0, len(st["src"])],
+                              "tri_range": [t0, len(st["tris"]) // 3],
+                              "camera_depth": round(_player_camera_depth(p) or 0.0, 3)})
+    # per-part gather arrays: part_idx -> (vert indices, unique indices)
+    gather = {}
+    for ui, (pi, vi) in enumerate(st["uniq"]):
+        gather.setdefault(pi, ([], []))
+        gather[pi][0].append(vi); gather[pi][1].append(ui)
+    st["gather"] = {pi: (np.asarray(v, np.int64), np.asarray(u, np.int64))
+                    for pi, (v, u) in gather.items()}
+    return st
+
+
+def _anim_frame_positions(st, W, H):
+    """Screen-pixel positions (float32 (U,2), y up) of the unique vertices at the current
+    frame, using the evaluated depsgraph and the evaluated camera (animated constraints)."""
+    dg = bpy.context.evaluated_depsgraph_get()
+    cam = bpy.context.scene.camera
+    ce = cam.evaluated_get(dg)
+    P = np.array(ce.calc_matrix_camera(dg, x=W, y=H) @ ce.matrix_world.inverted())
+    out = np.empty((len(st["uniq"]), 2), np.float32)
+    for pi, name in enumerate(st["parts"]):
+        o = bpy.context.scene.objects[name]
+        ev = o.evaluated_get(dg); me = ev.to_mesh()
+        co = np.empty(len(me.vertices) * 3, 'float32')
+        me.vertices.foreach_get('co', co)
+        co = co.reshape(-1, 3)
+        mw = np.array(ev.matrix_world)
+        w = co @ mw[:3, :3].T + mw[:3, 3]
+        clip = w @ P[:3, :3].T + P[:3, 3]
+        wcl = w @ P[3, :3] + P[3, 3]
+        scr = (clip[:, :2] / wcl[:, None] * 0.5 + 0.5) * [W, H]
+        vi, ui = st["gather"].get(pi, (None, None))
+        if vi is not None:
+            out[ui] = scr[vi]
+        ev.to_mesh_clear()
+    return out
+
+
+def _anim_write_mesh(path, st):
+    """mesh.bin: 'NSKM' header + zlib payload (uv u16 pairs, src u16, tris u16 triples).
+    Browser-side: DecompressionStream('deflate')."""
+    import struct, zlib
+    welded, unique, ntris = len(st["src"]), len(st["uniq"]), len(st["tris"]) // 3
+    uv = np.round(np.asarray(st["uv"], np.float64) * 65535).astype('<u2')
+    src = np.asarray(st["src"], '<u2')
+    tris = np.asarray(st["tris"], '<u2')
+    payload = zlib.compress(uv.tobytes() + src.tobytes() + tris.tobytes(), 9)
+    with open(path, "wb") as f:
+        f.write(struct.pack('<4sIIII', b'NSKM', 1, welded, unique, ntris))
+        f.write(payload)
+    return welded, unique, ntris
+
+
+def _anim_write_anim(path, keys_q, quant, keys_fps):
+    """anim.bin: 'NSKA' header + zlib payload of int16 positions for K mesh keys --
+    key 0 absolute, key 1 delta, keys 2+ delta-of-delta (linear motion predictor)."""
+    import struct, zlib
+    K, V = len(keys_q), keys_q[0].shape[0]
+    stream = [keys_q[0].tobytes()]
+    if K > 1:
+        deltas = [(b - a) for a, b in zip(keys_q, keys_q[1:])]
+        stream.append(deltas[0].tobytes())
+        stream += [(b - a).tobytes() for a, b in zip(deltas, deltas[1:])]
+    payload = zlib.compress(b"".join(stream), 9)
+    with open(path, "wb") as f:
+        f.write(struct.pack('<4sIIIff', b'NSKA', 1, V, K, float(quant), float(keys_fps)))
+        f.write(payload)
+    return K, V
+
+
+def _anim_encode(adir, fps):
+    """Encode the PNG sequences to WebM/VP9 with ffmpeg (foreground keeps alpha). Returns
+    (ok, message); if ffmpeg is missing, writes encode.sh with the commands instead."""
+    import shutil as _sh, subprocess
+    seq = os.path.join(adir, "seq")
+    jobs = [("bg", "background.webm", ["-pix_fmt", "yuv420p"]),
+            ("fg", "foreground.webm", ["-pix_fmt", "yuva420p", "-auto-alt-ref", "0"]),
+            ("light", "light.webm", ["-pix_fmt", "yuv420p"])]
+    # GUI Blender on macOS doesn't inherit the shell PATH -- look in the usual spots too.
+    ff = _sh.which("ffmpeg") or next(
+        (p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg",
+                     "/usr/bin/ffmpeg") if os.path.exists(p)), None)
+    def cmd(name, out, extra):
+        return [ff or "ffmpeg", "-y", "-framerate", str(fps),
+                "-i", os.path.join(seq, name, "%04d.png"),
+                "-c:v", "libvpx-vp9", "-crf", str(ANIM_CRF[name]), "-b:v", "0",
+                "-row-mt", "1", "-cpu-used", "4", *extra, os.path.join(adir, out)]
+    if ff is None:
+        sh = os.path.join(adir, "encode.sh")
+        with open(sh, "w") as f:
+            f.write("#!/bin/sh\n# ffmpeg not found at export time -- run this manually\n")
+            for name, out, extra in jobs:
+                f.write(" ".join(cmd(name, out, extra)) + "\n")
+        os.chmod(sh, 0o755)
+        return False, "ffmpeg not found -- wrote encode.sh"
+    for name, out, extra in jobs:
+        r = subprocess.run(cmd(name, out, extra), capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, f"ffmpeg failed on {out}: {r.stderr[-400:]}"
+    return True, "encoded background/foreground/light .webm"
+
+
+def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
+    """Generator for the animated export (one yield per unit of work, like _render_steps).
+    Per frame: background (players camera-invisible, shadows baked), foreground (per-pixel:
+    scenery-holdout AND player silhouette), combined light; plus mesh keys every
+    ANIM_KEYS_STEP frames. Writes mesh.bin/anim.bin/manifest.json and encodes the videos."""
+    s = bpy.context.scene
+    f0 = s.frame_start if frame_start is None else frame_start
+    f1 = s.frame_end if frame_end is None else frame_end
+    nf = f1 - f0 + 1
+    fps = s.render.fps
+    W = s.render.resolution_x * MASK_RES_PCT // 100
+    H = s.render.resolution_y * MASK_RES_PCT // 100
+    adir = os.path.join(_abs(OUT_DIR), ANIM_OUT_SUBDIR)
+    for k in ("bg", "fg", "light"):
+        os.makedirs(os.path.join(adir, "seq", k), exist_ok=True)
+
+    base_set = set(ANIM_BASE_LABELS)
+    base_parts, other_char = [], []
+    for p in players:
+        p["uv_labels"] = _assign_part_labels(p["uv_parts"], label=p["label"])
+        for o in p["char_all"]:
+            (base_parts if p["uv_labels"].get(o.name) in base_set
+             else other_char).append(o)
+    base_names = {o.name for o in base_parts}
+    char_names = {o.name for p in players for o in p["char_all"]}
+
+    forced_props = _force_selection_props_on(players)   # not strictly needed (base only)
+    sess = _Session()
+    cur_frame = s.frame_current
+    simp = (s.render.use_simplify, s.render.simplify_subdivision_render)
+    arms = list({p["arm"] for p in players if p.get("arm")})
+    rig_snap = {}
+    for a in arms:
+        pb = a.pose.bones.get('Main_Properties')
+        if pb is not None:
+            rig_snap[a.name] = (pb.get('AntiLag'), pb.get('Slim main'))
+
+    total = 1 + nf * 3 + 2
+    state = {"done": 0}
+    def prog(msg):
+        state["done"] += 1
+        print(f"[ANIM {state['done']}/{total}] {msg}")
+        return (state["done"] / total, msg)
+
+    def setup():
+        """players reduced to their base parts; scenery untouched."""
+        sess.restore_visibility()
+        sess.mute_drivers(True)
+        for o in other_char:
+            o.hide_render = True
+        for o in base_parts:
+            o.hide_render = False
+        bpy.context.view_layer.update()
+
+    try:
+        # AntiLag (viewport mesh) + classic arms + render geometry == viewport geometry
+        for a in arms:
+            pb = a.pose.bones.get('Main_Properties')
+            if pb is not None:
+                if 'AntiLag' in pb.keys():
+                    pb['AntiLag'] = True
+                if 'Slim main' in pb.keys():
+                    pb['Slim main'] = False
+                a.update_tag()
+        s.render.use_simplify = True
+        s.render.simplify_subdivision_render = 0
+        s.frame_set(f0)
+        bpy.context.view_layer.update()
+
+        setup()
+        st = _anim_collect_static(players, W, H)
+        yield prog(f"static mesh ({len(st['src'])} welded / {len(st['uniq'])} unique verts)")
+
+        keys, key_frames = [], []
+        gray = _gray_diffuse_material()
+        scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in char_names]
+        for i, f in enumerate(range(f0, f1 + 1)):
+            s.frame_set(f)
+            if i % ANIM_KEYS_STEP == 0 or f == f1:
+                setup()
+                keys.append(_anim_frame_positions(st, W, H))
+                key_frames.append(i)
+            fn = f"{i+1:04d}.png"
+            # 1) BACKGROUND: players camera-invisible (still casting -> shadows baked in)
+            setup()
+            sc = {o: o.visible_camera for o in base_parts}
+            for o in base_parts:
+                o.visible_camera = False
+            bpy.context.view_layer.update()
+            bg, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT)
+            for o, v in sc.items():
+                o.visible_camera = v
+            buf = np.ones((bg.shape[0], 4), 'float32')
+            buf[:, :3] = _to_display(bg)
+            _save_image(buf.reshape(-1), rW, rH, os.path.join(adir, "seq", "bg", fn))
+            yield prog(f"frame {i+1}/{nf} background")
+            # 2) FOREGROUND: scenery-with-players-holdout, masked to the silhouette
+            setup()
+            hold = {o: o.is_holdout for o in base_parts}
+            for o in base_parts:
+                o.is_holdout = True
+            bpy.context.view_layer.update()
+            C, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+            for o, v in hold.items():
+                o.is_holdout = v
+            setup()
+            for o in s.objects:
+                if o.type == 'MESH' and o.name not in base_names:
+                    o.hide_render = True
+            bpy.context.view_layer.update()
+            D, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+            ca = np.clip(C[:, 3], 0.0, 1.0)
+            straight = np.where(ca[:, None] > 1e-4,
+                                C[:, :3] / np.maximum(ca[:, None], 1e-4), 0.0)
+            fgb = np.zeros((C.shape[0], 4), 'float32')
+            fgb[:, :3] = _to_display(straight)
+            fgb[:, 3] = np.where(D[:, 3] > 0.5, ca, 0.0)
+            _save_image(fgb.reshape(-1), rW, rH, os.path.join(adir, "seq", "fg", fn))
+            yield prog(f"frame {i+1}/{nf} foreground")
+            # 3) LIGHT: base parts gray, scenery camera-invisible (still lighting)
+            setup()
+            sv = _swap_materials(base_parts, gray)
+            sc = {o: o.visible_camera for o in scenery}
+            for o in scenery:
+                o.visible_camera = False
+            bpy.context.view_layer.update()
+            L, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+            for o, v in sc.items():
+                o.visible_camera = v
+            _restore_materials(sv)
+            la = np.clip(L[:, 3], 0.0, 1.0)
+            lst = np.where(la[:, None] > 1e-4,
+                           L[:, :3] / np.maximum(la[:, None], 1e-4), 0.0)
+            lbuf = np.ones((L.shape[0], 4), 'float32')
+            lbuf[:, :3] = _lin_to_srgb(lst)
+            _save_image(lbuf.reshape(-1), rW, rH, os.path.join(adir, "seq", "light", fn))
+            yield prog(f"frame {i+1}/{nf} light")
+
+        welded, unique, ntris = _anim_write_mesh(os.path.join(adir, "mesh.bin"), st)
+        qk = [np.round(k * ANIM_QUANT).astype('<i2') for k in keys]
+        K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), qk,
+                                ANIM_QUANT, fps / ANIM_KEYS_STEP)
+        manifest = {
+            "animated_version": 1,
+            "addon_version": ADDON_VERSION,
+            "fps": fps,
+            "frames": nf,
+            "resolution": [W, H],
+            "videos": {"background": "background.webm",
+                       "foreground": "foreground.webm",
+                       "light": "light.webm"},
+            "mesh": {"file": "mesh.bin", "welded": welded, "unique": unique,
+                     "tris": ntris, "players": st["players"],
+                     "layout": "NSKM u32x4 header + zlib(uv u16x2/65535, src u16, tris u16x3)"},
+            "anim": {"file": "anim.bin", "keys": K, "verts": V, "quant": ANIM_QUANT,
+                     "keys_fps": fps / ANIM_KEYS_STEP, "predictor": "delta2",
+                     "layout": "NSKA header + zlib(int16: abs, delta, then delta-of-delta)"},
+            "shader_note": ("draw background.webm; per player back-to-front draw the mesh "
+                            "with color = skin(uv) * light(screen) * 2 (display space); "
+                            "draw foreground.webm on top. Interpolate positions between "
+                            "mesh keys."),
+        }
+        with open(os.path.join(adir, "manifest.json"), "w") as fh:
+            json.dump(manifest, fh, indent=2)
+        yield prog("mesh.bin / anim.bin / manifest.json")
+        if ANIM_ENCODE:
+            ok, msg = _anim_encode(adir, fps)
+            print("[ANIM] encode:", msg)
+            if ok and not ANIM_KEEP_SEQUENCES:
+                import shutil as _sh
+                _sh.rmtree(os.path.join(adir, "seq"), ignore_errors=True)
+        yield prog("encode")
+    finally:
+        sess.restore()
+        s.render.use_simplify, s.render.simplify_subdivision_render = simp
+        for a in arms:
+            pb = a.pose.bones.get('Main_Properties')
+            snap = rig_snap.get(a.name)
+            if pb is not None and snap is not None:
+                if snap[0] is not None:
+                    pb['AntiLag'] = snap[0]
+                if snap[1] is not None:
+                    pb['Slim main'] = snap[1]
+                a.update_tag()
+        _restore_selection_props(forced_props)
+        s.frame_set(cur_frame)
+        bpy.context.view_layer.update()
+    return {"frames": nf}
+
+
 # ----------------------- UI: settings + panel -----------------------
 # The CONFIG constants at the top are the defaults/fallback. These scene properties mirror
 # the most-used ones so they can be edited in the N-panel; _apply_settings() copies them
@@ -2406,6 +2754,59 @@ class RENDER_OT_novaskin(bpy.types.Operator):
         # whole batch synchronously and block until done.
         return {'FINISHED'} if render_all(op=self, draft=self.draft) is not None \
             else {'CANCELLED'}
+
+
+class RENDER_OT_novaskin_animated(RENDER_OT_novaskin):
+    """Export the ANIMATED wallpaper (scene frame range): background/foreground/light
+    videos + the players' base-layer mesh stream (docs/animated-export-plan.md).
+    Base layer only; optional-layer marks are ignored (they render as scenery)"""
+    bl_idname = "render.novaskin_animated"
+    bl_label = "Export Animation (beta)"
+    bl_options = {'REGISTER'}
+
+    draft: BoolProperty(
+        name="Draft", default=False, options={'SKIP_SAVE'},
+        description="Fast preview: 50% resolution, few samples")
+
+    def invoke(self, context, event):
+        _apply_settings(context.scene, draft=self.draft)
+        players = discover_players()
+        errors = _preflight(players)
+        if errors:
+            for e in errors:
+                self.report({'ERROR'}, e)
+            return {'CANCELLED'}
+        self._players = players
+        self._gen = _anim_render_steps(players, op=self)
+        self._wm = context.window_manager
+        self._result = None
+        self._wm.progress_begin(0.0, 1.0)
+        self._timer = self._wm.event_timer_add(0.001, window=context.window)
+        self._wm.modal_handler_add(self)
+        _PROGRESS.update(running=True, frac=0.0, msg="animated: starting...", cancel=False)
+        bpy.app.driver_namespace[_ACTIVE_KEY] = self
+        context.workspace.status_text_set("NovaSkin animated: starting... (Esc to cancel)")
+        _set_progress_header("NovaSkin animated: starting... (Esc to cancel)")
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        # synchronous run (scripts): drain the generator
+        _apply_settings(context.scene, draft=self.draft)
+        players = discover_players()
+        errors = _preflight(players)
+        if errors:
+            for e in errors:
+                self.report({'ERROR'}, e)
+            return {'CANCELLED'}
+        gen = _anim_render_steps(players, op=self)
+        try:
+            while True:
+                next(gen)
+        except StopIteration:
+            return {'FINISHED'}
+        except Exception as ex:
+            self.report({'ERROR'}, f"NovaSkin animated failed: {ex}")
+            return {'CANCELLED'}
 
 
 class RENDER_OT_novaskin_cancel(bpy.types.Operator):
@@ -2622,6 +3023,14 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             box.label(text="none marked", icon='LAYER_USED')
 
         box = layout.box()
+        box.label(text="Animated (beta)", icon='RENDER_ANIMATION')
+        box.operator("render.novaskin_animated", icon='RENDER_ANIMATION').draft = False
+        box.operator("render.novaskin_animated", text="Export Animation Draft",
+                     icon='MOD_FLUID').draft = True
+        box.label(text=f"frames {context.scene.frame_start}-{context.scene.frame_end}"
+                       f" @ {context.scene.render.fps} fps, base layer only")
+
+        box = layout.box()
         box.label(text="Rig", icon='ARMATURE_DATA')
         box.prop(st, "fix_2layer_position")
         arms = _player_armatures()
@@ -2639,9 +3048,9 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                          icon='URL').url = RIG_SOURCE_URL
 
 
-_classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_cancel,
-            OBJECT_OT_novaskin_layer_toggle, OBJECT_OT_novaskin_layer_remove,
-            VIEW3D_PT_novaskin)
+_classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_animated,
+            RENDER_OT_novaskin_cancel, OBJECT_OT_novaskin_layer_toggle,
+            OBJECT_OT_novaskin_layer_remove, VIEW3D_PT_novaskin)
 
 
 def _teardown_active_batch():

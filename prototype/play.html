@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NovaSkin animated wallpaper — player prototype</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 13px/1.4 system-ui, sans-serif; }
+  #wrap { width: 960px; margin: 16px auto; }
+  canvas { display: block; width: 960px; }
+  #hud { width: 960px; margin: 8px auto; display: flex; gap: 16px; align-items: center; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="gl"></canvas></div>
+<div id="hud">
+  <button id="playbtn">play</button>
+  <span id="stats">loading…</span>
+</div>
+<script type="module" src="play.js"></script>
+</body>
+</html>
