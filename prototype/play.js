@@ -61,9 +61,17 @@ function video(src) {
 }
 const [vBg, vFg, vLight] = await Promise.all(
   [manifest.videos.background, manifest.videos.foreground, manifest.videos.light].map(video));
-const skinImg = await new Promise((ok, err) => {
-  const i = new Image(); i.onload = () => ok(i); i.onerror = err; i.src = 'data/skin.png';
+// keep the secondary videos locked to the background's clock (3 <video> elements drift)
+setInterval(() => {
+  for (const v of [vFg, vLight])
+    if (Math.abs(v.currentTime - vBg.currentTime) > 0.05)
+      v.currentTime = vBg.currentTime;
+}, 500);
+// one skin per player (the customizer swaps these individually); default: same skin
+const loadImage = (src) => new Promise((ok, err) => {
+  const i = new Image(); i.onload = () => ok(i); i.onerror = err; i.src = src;
 });
+const skins = await Promise.all(manifest.mesh.players.map(() => loadImage('data/skin.png')));
 
 // --- GL setup (same shaders as the one-frame prototype)
 const canvas = document.getElementById('gl');
@@ -112,8 +120,8 @@ function upload(t, srcEl) {
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcEl);
 }
-const tBg = tex(), tFg = tex(), tLight = tex(), tSkin = tex(true);
-upload(tSkin, skinImg);
+const tBg = tex(), tFg = tex(), tLight = tex();
+const tSkins = skins.map((img) => { const t = tex(true); upload(t, img); return t; });
 
 const quadVao = gl.createVertexArray();
 gl.bindVertexArray(quadVao);
@@ -159,11 +167,16 @@ function draw() {
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   gl.useProgram(meshP); gl.bindVertexArray(meshVao);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tSkin);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLight);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
-  gl.drawElements(gl.TRIANGLES, tris.length, gl.UNSIGNED_SHORT, 0);
+  gl.activeTexture(gl.TEXTURE0);
+  // players are stored back-to-front; each draws its own triangle range with its own skin
+  manifest.mesh.players.forEach((p, i) => {
+    gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
+    const [t0, t1] = p.tri_range;
+    gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, gl.UNSIGNED_SHORT, t0 * 3 * 2);
+  });
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   gl.useProgram(quadP); gl.bindVertexArray(quadVao);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tFg);

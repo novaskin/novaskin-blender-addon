@@ -184,6 +184,19 @@ independent of layer toggles).
 
 ---
 
+## Animated export (beta)
+
+The panel's **Animated (beta)** section exports the scene's frame range as an animated
+wallpaper (`<OUT_DIR>/animated/`): three lossy WebM videos — background (player shadows
+baked in), per-pixel foreground occlusion layer, combined player light — plus the players'
+**base-layer geometry as a screen-space mesh stream** (`mesh.bin` + `anim.bin`, ~1 MB for
+15 s), retextured in the browser with the user's skin (`color = skin(uv) × light(screen) × 2`).
+Base layer only, classic arms, players always drawn (no per-player toggles); optional-layer
+marks are ignored (those objects render as scenery). Needs `ffmpeg` for the WebM encode
+(otherwise it writes the PNG sequences + an `encode.sh`). Design, formats and measurements:
+[docs/animated-export-plan.md](docs/animated-export-plan.md); reference web player:
+[prototype/play.html](prototype/play.html).
+
 ## Configuration
 
 Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key ones:

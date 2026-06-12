@@ -239,6 +239,33 @@ matches the viewport mesh).
 - **Phase 2 — exporter MVP:** frame loop in the add-on (reuse `_Session`/steps/progress);
   write `mesh.json`/`anim.bin`; encode videos (Blender renders PNG sequences; ffmpeg or
   Blender's own encoder for WebM).
+
+### Phase 2 results (2026-06-12) — MVP shipped ✅
+
+`render.novaskin_animated` (panel **Animated (beta)**, + Draft button). Per frame:
+background (players camera-invisible, shadows baked), per-pixel foreground
+(scenery-holdout ∩ silhouette), combined light; mesh keys every `ANIM_KEYS_STEP` frames.
+Outputs `<OUT_DIR>/animated/`:
+
+- `mesh.bin` — `NSKM` header + zlib(uv u16×2, src u16 welded→unique, tris u16×3)
+- `anim.bin` — `NSKA` header + zlib(int16 1/8 px: abs, delta, then delta-of-delta)
+- `manifest.json`, `background/foreground/light.webm` (ffmpeg VP9; fg `yuva420p` alpha;
+  falls back to `encode.sh`, and searches homebrew paths — GUI Blender has no shell PATH)
+
+Verified end-to-end on an 8-frame draft (480×270): binaries parse byte-exact in the
+browser (`DecompressionStream('deflate')`), videos encode (bg 78 KB, fg 84 KB, light
+2.7 KB), and `prototype/play.html` composites correctly — water occluding the swimmers,
+per-player skin textures, keys lerped, no console errors.
+
+**Known gaps / Phase 3+ list:**
+- Video sync: 3 `<video>` elements kept aligned by a 500 ms re-sync nudge; consider one
+  WebCodecs clock or muxing streams later. Loop-seam behavior unverified on long clips.
+- Draw order fixed at frame_start (players swapping depth mid-clip would need per-key
+  order bytes).
+- Slim variant unsupported (classic forced); overlays/hat excluded by design (base only).
+- Safari: no VP9-alpha — foreground needs an HEVC+alpha or separate-matte fallback.
+- Panel doesn't expose keys_step / CRFs / keep-sequences yet (CONFIG constants only).
+- Light could be encoded at half resolution (cheap win).
 - **Phase 3 — size pass:** delta+quantization tuning, light at half-res, bitrate ladder.
 - **Phase 4 — customizer integration** (out of this repo).
 
