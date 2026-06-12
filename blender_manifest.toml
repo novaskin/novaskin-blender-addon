@@ -17,4 +17,3 @@ license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
 files = "Write the exported UV/mask/light files next to the .blend"
-network = "Open the NovaSkin wallpaper tool in your browser"
