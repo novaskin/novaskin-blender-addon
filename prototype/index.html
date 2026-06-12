@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NovaSkin animated-export prototype — one frame</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 13px/1.4 system-ui, sans-serif; }
+  #wrap { position: relative; width: 960px; margin: 16px auto; }
+  canvas, img.layer { display: block; width: 960px; height: 540px; }
+  #ref { position: absolute; inset: 0; opacity: 0; pointer-events: none; }
+  #hud { width: 960px; margin: 8px auto; display: flex; gap: 16px; align-items: center; }
+  #hud input[type=range] { flex: 1; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="gl" width="1920" height="1080"></canvas>
+  <img id="ref" class="layer" src="data/reference.png" alt="Blender reference">
+</div>
+<div id="hud">
+  <span>composite</span>
+  <input id="mix" type="range" min="0" max="100" value="0">
+  <span>Blender reference</span>
+  <label><input id="wire" type="checkbox"> wireframe</label>
+  <span id="stats"></span>
+</div>
+<script type="module" src="main.js"></script>
+</body>
+</html>

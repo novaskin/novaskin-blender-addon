@@ -208,6 +208,26 @@ Retexturing = swap the skin texture; nothing else changes. Static skin × animat
   light + background/foreground as stills; render it in Three.js with a real skin;
   compare against the Blender render. If the look matches on one frame, time is just
   repetition.
+
+### Phase 1 results (2026-06-12, frame 180) — **GO** ✅
+
+`prototype/` (WebGL2, no deps; `python3 -m http.server` in that dir): background quad →
+players (skin×light×2 shader, painter's order) → foreground quad. Data exported from
+Blender at frame 180 (AntiLag, classic, base-only, render simplify=0 so rendered geometry
+matches the viewport mesh).
+
+- **Pixel-diff vs the Blender reference render: MAE 0.69/255, median 0, p95 < 1; only
+  2.1 % of pixels differ by > 10** (mesh AA edges + render-to-render noise between two
+  independent 16-sample renders). Visually indistinguishable at 1×.
+- The scene's water occluding the swimming players is reproduced exactly by the
+  per-pixel foreground layer.
+- **Welding discovery:** per-(vertex, UV) welding for the GPU buffers gives 13 234 verts
+  (3.9× the 3 416 raw — box UV seams split heavily). Positions of the duplicates are
+  identical, so `anim.bin` must store positions for **unique vertices only** (3 416) and
+  `mesh.json` carries a static `src: welded → unique` index map. The 0.37–0.92 MB budget
+  stands.
+- Light sampled by `gl_FragCoord/resolution`; one FLIP_Y convention for every texture
+  (v=0 = bottom) keeps Blender UV space, screen space and GL consistent.
 - **Phase 2 — exporter MVP:** frame loop in the add-on (reuse `_Session`/steps/progress);
   write `mesh.json`/`anim.bin`; encode videos (Blender renders PNG sequences; ffmpeg or
   Blender's own encoder for WebM).
