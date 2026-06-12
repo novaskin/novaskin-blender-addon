@@ -2289,13 +2289,15 @@ def _anim_collect_static(players, W, H):
 
 
 def _anim_frame_positions(st, W, H):
-    """Screen-pixel positions (float32 (U,2), y up) of the unique vertices at the current
-    frame, using the evaluated depsgraph and the evaluated camera (animated constraints)."""
+    """Screen positions + camera depth (float32 (U,3): x px, y px, depth) of the unique
+    vertices at the current frame, using the evaluated depsgraph and the evaluated camera
+    (animated constraints). Depth is the perspective divisor (camera-space distance) --
+    one consistent scale across players, used for the GPU depth test (smaller = nearer)."""
     dg = bpy.context.evaluated_depsgraph_get()
     cam = bpy.context.scene.camera
     ce = cam.evaluated_get(dg)
     P = np.array(ce.calc_matrix_camera(dg, x=W, y=H) @ ce.matrix_world.inverted())
-    out = np.empty((len(st["uniq"]), 2), np.float32)
+    out = np.empty((len(st["uniq"]), 3), np.float32)
     for pi, name in enumerate(st["parts"]):
         o = bpy.context.scene.objects[name]
         ev = o.evaluated_get(dg); me = ev.to_mesh()
@@ -2309,7 +2311,8 @@ def _anim_frame_positions(st, W, H):
         scr = (clip[:, :2] / wcl[:, None] * 0.5 + 0.5) * [W, H]
         vi, ui = st["gather"].get(pi, (None, None))
         if vi is not None:
-            out[ui] = scr[vi]
+            out[ui, :2] = scr[vi]
+            out[ui, 2] = wcl[vi]
         ev.to_mesh_clear()
     return out
 
@@ -2329,11 +2332,23 @@ def _anim_write_mesh(path, st):
     return welded, unique, ntris
 
 
-def _anim_write_anim(path, keys_q, quant, keys_fps):
-    """anim.bin: 'NSKA' header + zlib payload of int16 positions for K mesh keys --
-    key 0 absolute, key 1 delta, keys 2+ delta-of-delta (linear motion predictor)."""
+def _anim_write_anim(path, keys, quant, keys_fps):
+    """anim.bin v2: 'NSKA' header + zlib payload of int16 (x, y, z) per vertex for K mesh
+    keys -- key 0 absolute, key 1 delta, keys 2+ delta-of-delta (linear motion predictor).
+    x/y are pixels x `quant` (1/8 px); z is camera depth normalized to [zmin, zmax] from
+    the header x 32767 -- one scale across all players, for the GPU depth test."""
     import struct, zlib
-    K, V = len(keys_q), keys_q[0].shape[0]
+    K, V = len(keys), keys[0].shape[0]
+    zmin = float(min(k[:, 2].min() for k in keys))
+    zmax = float(max(k[:, 2].max() for k in keys))
+    if zmax - zmin < 1e-6:
+        zmax = zmin + 1e-6
+    keys_q = []
+    for k in keys:
+        q = np.empty((V, 3), '<i2')
+        q[:, :2] = np.round(k[:, :2] * quant)
+        q[:, 2] = np.round((k[:, 2] - zmin) / (zmax - zmin) * 32767.0)
+        keys_q.append(q)
     stream = [keys_q[0].tobytes()]
     if K > 1:
         deltas = [(b - a) for a, b in zip(keys_q, keys_q[1:])]
@@ -2341,7 +2356,8 @@ def _anim_write_anim(path, keys_q, quant, keys_fps):
         stream += [(b - a).tobytes() for a, b in zip(deltas, deltas[1:])]
     payload = zlib.compress(b"".join(stream), 9)
     with open(path, "wb") as f:
-        f.write(struct.pack('<4sIIIff', b'NSKA', 1, V, K, float(quant), float(keys_fps)))
+        f.write(struct.pack('<4sIIIffff', b'NSKA', 2, V, K,
+                            float(quant), float(keys_fps), zmin, zmax))
         f.write(payload)
     return K, V
 
@@ -2517,8 +2533,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             yield prog(f"frame {i+1}/{nf} light")
 
         welded, unique, ntris = _anim_write_mesh(os.path.join(adir, "mesh.bin"), st)
-        qk = [np.round(k * ANIM_QUANT).astype('<i2') for k in keys]
-        K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), qk,
+        K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), keys,
                                 ANIM_QUANT, fps / ANIM_KEYS_STEP)
         manifest = {
             "animated_version": 1,
@@ -2534,11 +2549,13 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                      "layout": "NSKM u32x4 header + zlib(uv u16x2/65535, src u16, tris u16x3)"},
             "anim": {"file": "anim.bin", "keys": K, "verts": V, "quant": ANIM_QUANT,
                      "keys_fps": fps / ANIM_KEYS_STEP, "predictor": "delta2",
-                     "layout": "NSKA header + zlib(int16: abs, delta, then delta-of-delta)"},
-            "shader_note": ("draw background.webm; per player back-to-front draw the mesh "
-                            "with color = skin(uv) * light(screen) * 2 (display space); "
-                            "draw foreground.webm on top. Interpolate positions between "
-                            "mesh keys."),
+                     "layout": ("NSKA v2 header (+zmin/zmax) + zlib(int16 xyz: abs, "
+                                "delta, then delta-of-delta); z = camera depth for the "
+                                "GPU depth test (shared scale, smaller = nearer)")},
+            "shader_note": ("draw background.webm; draw the player meshes with a depth "
+                            "test on the z attribute and color = skin(uv) * light(screen) "
+                            "* 2 (display space); draw foreground.webm on top. Interpolate "
+                            "positions between mesh keys."),
         }
         with open(os.path.join(adir, "manifest.json"), "w") as fh:
             json.dump(manifest, fh, indent=2)
@@ -2710,8 +2727,18 @@ class RENDER_OT_novaskin(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
-        if event.type == 'ESC':
-            return self._finish(context, cancelled=True)
+        if event.type == 'ESC' and event.value == 'PRESS':
+            # confirm before throwing away a long batch: Esc arms, a second Esc within
+            # 3 s cancels (the panel's Cancel button stays immediate -- clicking it is
+            # deliberate; a stray Esc with the mouse in the viewport is not).
+            import time
+            if getattr(self, "_esc_armed_until", 0.0) > time.time():
+                return self._finish(context, cancelled=True)
+            self._esc_armed_until = time.time() + 3.0
+            warn = "Press Esc again to CANCEL the export"
+            context.workspace.status_text_set(warn)
+            _set_progress_header(warn)
+            return {'RUNNING_MODAL'}
         if event.type == 'TIMER':
             if _PROGRESS.get("cancel"):           # Cancel button in the panel
                 return self._finish(context, cancelled=True)

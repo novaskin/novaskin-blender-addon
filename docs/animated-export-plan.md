@@ -260,8 +260,11 @@ per-player skin textures, keys lerped, no console errors.
 **Known gaps / Phase 3+ list:**
 - Video sync: 3 `<video>` elements kept aligned by a 500 ms re-sync nudge; consider one
   WebCodecs clock or muxing streams later. Loop-seam behavior unverified on long clips.
-- Draw order fixed at frame_start (players swapping depth mid-clip would need per-key
-  order bytes).
+- ~~Draw order fixed at frame_start~~ → solved: NSKA v2 carries per-vertex camera depth
+  (shared scale) and the player uses a GPU depth test — correct self-occlusion (legs
+  behind no longer draw over) AND per-pixel inter-player ordering. Cost: anim.bin ~2×
+  (z quantized to 16 bits is noisy; a 12-bit z is a pending size tweak).
+- Esc during a batch now asks for confirmation (second Esc within 3 s cancels).
 - Slim variant unsupported (classic forced); overlays/hat excluded by design (base only).
 - Safari: no VP9-alpha — foreground needs an HEVC+alpha or separate-matte fallback.
 - Panel doesn't expose keys_step / CRFs / keep-sequences yet (CONFIG constants only).
