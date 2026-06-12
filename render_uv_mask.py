@@ -304,6 +304,11 @@ ANIM_ENCODE = True          # run ffmpeg after rendering (else keep PNG sequence
 ANIM_KEEP_SEQUENCES = False  # keep seq/ PNGs after a successful encode
 ANIM_BASE_LABELS = ["head", "body", "arm_left_classic", "arm_right_classic",
                     "leg_left", "leg_right"]
+# Dilate the light outward this many pixels beyond the player silhouettes before encoding.
+# The light is ONLY sampled by the player fragments (it is never composited over the
+# background), but mesh edges can sample 1-3 px outside the rendered silhouette (12fps key
+# lerp vs 24fps video + VP9 edge blur) -- padding prevents black fringes. 0 disables.
+ANIM_LIGHT_PAD = 8
 
 # Web wallpaper tool (the panel has a button that opens this URL in the browser).
 WALLPAPER_TOOL_URL = "https://minecraft.novaskin.me/wallpapers/tools/blender/"
@@ -2237,6 +2242,29 @@ def render_all(op=None, draft=False):
 
 # ----------------------- ANIMATED EXPORT (docs/animated-export-plan.md) -----------------------
 
+def _anim_dilate_light(rgb, covered, W, H, passes=None):
+    """Pad the light outward: fill uncovered pixels with the nearest covered color
+    (iterative 4-neighbour dilation, `passes` px). Keeps player-edge sampling from
+    reading black; the background is never affected (the light is only sampled by
+    player fragments). rgb (N,3) flat, covered (N,) bool -> filled rgb."""
+    if passes is None:
+        passes = ANIM_LIGHT_PAD
+    if passes <= 0:
+        return rgb
+    img = rgb.reshape(H, W, 3).copy()
+    m = covered.reshape(H, W).copy()
+    for _ in range(passes):
+        if m.all():
+            break
+        for axis, shift in ((0, 1), (0, -1), (1, 1), (1, -1)):
+            sm = np.roll(m, shift, axis)
+            sc = np.roll(img, shift, axis)
+            take = (~m) & sm
+            img[take] = sc[take]
+            m |= take
+    return img.reshape(-1, 3)
+
+
 def _anim_collect_static(players, W, H):
     """Build the static mesh buffers at the CURRENT frame: weld vertices by
     (part, vertex, uv) for the GPU buffers, and map each welded vert to a UNIQUE
@@ -2527,6 +2555,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             la = np.clip(L[:, 3], 0.0, 1.0)
             lst = np.where(la[:, None] > 1e-4,
                            L[:, :3] / np.maximum(la[:, None], 1e-4), 0.0)
+            lst = _anim_dilate_light(lst, la > 0.01, rW, rH)
             lbuf = np.ones((L.shape[0], 4), 'float32')
             lbuf[:, :3] = _lin_to_srgb(lst)
             _save_image(lbuf.reshape(-1), rW, rH, os.path.join(adir, "seq", "light", fn))
