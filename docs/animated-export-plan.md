@@ -105,6 +105,22 @@ animated/
 - Resolution: export res (1080p), bitrate tuned per layer; `light.webm` can typically be
   half resolution (light is low-frequency) — decide in the prototype.
 
+### Why the light is NOT merged into `foreground.webm` (considered ✅)
+
+WebM alpha is a full 8-bit plane, so a semi-transparent overlay (e.g. 50 % black over the
+player) *is* expressible — and "over" compositing with black does reduce to a scalar
+multiply (`result = player × (1−a)`). But the player light needs more than darkening:
+**colored light** (per-channel multiply — one alpha can't do R≠G≠B) and **gain above 1×**
+(`light/0.5` brightens up to 2×; "over" can only lerp toward the overlay color — a white
+overlay fogs, it doesn't multiply). That is exactly why the player shader samples the
+light as a texture (`skin × light/0.5`).
+
+Packing note for a possible v2: the regions are complementary (light only matters where
+the player is visible = where the foreground is transparent), so the light could ride in
+the foreground's unused RGB and save one video decode. Rejected for v1: AA edges + lossy
+alpha bleed scenery RGB into the light exactly at occlusion contact pixels, and
+`light.webm` at half resolution is already the cheapest of the three streams.
+
 ## Occlusion by the scenery
 
 The mesh must be occluded by scenery, like everything else. Two options:
