@@ -179,6 +179,31 @@ Retexturing = swap the skin texture; nothing else changes. Static skin × animat
 - **Phase 0 — measurements (Blender, cheap):** evaluated vert counts at each
   simplification level; verify projected-vertex export (`world_to_camera_view` on the
   evaluated depsgraph mesh); confirm the foreground/background split renders.
+
+### Phase 0 results (2026-06-12, wallpaper1.blend, 2 players, 15 s / 360 f camera sway) ✅
+
+- **AntiLag is mandatory.** The rig's AntiLag drives `Subdivision.show_viewport`
+  (viewport-only; render keeps level 3 — irrelevant, the mesh comes from the viewport
+  depsgraph). Base-layer (classic) totals for 2 players:
+  - default (subsurf 1): **34 328 verts** → 49 MB raw — inviable.
+  - AntiLag (subsurf off): **3 416 verts / 6 784 tris** → 4.9 MB raw.
+- **Projection pipeline verified**: evaluated-depsgraph meshes, camera
+  `calc_matrix_camera` per frame (handles the Track To constraint), topology constant
+  across frames, 97.8 % of verts in-frame, ~**2 ms/frame** extraction (free next to
+  renders).
+- **`anim.bin` budget validated** (real consecutive-frame deltas, int16 + zlib):
+  - 1/8 px quant: **0.92 MB** for 360 f; 1/4 px: **0.74 MB**.
+  - With mesh keys at 12 fps + browser interpolation: **0.37–0.46 MB** ✅ (target ~0.5 MB).
+- **Foreground split verified — and needed**: at frame 180, **19.7 % of the player
+  silhouette** (14 260 px) is occluded by scenery. Two cheap data renders produce it:
+  1. scenery with players as **holdout** (alpha hole where a player is in front);
+  2. player **unoccluded silhouette** (scenery hidden);
+  `foreground = render(1) ∩ silhouette(2)` — per pixel.
+
+  Design note: the split is **per-pixel, not per-object** (the ground plane spans the
+  whole depth range, so an object-level front/behind split is impossible). Restricting
+  the foreground to the silhouette also protects the player's AA edges from being
+  overwritten by redundant scenery pixels.
 - **Phase 1 — one-frame web prototype (the go/no-go gate):** export ONE frame's mesh +
   light + background/foreground as stills; render it in Three.js with a real skin;
   compare against the Blender render. If the look matches on one frame, time is just
