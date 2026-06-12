@@ -1094,11 +1094,14 @@ def _rendered_depth_range(player, sess, gray_mat, _back_mat=None):
     ray, so there is no pass-through nor background contamination (unlike the backface
     material, whose UV coverage marks the whole silhouette but the depth is the background
     where there is no back face). The deepest back faces saturate slightly at 1.0 on
-    normalization -- acceptable."""
+    normalization -- acceptable.
+    Returns (rng, reason): ((vmin, vmax), None) on success, or (None, reason) on failure
+    -- reason names WHICH path failed so the caller can report it instead of silently
+    exporting a flat (depth-less) B channel."""
     s = sess.s
     parts = list(player["uv_parts"])
     if not parts:
-        return None
+        return None, "no UV parts"
     sess.mute_drivers(True)
     for o in s.objects:
         o.hide_render = True
@@ -1112,15 +1115,35 @@ def _rendered_depth_range(player, sess, gray_mat, _back_mat=None):
         dep, _, _ = sess.render_pass('Depth', 'CYCLES', 1, 50)
     finally:
         _restore_materials(sv)
-    if uv is None or dep is None:
-        return None
+    if uv is None:
+        return None, "empty Viewer node on the UV pass (transient GUI/render hiccup)"
+    if dep is None:
+        return None, "empty Viewer node on the Depth pass (transient GUI/render hiccup)"
     geo = dep[uv[:, 2] > 0.5, 0]   # reliable coverage (opaque: front face = surface)
     if geo.size == 0:
-        return None
+        return None, "zero coverage in the opaque render (no part pixels hit the camera)"
     vmin, vmax = float(geo.min()), float(geo.max())
     if vmax - vmin < 1e-6:
         vmax = vmin + 1e-6
-    return (vmin, vmax)
+    return (vmin, vmax), None
+
+
+def _depth_range_or_abort(player, sess, gray_mat, back_mat, label):
+    """_rendered_depth_range with ONE retry on failure (covers a transient empty Viewer
+    node, common on the first renders of a session), then raise with a clear message if it
+    still fails. Exporting without a depth range silently flattens the UV's B channel and
+    breaks depth occlusion -- failing loudly is better than a broken-but-'successful' export."""
+    rng, reason = _rendered_depth_range(player, sess, gray_mat, back_mat)
+    if rng is None:
+        print(f"[depth] {label}: depth range failed -- {reason}. Retrying once...")
+        rng, reason = _rendered_depth_range(player, sess, gray_mat, back_mat)
+    if rng is None:
+        raise RuntimeError(
+            f"Depth range unavailable for {label}: {reason}. The UV depth (B channel) "
+            f"would be a flat placeholder, breaking depth occlusion against the other "
+            f"players/layers. Export aborted -- if this was a transient empty Viewer node, "
+            f"just run it again.")
+    return rng
 
 
 def export_part_uv(part, sess, out_subdir, tag="_UV", depth_range=None, label=None,
@@ -1481,8 +1504,17 @@ def _layer_steps(players, groups, sess, prog, layer_infos):
                     for o, c in sc.items():
                         o.visible_camera = c
                     _restore_materials(sv)
-            dr = (_rendered_depth_range({"uv_parts": [ly]}, sess, _opaque_mask_material())
-                  if UV_DEPTH_IN_BLUE else None)
+            dr = None
+            if UV_DEPTH_IN_BLUE:
+                dr, reason = _rendered_depth_range({"uv_parts": [ly]}, sess,
+                                                   _opaque_mask_material())
+                if dr is None:   # retry once (transient empty Viewer); non-fatal for layers
+                    print(f"[depth] layer '{safe}': depth range failed -- {reason}. Retry...")
+                    dr, reason = _rendered_depth_range({"uv_parts": [ly]}, sess,
+                                                       _opaque_mask_material())
+                if dr is None:
+                    print(f"[depth] layer '{safe}': no depth range ({reason}); the layer "
+                          f"will composite by camera_depth (draw order), not per-pixel.")
             # Same scale/key as the players' "depth_range_viewer": the UV's B decodes to an
             # absolute (Viewer-scale) depth via zmin + B*(zmax-zmin) -- comparable across
             # players and layers for per-pixel depth-checked compositing.
@@ -1988,9 +2020,12 @@ def _render_steps(players, op=None):
     front_tag = "_UVDL" if embed_light else "_UV"
 
     try:
-        # 0) Depth range per player (for depth in the B channel), in the Viewer's scale
+        # 0) Depth range per player (for depth in the B channel), in the Viewer's scale.
+        #    Retry once and ABORT on persistent failure -- a None range here silently
+        #    flattens the B channel and breaks depth occlusion (see _depth_range_or_abort).
         for p in players:
-            p["depth_range"] = (_rendered_depth_range(p, sess, mask_mat, back_mat)
+            p["depth_range"] = (_depth_range_or_abort(p, sess, mask_mat, back_mat,
+                                                      f"player '{p['label']}'")
                                 if UV_DEPTH_IN_BLUE else None)
             p["uv_labels"] = _assign_part_labels(p["uv_parts"])
             yield prog(f"Depth range: {p['label']}")
@@ -2152,6 +2187,13 @@ def render_all(op=None, draft=False):
             next(gen)
     except StopIteration as e:
         results = e.value
+    except Exception as ex:
+        # an abort (e.g. depth range unavailable) -- the generator's finally already
+        # restored the scene; report cleanly instead of a raw Python traceback.
+        print(f"\nrender_uv_mask: ABORTED -- {ex}\n")
+        if op is not None:
+            op.report({'ERROR'}, str(ex))
+        return None
     print("Done. Players:",
           {k: {"uv": len(v["uv"]), "masks": list(v["masks"].keys())} for k, v in results.items()})
     if op is not None:
