@@ -198,6 +198,7 @@ Parameters live in the **CONFIG** block at the top of `render_uv_mask.py`. Key o
 | `PNG_COMPRESSION` | zlib level for data PNGs (default `90`; byte-exact) |
 | `UV_PNG_FLOOR_TEXELS` / `UV_TEXEL_BINS` | PNG U/V quantized with `floor` into texel bins (byte = texel index @256) |
 | `FIX_2LAYER_POSITION` / `HAT_SCALE_RATIO` | Snap the hat (`2_Layer_Extrusion`) onto `NoFace_Head` and scale it to the Minecraft hat size (`1.125`× the head) before export (persistent) |
+| `SELECTION_FORCE_ON` | Rig toggles forced ON during the export so the parts they reveal are **always exported** — by default `Main_Properties["Second layer"]`, so the jacket/sleeve/pant overlays export even when the artist left the rig's *Second layer* toggle off. The original value is restored afterward |
 | `ILLUM_SAMPLES` / `ILLUM_COLORSPACE` | Illum quality/encoding |
 | `PNG_BIT_DEPTH` | Bit depth of UV/mask PNGs (default `8`; 256 levels, enough for MC skins) |
 | `UV_FORMAT` / `EXR_HALF` / `EXR_CODEC` | UV + base_layer format: `PNG` (default), `WEBP` (8-bit **lossless** — quality 100; ~60% smaller than PNG, browser-decodable) or `OPEN_EXR` (half-float, `ZIP` ≈ PNG size, lossless). As EXR + illum, the RGB light is embedded as an extra `light.*` layer — see note |

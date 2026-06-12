@@ -117,6 +117,15 @@ SELECTION_FORCE_OFF = [
     ("L.Arm_Properties", "L.Arm_Fingers"),
     ("L.Arm_Properties", "L.Arm_ Fingers+"),
 ]
+# Pose-bone toggles to force ON (truthy) so the parts they reveal are ALWAYS exported, even
+# when the artist left the toggle OFF in the rig UI. The "Second layer" toggle hides the
+# overlay meshes (jacket/sleeves/pants 2nd layer) via hide_render DRIVERS; with it off those
+# parts aren't selected and never exported (and reconciliation can't recover them -- they are
+# driver-hidden, not manually). Forced during part selection AND the whole render, then the
+# artist's original value is restored. Empty list = export exactly what is visible.
+SELECTION_FORCE_ON = [
+    ("Main_Properties", "Second layer"),
+]
 # Opaque material override during the mask (the skin has alpha -> it would punch holes
 # in the mask). Object Index ignores color; it only needs to be opaque. Gray ~#808080.
 MASK_OVERRIDE_RGBA = (0.5, 0.5, 0.5, 1.0)
@@ -403,6 +412,42 @@ def _force_player_parts_visible(players):
     return forced
 
 
+def _force_selection_props_on(players):
+    """Force the SELECTION_FORCE_ON toggles (e.g. 'Second layer') ON on every player rig so
+    the overlay parts they reveal are visible in the mask/illum renders too -- not just the
+    UV pass. Must run BEFORE the _Session snapshot, so the snapshot captures the overlays
+    visible. Returns [(arm, bone, key, original)] to restore at the end."""
+    saved, seen = [], set()
+    for p in players:
+        arm = p.get("arm")
+        if arm is None or arm.name in seen:
+            continue
+        seen.add(arm.name)
+        for bn, k in SELECTION_FORCE_ON:
+            pb = arm.pose.bones.get(bn)
+            if pb is not None and k in pb.keys() and not pb[k]:
+                saved.append((arm, bn, k, pb[k]))
+                pb[k] = type(pb[k])(1)
+                arm.update_tag()
+    if saved:
+        bpy.context.view_layer.update()
+        print("[2ND LAYER] forced ON for export: "
+              + ", ".join(f"{a.name}['{k}']" for a, _, k, _ in saved))
+    return saved
+
+
+def _restore_selection_props(saved):
+    """Restore the artist's toggle values forced by _force_selection_props_on; re-running the
+    drivers (view_layer.update) re-hides the overlays to match the rig UI state."""
+    for arm, bn, k, v in saved:
+        pb = arm.pose.bones.get(bn)
+        if pb is not None:
+            pb[k] = v
+            arm.update_tag()
+    if saved:
+        bpy.context.view_layer.update()
+
+
 def _node(node_type):
     ng = getattr(bpy.context.scene, "compositing_node_group", None)
     if not ng:
@@ -443,6 +488,13 @@ def _select_uv_parts(arm, char):
         if pb is not None and k in pb.keys():
             saved[(bn, k)] = pb[k]
             pb[k] = type(pb[k])(0)
+    # force "always export" toggles (e.g. Second layer) ON so their overlay parts are
+    # detected as visible and selected, regardless of the rig UI toggle state.
+    for bn, k in SELECTION_FORCE_ON:
+        pb = arm.pose.bones.get(bn)
+        if pb is not None and k in pb.keys():
+            saved[(bn, k)] = pb[k]
+            pb[k] = type(pb[k])(1)
 
     slim_bn, slim_key = SLIM_CONTROL
     slim_pb = arm.pose.bones.get(slim_bn)
@@ -1855,8 +1907,10 @@ def _render_steps(players, op=None):
     inside try/finally, so closing the generator (modal cancel) still restores the scene."""
     if FIX_2LAYER_POSITION:
         _fix_2layer_positions(players)
-    # Make manually render-hidden parts visible BEFORE the _Session snapshot, so masks/illum
-    # render them; their original hide_render is put back in the finally below.
+    # Force the "always export" toggles (Second layer) ON, and make manually render-hidden
+    # parts visible -- BEFORE the _Session snapshot, so masks/illum render them. Both are put
+    # back in the finally below.
+    forced_props = _force_selection_props_on(players)
     forced_visible = _force_player_parts_visible(players)
     for p in players:
         os.makedirs(os.path.join(_abs(OUT_DIR), p["label"]), exist_ok=True)
@@ -2056,6 +2110,7 @@ def _render_steps(players, op=None):
         sess.restore()
         for o in forced_visible:   # put back the original manual hide_render
             o.hide_render = True
+        _restore_selection_props(forced_props)   # restore the artist's Second-layer toggle
     return results
 
 
