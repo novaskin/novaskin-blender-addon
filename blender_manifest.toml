@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "novaskin_export"
-version = "1.2.2"
+version = "1.2.3"
 name = "NovaSkin Export"
 tagline = "Export per-part UV/mask/illum/shadow for Minecraft skins"
 maintainer = "saviski"
@@ -17,4 +17,3 @@ license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
 files = "Write the exported UV/mask/light files next to the .blend"
-network = "Open the NovaSkin wallpaper tool in your browser"

@@ -61,7 +61,7 @@ Outputs go to <blend_dir>/novaskin/.
 bl_info = {
     "name": "NovaSkin Export (Thomas_Rig_Legacy)",
     "author": "saviski",
-    "version": (1, 2, 2),
+    "version": (1, 2, 3),
     "blender": (4, 2, 0),
     "location": "Top bar > Render > Render for NovaSkin",
     "description": "Export per-part UV + occlusion mask + illum/shadow per player.",
@@ -80,7 +80,7 @@ from bpy.props import (BoolProperty, IntProperty, EnumProperty,
 # Add-on version stamped into manifest.json ("addon_version"). Keep in sync with bl_info
 # and blender_manifest.toml -- bl_info must stay a literal (Blender parses it via ast) and
 # is STRIPPED from the extension zip, so the manifest can't read it at run time.
-ADDON_VERSION = "1.2.2"
+ADDON_VERSION = "1.2.3"
 # Version of the manifest.json FORMAT (bump when keys/semantics change, so the web tool
 # can branch). Absent in manifests written before this key existed.
 MANIFEST_VERSION = 1
