@@ -2503,8 +2503,15 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                          icon='MOD_FLUID').draft = True
 
         if WALLPAPER_TOOL_URL:
-            layout.operator("wm.url_open", text="Open Wallpaper Tool",
-                            icon='URL').url = WALLPAPER_TOOL_URL
+            # Web links honor the "Allow Online Access" preference (bpy.app.online_access):
+            # disabled in offline mode, as the extension guidelines require.
+            row = layout.row()
+            row.enabled = bpy.app.online_access
+            row.operator("wm.url_open", text="Open Wallpaper Tool",
+                         icon='URL').url = WALLPAPER_TOOL_URL
+            if not bpy.app.online_access:
+                layout.label(text="(enable Allow Online Access for web links)",
+                             icon='INFO')
 
         box = layout.box()
         box.label(text="Output", icon='FILE_FOLDER')
@@ -2572,7 +2579,9 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         else:
             box.label(text=f"no '{RIG_ID_VALUE or RIG_ID_PROP}' rig found", icon='ERROR')
             box.label(text="This exporter needs the Thomas Rig Legacy.")
-            box.operator("wm.url_open", text="Get the rig (extensions.blender.org)",
+            row = box.row()
+            row.enabled = bpy.app.online_access   # honor offline mode (extension guideline)
+            row.operator("wm.url_open", text="Get the rig (extensions.blender.org)",
                          icon='URL').url = RIG_SOURCE_URL
 
 

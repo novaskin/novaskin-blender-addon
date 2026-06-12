@@ -23,10 +23,11 @@ plus `layers/` and scene-level files).
   script reads the result through the *Viewer node*.
 - The **[Thomas Rig Legacy](https://extensions.blender.org/add-ons/thomas-rig-legacy/)**
   rig in the scene (1+ players, identified by the `Rig_ID` custom property). This exporter
-  is built specifically for that rig — install/append it separately (Blender extensions
-  can't declare another extension as a dependency, only Python wheels, so it isn't pulled
-  in automatically). The panel shows how many players it detects, and links to the rig when
-  none is found.
+  is built specifically for that rig, but the rig is **scene content you add to your
+  `.blend`** (not Python this add-on imports), so install/append it separately. The Blender
+  extension manifest can't auto-pull another extension anyway (it only bundles Python
+  wheels). The panel shows how many players it detects and links to the rig when none is
+  found.
 - An **active camera**, and lights/scenery.
 - The **`.blend` must be saved** (output uses `//novaskin/`, relative to the file).
 
