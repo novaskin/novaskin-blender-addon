@@ -189,4 +189,9 @@ document.getElementById('stats').textContent =
   `${uniqueN} unique / ${welded} welded verts, ${ntris} tris, ${K} keys @ ${keysFps} fps, ` +
   `${manifest.frames} frames @ ${manifest.fps} fps, ${W}x${H}`;
 document.getElementById('playbtn').onclick = () => { vBg.play(); vFg.play(); vLight.play(); };
+// debug handle (pause/seek from the console): __dbg.seek(5.0)
+window.__dbg = {
+  vBg, vFg, vLight, keys, K, keysFps,
+  seek(t) { for (const v of [vBg, vFg, vLight]) { v.pause(); v.currentTime = t; } },
+};
 draw();
