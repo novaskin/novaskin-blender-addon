@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "novaskin_export"
-version = "1.2.1"
+version = "1.2.2"
 name = "NovaSkin Export"
 tagline = "Export per-part UV/mask/illum/shadow for Minecraft skins"
 maintainer = "saviski"
