@@ -131,6 +131,28 @@ function upload(t, srcEl) {
 const tBg = tex(), tFg = tex(), tLight = tex();
 const tSkins = skins.map((img) => { const t = tex(true); upload(t, img); return t; });
 
+// swap a player's skin at runtime (file input below, or __dbg.setSkin(i, src))
+function setSkin(i, source) { upload(tSkins[i], source); }
+{
+  const box = document.getElementById('skins');
+  manifest.mesh.players.forEach((p, i) => {
+    const lab = document.createElement('label');
+    lab.textContent = ` ${p.label}: `;
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = 'image/png,image/webp,image/jpeg';
+    inp.style.width = '110px';
+    inp.onchange = () => {
+      const f = inp.files[0];
+      if (!f) return;
+      const img = new Image();
+      img.onload = () => { setSkin(i, img); URL.revokeObjectURL(img.src); };
+      img.src = URL.createObjectURL(f);
+    };
+    lab.appendChild(inp);
+    box.appendChild(lab);
+  });
+}
+
 const quadVao = gl.createVertexArray();
 gl.bindVertexArray(quadVao);
 gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
@@ -215,7 +237,7 @@ document.getElementById('stats').textContent =
 document.getElementById('playbtn').onclick = () => { vBg.play(); vFg.play(); vLight.play(); };
 // debug handle (pause/seek from the console): __dbg.seek(5.0)
 window.__dbg = {
-  vBg, vFg, vLight, keys, K, keysFps,
+  vBg, vFg, vLight, keys, K, keysFps, setSkin,
   seek(t) { for (const v of [vBg, vFg, vLight]) { v.pause(); v.currentTime = t; } },
 };
 draw();
