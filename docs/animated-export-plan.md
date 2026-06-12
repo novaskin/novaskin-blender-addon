@@ -194,6 +194,14 @@ Retexturing = swap the skin texture; nothing else changes. Static skin × animat
 - **`anim.bin` budget validated** (real consecutive-frame deltas, int16 + zlib):
   - 1/8 px quant: **0.92 MB** for 360 f; 1/4 px: **0.74 MB**.
   - With mesh keys at 12 fps + browser interpolation: **0.37–0.46 MB** ✅ (target ~0.5 MB).
+- **With CHARACTER animation** (vigorous swim stroke keyed on Player 1 — arm steps up to
+  34 px/frame — on top of the camera sway; Player 2 static):
+  - plain delta: 1.49 MB / 360 f; **delta-of-delta (linear motion predictor): 1.26 MB**,
+    or **0.63 MB at 12 fps keys** — the predictor recovers ~15 %, smooth motion is
+    second-order-small. Both players animated would land roughly 2× the animated share
+    (a static player's deltas compress to almost nothing), still ≈ 1–1.3 MB @ 12 fps —
+    comparable to one of the three videos. Budget holds; 12 fps mesh keys + browser
+    lerp is the recommended default.
 - **Foreground split verified — and needed**: at frame 180, **19.7 % of the player
   silhouette** (14 260 px) is occluded by scenery. Two cheap data renders produce it:
   1. scenery with players as **holdout** (alpha hole where a player is in front);
