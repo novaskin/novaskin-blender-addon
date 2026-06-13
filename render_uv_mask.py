@@ -302,6 +302,10 @@ ANIM_QUANT = 8.0            # vertex quantization: 1/8 px (int16)
 ANIM_CRF = {"bg": 32, "fg": 32, "light": 38}   # VP9 quality per stream
 ANIM_ENCODE = True          # run ffmpeg after rendering (else keep PNG sequences + script)
 ANIM_KEEP_SEQUENCES = False  # keep seq/ PNGs after a successful encode
+# Resume an interrupted export: skip frames whose PNGs already exist in seq/. A crash or
+# cancel leaves the rendered frames (seq/ is only deleted after a SUCCESSFUL encode), so
+# re-running the export continues from where it stopped. Delete seq/ to force a fresh run.
+ANIM_RESUME = True
 ANIM_BASE_LABELS = ["head", "body", "arm_left_classic", "arm_right_classic",
                     "leg_left", "leg_right"]
 # Dilate the light outward this many pixels beyond the player silhouettes before encoding.
@@ -2248,6 +2252,14 @@ def render_all(op=None, draft=False):
 
 # ----------------------- ANIMATED EXPORT (docs/animated-export-plan.md) -----------------------
 
+def _anim_frame_cached(adir, i):
+    """True if frame i's four PNGs already exist (non-empty) -- resume skips re-rendering."""
+    fn = f"{i + 1:04d}.png"
+    return all(os.path.exists(p) and os.path.getsize(p) > 0
+               for p in (os.path.join(adir, "seq", k, fn)
+                         for k in ("bg", "fg", "fg_matte", "light")))
+
+
 def _anim_dilate_light(rgb, covered, W, H, passes=None):
     """Pad the light outward: fill uncovered pixels with the nearest covered color
     (iterative 4-neighbour dilation, `passes` px). Keeps player-edge sampling from
@@ -2544,9 +2556,17 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
               f"= {cx1-cx0}x{cy1-cy0} ({100*(cx1-cx0)*(cy1-cy0)/(W*H):.0f}% of frame)")
         gray = _gray_diffuse_material()
         scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in char_names]
+        cached = sum(1 for i in range(nf) if ANIM_RESUME and _anim_frame_cached(adir, i))
+        if cached:
+            print(f"[ANIM] resume: {cached}/{nf} frames already rendered -- skipping them")
         for i, f in enumerate(range(f0, f1 + 1)):
-            s.frame_set(f)
             fn = f"{i+1:04d}.png"
+            if ANIM_RESUME and _anim_frame_cached(adir, i):   # resume: this frame is done
+                yield prog(f"frame {i+1}/{nf} background (cached)")
+                yield prog(f"frame {i+1}/{nf} foreground (cached)")
+                yield prog(f"frame {i+1}/{nf} light (cached)")
+                continue
+            s.frame_set(f)
             # 1) BACKGROUND: players camera-invisible (still casting -> shadows baked in)
             setup()
             sc = {o: o.visible_camera for o in base_parts}
