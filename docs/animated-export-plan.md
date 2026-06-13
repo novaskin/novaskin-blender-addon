@@ -269,6 +269,20 @@ per-player skin textures, keys lerped, no console errors.
 - Safari: no VP9-alpha — foreground needs an HEVC+alpha or separate-matte fallback.
 - Panel doesn't expose keys_step / CRFs / keep-sequences yet (CONFIG constants only).
 - Light could be encoded at half resolution (cheap win).
+
+### Phase 3 — crop optimization (2026-06-12) ✅ validated
+
+The foreground was nearly as big as the background (8.5 MB / 360f) despite being ~97%
+transparent: it carried the scenery RGB outside the silhouette, and the full frame was
+encoded though content is localized to the players. Two fixes (ANIM_CROP_PAD, default on):
+- zero the foreground RGB where alpha=0 (flat -> compresses to nothing);
+- crop foreground + light to the union of the players' screen bboxes (+ pad), computed in
+  a key pre-pass; even dims for yuv420p; background stays full-frame.
+manifest.crop (top-left px) drives the web side: the foreground quad is positioned at the
+rect and the light is sampled at (fragScreen - cropOrigin)/cropSize.
+Verified e2e (12-frame draft): crop 380x180 (~13% of frame); foreground 42 KB vs 369 KB
+background (was comparable); composite, occlusion and light alignment all correct in the
+player; also speeds the fg/light render passes (fewer px).
 - **Phase 3 — size pass:** delta+quantization tuning, light at half-res, bitrate ladder.
 - **Phase 4 — customizer integration** (out of this repo).
 
