@@ -86,6 +86,64 @@ space). Trade-off: a layer's shadow never falls on a player. Manifest entries ca
 `kind`, `meshes`, bbox, `camera_depth`, `depth_range_viewer` and join
 `draw_order_back_to_front`.
 
+## Animated export (`animated/`)
+
+A separate output for the animated wallpaper, consumed by a WebGL player (reference:
+[prototype/play.html](../prototype/play.html)). Design rationale:
+[animated-export-plan.md](animated-export-plan.md). Layout:
+
+```
+animated/
+├── background.webm        full-frame scenery (player shadows baked in); lossy VP9
+├── foreground.webm        scenery IN FRONT of the players; RGB only, cropped (no alpha)
+├── foreground_matte.webm  the foreground's alpha as grayscale; cropped (Safari-safe)
+├── light.webm             combined player light (gray-0.5 basis); cropped
+├── mesh.bin               static geometry (NSKM)
+├── anim.bin               per-frame screen positions + depth (NSKA)
+└── manifest.json          fps, frames, resolution, crop, file list, format versions
+```
+
+The character is NOT video — it is a screen-space triangle mesh re-textured live with the
+user's skin. Only base-layer parts; players always drawn.
+
+### Compositing recipe (per displayed frame `t`)
+
+1. Draw `background.webm` full-frame.
+2. Draw each player's mesh (back-to-front), with a **depth test** on the vertex z and
+   `color = skin(uv) · light(screenUv) · 2` (display space). Vertex positions are the mesh
+   keys interpolated at `t` (see anim.bin). `light` is sampled in screen space, offset by
+   the crop: `screenUv = (fragCoord − cropOrigin) / cropSize`.
+3. Draw the foreground over the players: `rgba = (foreground.rgb, foreground_matte.r)` with
+   straight-alpha "over", positioned at the crop rect (not full-frame).
+
+`light`/`foreground`/`foreground_matte` are cropped to `manifest.crop`; `background` is
+full-frame. Keep the three secondary videos time-locked to the background's clock.
+
+### `mesh.bin` — NSKM (static, little-endian)
+
+`< 4s I I I >` header: magic `NSKM`, version (1), `welded`, `unique`, `tris`, then a
+**zlib** payload of:
+- `uv`: `welded × u16×2` — skin UV per welded vertex, `/65535` → 0..1.
+- `src`: `welded × u16` — maps each welded vertex to its **unique** position index (box UV
+  seams split positions; anim.bin only stores the `unique` positions).
+- `tris`: `tris × u16×3` — triangle indices into the welded vertices.
+
+`manifest.mesh.players[]` gives each player's `tri_range` (draw its own skin) and
+`vert_range`, back-to-front.
+
+### `anim.bin` — NSKA v3 (per-frame, little-endian)
+
+`< 4s I I I f f f f f >` header: magic `NSKA`, version (3), `V` (unique verts), `K` (mesh
+keys), `quant` (x/y px scale, 8), `keys_fps`, `zmin`, `zmax`, `zq`, then a **zlib** payload
+of `K` keys of `V × i16×3` (x, y, z):
+- key 0 absolute, key 1 = delta vs key 0, keys 2+ = **delta-of-delta** (linear motion
+  predictor). Reconstruct by accumulating a running delta.
+- `x, y = int / quant` (screen pixels, y up).
+- `z = int / zq` → 0..1, the normalized camera depth (`= (camDepth − zmin)/(zmax − zmin)`);
+  one scale across all players. Feed straight into the depth test (smaller = nearer).
+- Display position at time `t`: `key = t · keys_fps`; lerp `keys[floor(key)]` →
+  `keys[floor(key)+1]`. Older v2 has no `zq` (z `/32767`); v1 has no z.
+
 ## Manifest essentials
 
 - `manifest_version` / `addon_version` — format and exporter versions.

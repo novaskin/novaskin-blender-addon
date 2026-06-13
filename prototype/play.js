@@ -36,22 +36,21 @@ const uv = Float32Array.from(uvQ, v => v / 65535);
 
 // --- anim.bin: NSKA | u32 version, V, K, f32 quant, keys_fps | zlib(int16 abs/delta/ddelta)
 const ab = await bin(DIR + manifest.anim.file);
-const ah = new DataView(ab, 0, 32);
+const ah = new DataView(ab, 0, 36);
 if (new TextDecoder().decode(new Uint8Array(ab, 0, 4)) !== 'NSKA') throw 'bad anim.bin';
 const aVer = ah.getUint32(4, true);
 const V = ah.getUint32(8, true), K = ah.getUint32(12, true);
 const quant = ah.getFloat32(16, true), keysFps = ah.getFloat32(20, true);
-const CH = aVer >= 2 ? 3 : 2;                 // v2 carries z (camera depth) per vertex
-const zMin = aVer >= 2 ? ah.getFloat32(24, true) : 0;
-const zMax = aVer >= 2 ? ah.getFloat32(28, true) : 1;
-const hdrLen = aVer >= 2 ? 32 : 24;
+const CH = aVer >= 2 ? 3 : 2;                 // v2+ carry z (camera depth) per vertex
+const zDiv = aVer >= 3 ? ah.getFloat32(32, true) : 32767;   // v3: z quant from header
+const hdrLen = aVer >= 3 ? 36 : (aVer >= 2 ? 32 : 24);
 const ap = new Int16Array((await inflate(new Uint8Array(ab, hdrLen))).buffer);
 // reconstruct delta-of-delta -> absolute keys (float px)
 const keys = [];
 {
   const n = V * CH;
   const cur = new Int32Array(n), d = new Int32Array(n);
-  const toF = (v, i) => (i % CH === 2) ? v / 32767 : v / quant;   // z normalized 0..1
+  const toF = (v, i) => (i % CH === 2) ? v / zDiv : v / quant;   // z normalized 0..1
   for (let i = 0; i < n; i++) cur[i] = ap[i];                 // key 0: absolute
   keys.push(Float32Array.from(cur, toF));
   for (let k = 1; k < K; k++) {
@@ -203,11 +202,13 @@ gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 
 gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
 gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, tris, gl.STATIC_DRAW);
 
+const meshSpan = K / keysFps;           // mesh-key duration (s)
 function setPositions(time) {
-  // lerp between mesh keys; gather welded positions from unique via src
-  const x = Math.min(time * keysFps, K - 1.0001);
-  const k = Math.floor(x), t = x - k;
-  const a = keys[k], b = keys[Math.min(k + 1, K - 1)];
+  // lerp between mesh keys, WRAPPING the last key back to key 0 so the mesh loops in step
+  // with the looping videos (for loop-closed animations key K-1 ~= key 0, so it's seamless).
+  const x = (time % meshSpan) * keysFps;
+  const k = Math.floor(x) % K, t = x - Math.floor(x);
+  const a = keys[k], b = keys[(k + 1) % K];
   for (let i = 0; i < welded; i++) {
     const u = src[i] * CH;
     posArr[i*3]   = a[u]   + (b[u]   - a[u])   * t;

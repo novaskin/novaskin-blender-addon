@@ -298,7 +298,12 @@ COMPOSITE_BASE_LABELS = ["head", "body",
 # IGNORED here (marked objects render as plain scenery). Frame range = the scene's.
 ANIM_OUT_SUBDIR = "animated"
 ANIM_KEYS_STEP = 2          # store mesh keys every Nth video frame (24fps video -> 12fps keys)
-ANIM_QUANT = 8.0            # vertex quantization: 1/8 px (int16)
+ANIM_QUANT = 8.0            # vertex x/y quantization: 1/8 px (int16)
+ANIM_Z_BITS = 12            # depth quantization: 12 bits = 4095 levels (plenty for the depth
+                            # test; smaller than the x/y range -> better delta compression)
+# The 'Export Animation Draft' button renders only the first few seconds (fast iteration on
+# look/quality) instead of the whole frame range. The full export uses the scene's range.
+ANIM_DRAFT_SECONDS = 3
 ANIM_CRF = {"bg": 32, "fg": 32, "light": 38}   # VP9 quality per stream
 ANIM_ENCODE = True          # run ffmpeg after rendering (else keep PNG sequences + script)
 ANIM_KEEP_SEQUENCES = False  # keep seq/ PNGs after a successful encode
@@ -2379,21 +2384,23 @@ def _anim_write_mesh(path, st):
 
 
 def _anim_write_anim(path, keys, quant, keys_fps):
-    """anim.bin v2: 'NSKA' header + zlib payload of int16 (x, y, z) per vertex for K mesh
+    """anim.bin v3: 'NSKA' header + zlib payload of int16 (x, y, z) per vertex for K mesh
     keys -- key 0 absolute, key 1 delta, keys 2+ delta-of-delta (linear motion predictor).
-    x/y are pixels x `quant` (1/8 px); z is camera depth normalized to [zmin, zmax] from
-    the header x 32767 -- one scale across all players, for the GPU depth test."""
+    x/y are pixels x `quant` (1/8 px); z is camera depth normalized to [zmin, zmax] x zq
+    (zq = 2^ANIM_Z_BITS - 1; one scale across all players, for the GPU depth test). zq is
+    in the header so the consumer divides by the right value."""
     import struct, zlib
     K, V = len(keys), keys[0].shape[0]
     zmin = float(min(k[:, 2].min() for k in keys))
     zmax = float(max(k[:, 2].max() for k in keys))
     if zmax - zmin < 1e-6:
         zmax = zmin + 1e-6
+    zq = float((1 << ANIM_Z_BITS) - 1)
     keys_q = []
     for k in keys:
         q = np.empty((V, 3), '<i2')
         q[:, :2] = np.round(k[:, :2] * quant)
-        q[:, 2] = np.round((k[:, 2] - zmin) / (zmax - zmin) * 32767.0)
+        q[:, 2] = np.round((k[:, 2] - zmin) / (zmax - zmin) * zq)
         keys_q.append(q)
     stream = [keys_q[0].tobytes()]
     if K > 1:
@@ -2402,8 +2409,8 @@ def _anim_write_anim(path, keys, quant, keys_fps):
         stream += [(b - a).tobytes() for a, b in zip(deltas, deltas[1:])]
     payload = zlib.compress(b"".join(stream), 9)
     with open(path, "wb") as f:
-        f.write(struct.pack('<4sIIIffff', b'NSKA', 2, V, K,
-                            float(quant), float(keys_fps), zmin, zmax))
+        f.write(struct.pack('<4sIIIfffff', b'NSKA', 3, V, K,
+                            float(quant), float(keys_fps), zmin, zmax, zq))
         f.write(payload)
     return K, V
 
@@ -2459,8 +2466,11 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     s = bpy.context.scene
     f0 = s.frame_start if frame_start is None else frame_start
     f1 = s.frame_end if frame_end is None else frame_end
-    nf = f1 - f0 + 1
     fps = s.render.fps
+    # Draft (panel button): only the first few seconds, for fast look/quality iteration.
+    if DRAFT_MODE and frame_start is None and frame_end is None:
+        f1 = min(f1, f0 + max(1, int(ANIM_DRAFT_SECONDS * fps)) - 1)
+    nf = f1 - f0 + 1
     W = s.render.resolution_x * MASK_RES_PCT // 100
     H = s.render.resolution_y * MASK_RES_PCT // 100
     adir = os.path.join(_abs(OUT_DIR), ANIM_OUT_SUBDIR)
@@ -2661,8 +2671,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                      "layout": "NSKM u32x4 header + zlib(uv u16x2/65535, src u16, tris u16x3)"},
             "anim": {"file": "anim.bin", "keys": K, "verts": V, "quant": ANIM_QUANT,
                      "keys_fps": fps / ANIM_KEYS_STEP, "predictor": "delta2",
-                     "layout": ("NSKA v2 header (+zmin/zmax) + zlib(int16 xyz: abs, "
-                                "delta, then delta-of-delta); z = camera depth for the "
+                     "z_bits": ANIM_Z_BITS,
+                     "layout": ("NSKA v3 header (magic,u32 ver/V/K,f32 quant/keys_fps/zmin/"
+                                "zmax/zq) + zlib(int16 xyz: abs, delta, then delta-of-delta);"
+                                " x,y = px*quant; z = (camDepth-zmin)/(zmax-zmin)*zq for the "
                                 "GPU depth test (shared scale, smaller = nearer)")},
             "shader_note": ("draw background.webm; draw the player meshes with a depth "
                             "test on the z attribute and color = skin(uv) * light(screen) "
@@ -3195,10 +3207,13 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             box = layout.box()
             box.label(text="Animated (beta)", icon='RENDER_ANIMATION')
             box.operator("render.novaskin_animated", icon='RENDER_ANIMATION').draft = False
-            box.operator("render.novaskin_animated", text="Export Animation Draft",
+            box.operator("render.novaskin_animated",
+                         text=f"Export Animation Draft (~{ANIM_DRAFT_SECONDS}s)",
                          icon='MOD_FLUID').draft = True
             box.label(text=f"frames {context.scene.frame_start}-{context.scene.frame_end}"
                            f" @ {context.scene.render.fps} fps, base layer only")
+            box.label(text=f"(draft renders only the first ~{ANIM_DRAFT_SECONDS}s)",
+                      icon='INFO')
 
         elif tab == 'RIG':
             box = layout.box()
