@@ -5,7 +5,7 @@
 const DIR = 'animated/';
 
 async function bin(url) {
-  const buf = await (await fetch(url)).arrayBuffer();
+  const buf = await (await fetch(url + _cb)).arrayBuffer();
   return buf;
 }
 async function inflate(bytes) {
@@ -14,7 +14,8 @@ async function inflate(bytes) {
   return new Uint8Array(await out.arrayBuffer());
 }
 
-const manifest = await (await fetch(DIR + 'manifest.json')).json();
+const _cb = '?v=' + Date.now();
+const manifest = await (await fetch(DIR + 'manifest.json' + _cb)).json();
 const [W, H] = manifest.resolution;
 // foreground+light crop (top-left px); default = full frame (older exports)
 const crop = manifest.crop || { x: 0, y: 0, w: W, h: H };
@@ -65,14 +66,18 @@ const keys = [];
 async function video(src) {
   // fetch the whole file as a blob: python http.server lacks Range support, which makes
   // a streamed <video> unseekable -- a blob URL is fully buffered and fully seekable
-  const blob = await (await fetch(DIR + src)).blob();
+  const blob = await (await fetch(DIR + src + _cb)).blob();
   const v = document.createElement('video');
   v.src = URL.createObjectURL(blob); v.muted = true; v.loop = true; v.playsInline = true;
   v.preload = 'auto';
   return new Promise((ok) => { v.oncanplaythrough = () => ok(v); v.load(); });
 }
-const [vBg, vFg, vLight] = await Promise.all(
-  [manifest.videos.background, manifest.videos.foreground, manifest.videos.light].map(video));
+const hasMatte = !!manifest.videos.foreground_matte;
+const vidList = [manifest.videos.background, manifest.videos.foreground, manifest.videos.light];
+if (hasMatte) vidList.push(manifest.videos.foreground_matte);
+const loadedVids = await Promise.all(vidList.map(video));
+const [vBg, vFg, vLight] = loadedVids;
+const vMatte = hasMatte ? loadedVids[3] : null;
 // keep the secondary videos locked to the background's clock (3 <video> elements drift)
 setInterval(() => {
   for (const v of [vFg, vLight])
@@ -89,7 +94,7 @@ const skins = await Promise.all(manifest.mesh.players.map(() => loadImage('data/
 const canvas = document.getElementById('gl');
 canvas.width = W; canvas.height = H;
 canvas.style.height = (960 * H / W) + 'px';
-const gl = canvas.getContext('webgl2', { premultipliedAlpha: false });
+const gl = canvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true });
 function sh(t, s) { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o);
   if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(o); return o; }
 function prog(v, f) { const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, v));
@@ -103,6 +108,21 @@ const quadP = prog(
    precision highp float; uniform sampler2D uTex; in vec2 vUv; out vec4 frag;
    void main(){ frag=texture(uTex,vUv); }`);
 const FULLRECT = [-1, -1, 2, 2];
+// foreground = rgb video + grayscale matte video (Safari-safe). With no matte, the rgb
+// texture's own alpha is used (older single-RGBA exports).
+const fgP = prog(
+  `#version 300 es
+   layout(location=0) in vec2 aPos; uniform vec4 uRect; out vec2 vUv;
+   void main(){ vUv=aPos; gl_Position=vec4(uRect.xy + aPos*uRect.zw, 0., 1.); }`,
+  `#version 300 es
+   precision highp float;
+   uniform sampler2D uRgb; uniform sampler2D uMatte; uniform bool uHasMatte;
+   in vec2 vUv; out vec4 frag;
+   void main(){
+     vec4 c=texture(uRgb,vUv);
+     float a=uHasMatte ? texture(uMatte,vUv).r : c.a;
+     frag=vec4(c.rgb, a);
+   }`);
 // crop rect in NDC (bottom-up px -> clip space)
 const cropRectNDC = [cropBL.x/W*2-1, cropBL.y/H*2-1, cropBL.w/W*2, cropBL.h/H*2];
 const meshP = prog(
@@ -139,7 +159,7 @@ function upload(t, srcEl) {
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcEl);
 }
-const tBg = tex(), tFg = tex(), tLight = tex();
+const tBg = tex(), tFg = tex(), tLight = tex(), tMatte = tex();
 const tSkins = skins.map((img) => { const t = tex(true); upload(t, img); return t; });
 
 // swap a player's skin at runtime (file input below, or __dbg.setSkin(i, src))
@@ -201,6 +221,7 @@ function setPositions(time) {
 const ck = (id) => document.getElementById(id).checked;
 function draw() {
   upload(tBg, vBg); upload(tFg, vFg); upload(tLight, vLight);
+  if (vMatte) upload(tMatte, vMatte);
   setPositions(vBg.currentTime);
   gl.viewport(0, 0, W, H);
   gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
@@ -237,10 +258,13 @@ function draw() {
   }
   if (ck('ck_fg')) {
     gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    gl.useProgram(quadP); gl.bindVertexArray(quadVao);
+    gl.useProgram(fgP); gl.bindVertexArray(quadVao);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tFg);
-    gl.uniform1i(gl.getUniformLocation(quadP, 'uTex'), 0);
-    gl.uniform4fv(gl.getUniformLocation(quadP, 'uRect'), cropRectNDC);  // positioned crop
+    gl.uniform1i(gl.getUniformLocation(fgP, 'uRgb'), 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tMatte);
+    gl.uniform1i(gl.getUniformLocation(fgP, 'uMatte'), 1);
+    gl.uniform1i(gl.getUniformLocation(fgP, 'uHasMatte'), vMatte ? 1 : 0);
+    gl.uniform4fv(gl.getUniformLocation(fgP, 'uRect'), cropRectNDC);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.disable(gl.BLEND);
   }
@@ -271,7 +295,7 @@ scrub.oninput = () => {
 };
 // debug handle (pause/seek from the console): __dbg.seek(5.0)
 window.__dbg = {
-  vBg, vFg, vLight, keys, K, keysFps, setSkin,
+  vBg, vFg, vLight, vMatte, hasMatte, keys, K, keysFps, setSkin,
   seek(t) { for (const v of [vBg, vFg, vLight]) { v.pause(); v.currentTime = t; } },
 };
 draw();

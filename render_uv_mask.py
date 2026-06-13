@@ -2397,35 +2397,46 @@ def _anim_write_anim(path, keys, quant, keys_fps):
 
 
 def _anim_encode(adir, fps):
-    """Encode the PNG sequences to WebM/VP9 with ffmpeg (foreground keeps alpha). Returns
-    (ok, message); if ffmpeg is missing, writes encode.sh with the commands instead."""
-    import shutil as _sh, subprocess
+    """Encode the PNG sequences to WebM/VP9 with ffmpeg. The foreground is split into an RGB
+    video + a grayscale MATTE video (its alpha) -- no alpha channel anywhere, so it decodes
+    on Safari too (which lacks VP9-alpha). All streams are plain yuv420p. Returns (ok,
+    message); if ffmpeg is missing, writes encode.sh/.bat with the commands instead."""
+    import shutil as _sh, subprocess, sys
     seq = os.path.join(adir, "seq")
-    jobs = [("bg", "background.webm", ["-pix_fmt", "yuv420p"]),
-            ("fg", "foreground.webm", ["-pix_fmt", "yuva420p", "-auto-alt-ref", "0"]),
-            ("light", "light.webm", ["-pix_fmt", "yuv420p"])]
-    # GUI Blender on macOS doesn't inherit the shell PATH -- look in the usual spots too.
-    ff = _sh.which("ffmpeg") or next(
-        (p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg",
-                     "/usr/bin/ffmpeg") if os.path.exists(p)), None)
-    def cmd(name, out, extra):
+    jobs = [("bg", "background.webm", ["-pix_fmt", "yuv420p"], "bg"),
+            ("fg", "foreground.webm", ["-pix_fmt", "yuv420p"], "fg"),
+            ("fg_matte", "foreground_matte.webm", ["-pix_fmt", "yuv420p"], "fg"),
+            ("light", "light.webm", ["-pix_fmt", "yuv420p"], "light")]
+    # GUI Blender doesn't inherit the shell PATH -- look in the usual per-OS spots too.
+    cands = (["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+             if sys.platform != "win32" else
+             [r"C:\ffmpeg\bin\ffmpeg.exe",
+              os.path.expandvars(r"%ProgramFiles%\ffmpeg\bin\ffmpeg.exe")])
+    ff = _sh.which("ffmpeg") or next((p for p in cands if os.path.exists(p)), None)
+    def cmd(name, out, extra, crf_key):
         return [ff or "ffmpeg", "-y", "-framerate", str(fps),
                 "-i", os.path.join(seq, name, "%04d.png"),
-                "-c:v", "libvpx-vp9", "-crf", str(ANIM_CRF[name]), "-b:v", "0",
+                "-c:v", "libvpx-vp9", "-crf", str(ANIM_CRF[crf_key]), "-b:v", "0",
                 "-row-mt", "1", "-cpu-used", "4", *extra, os.path.join(adir, out)]
     if ff is None:
-        sh = os.path.join(adir, "encode.sh")
-        with open(sh, "w") as f:
-            f.write("#!/bin/sh\n# ffmpeg not found at export time -- run this manually\n")
-            for name, out, extra in jobs:
-                f.write(" ".join(cmd(name, out, extra)) + "\n")
-        os.chmod(sh, 0o755)
-        return False, "ffmpeg not found -- wrote encode.sh"
-    for name, out, extra in jobs:
-        r = subprocess.run(cmd(name, out, extra), capture_output=True, text=True)
+        import shlex
+        win = sys.platform == "win32"
+        script = os.path.join(adir, "encode.bat" if win else "encode.sh")
+        with open(script, "w") as f:
+            f.write("@echo off\n" if win else "#!/bin/sh\n")
+            f.write(("rem " if win else "# ") + "ffmpeg not found -- run this to encode\n")
+            for name, out, extra, ck in jobs:
+                c = cmd(name, out, extra, ck)
+                c[0] = "ffmpeg"
+                f.write((" ".join(c) if win else " ".join(shlex.quote(x) for x in c)) + "\n")
+        if not win:
+            os.chmod(script, 0o755)
+        return False, f"ffmpeg not found -- wrote {os.path.basename(script)}"
+    for name, out, extra, ck in jobs:
+        r = subprocess.run(cmd(name, out, extra, ck), capture_output=True, text=True)
         if r.returncode != 0:
             return False, f"ffmpeg failed on {out}: {r.stderr[-400:]}"
-    return True, "encoded background/foreground/light .webm"
+    return True, "encoded bg / foreground (+ matte) / light .webm"
 
 
 def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
@@ -2441,7 +2452,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     W = s.render.resolution_x * MASK_RES_PCT // 100
     H = s.render.resolution_y * MASK_RES_PCT // 100
     adir = os.path.join(_abs(OUT_DIR), ANIM_OUT_SUBDIR)
-    for k in ("bg", "fg", "light"):
+    for k in ("bg", "fg", "fg_matte", "light"):
         os.makedirs(os.path.join(adir, "seq", k), exist_ok=True)
 
     base_set = set(ANIM_BASE_LABELS)
@@ -2567,15 +2578,23 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             ca = np.clip(C[:, 3], 0.0, 1.0)
             straight = np.where(ca[:, None] > 1e-4,
                                 C[:, :3] / np.maximum(ca[:, None], 1e-4), 0.0)
-            fgb = np.zeros((C.shape[0], 4), 'float32')
             alpha = np.where(D[:, 3] > 0.5, ca, 0.0)
-            fgb[:, 3] = alpha
-            # only keep RGB where it shows (alpha>0) -- zeroing the rest gives the encoder a
-            # flat region instead of the full scenery detail it would otherwise carry.
             vis = alpha > 1e-4
-            fgb[vis, :3] = _to_display(straight[vis])
-            cflat, cW, cH = _crop(fgb.reshape(-1))
-            _save_image(cflat, cW, cH, os.path.join(adir, "seq", "fg", fn))
+            # Foreground split into RGB + a grayscale matte (the alpha) -- two plain videos,
+            # no alpha channel, so it decodes on Safari (no VP9-alpha there). RGB is zeroed
+            # outside the silhouette (flat -> compresses to nothing).
+            fg_rgb = np.zeros((C.shape[0], 4), 'float32'); fg_rgb[:, 3] = 1.0
+            fg_rgb[vis, :3] = _to_display(straight[vis])
+            # dilate the color outward so the matte's soft/compressed edge blends with real
+            # scenery color instead of the zeroed black (which would fringe the silhouette)
+            fg_rgb[:, :3] = _anim_dilate_light(fg_rgb[:, :3], vis, rW, rH)
+            crgb, cW, cH = _crop(fg_rgb.reshape(-1))
+            _save_image(crgb, cW, cH, os.path.join(adir, "seq", "fg", fn))
+            matte = np.ones((C.shape[0], 4), 'float32')
+            matte[:, 0] = matte[:, 1] = matte[:, 2] = alpha
+            cm, _, _ = _crop(matte.reshape(-1))
+            _save_image(cm, cW, cH, os.path.join(adir, "seq", "fg_matte", fn),
+                        colorspace='Non-Color')
             yield prog(f"frame {i+1}/{nf} foreground")
             # 3) LIGHT: base parts gray, scenery camera-invisible (still lighting)
             setup()
@@ -2613,6 +2632,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             "crop": {"x": cx0, "y": H - cy1, "w": cx1 - cx0, "h": cy1 - cy0},
             "videos": {"background": "background.webm",
                        "foreground": "foreground.webm",
+                       "foreground_matte": "foreground_matte.webm",
                        "light": "light.webm"},
             "mesh": {"file": "mesh.bin", "welded": welded, "unique": unique,
                      "tris": ntris, "players": st["players"],

@@ -266,9 +266,21 @@ per-player skin textures, keys lerped, no console errors.
   (z quantized to 16 bits is noisy; a 12-bit z is a pending size tweak).
 - Esc during a batch now asks for confirmation (second Esc within 3 s cancels).
 - Slim variant unsupported (classic forced); overlays/hat excluded by design (base only).
-- Safari: no VP9-alpha — foreground needs an HEVC+alpha or separate-matte fallback.
+- ~~Safari: no VP9-alpha~~ → solved: the foreground is split into an RGB video + a grayscale MATTE video (its alpha). No alpha channel anywhere, all plain yuv420p, so it decodes on Safari. The web player combines rgb + matte (falls back to a single RGBA fg for older exports). Also lets Blender's bundled ffmpeg encode it later (no alpha needed).
 - Panel doesn't expose keys_step / CRFs / keep-sequences yet (CONFIG constants only).
 - Light could be encoded at half resolution (cheap win).
+
+### Encoder & cross-platform (2026-06-12)
+
+- ffmpeg search now covers per-OS install locations (homebrew/usr on Unix, ProgramFiles on
+  Windows) and falls back to writing `encode.sh` (Unix) or `encode.bat` (Windows). The PNG
+  sequences are the resume point if a batch is interrupted (keep them, skip existing).
+- Blender ships its OWN ffmpeg (file_format='FFMPEG', media_type='VIDEO', WEBM + VP9/AV1
+  confirmed in 5.1) -- encoding via the VSE would drop the system dependency AND is
+  cross-platform. PARKED: routing our pre-baked display frames through the sequencer
+  re-applies a color transform (needs a browser-validated config); WebM-alpha is unreliable
+  (the matte removes that blocker). Color config is the remaining work before switching;
+  until then, system ffmpeg + the script fallback.
 
 ### Phase 3 — crop optimization (2026-06-12) ✅ validated
 
