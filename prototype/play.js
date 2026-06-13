@@ -77,12 +77,16 @@ if (hasMatte) vidList.push(manifest.videos.foreground_matte);
 const loadedVids = await Promise.all(vidList.map(video));
 const [vBg, vFg, vLight] = loadedVids;
 const vMatte = hasMatte ? loadedVids[3] : null;
-// keep the secondary videos locked to the background's clock (3 <video> elements drift)
-setInterval(() => {
-  for (const v of [vFg, vLight])
-    if (Math.abs(v.currentTime - vBg.currentTime) > 0.05)
+// Frame-lock the secondary videos to the background's clock every drawn frame (independent
+// <video> elements drift, and start playing at slightly different times). The MATTE must be
+// in step too -- it is the occlusion shape; if it lags, the foreground freezes/misaligns.
+const SYNC_TOL = 1.5 / manifest.fps;   // re-seek if off by more than ~1.5 frames
+function syncVideos() {
+  for (const v of [vFg, vLight, vMatte]) {
+    if (v && Math.abs(v.currentTime - vBg.currentTime) > SYNC_TOL)
       v.currentTime = vBg.currentTime;
-}, 500);
+  }
+}
 // one skin per player (the customizer swaps these individually); default: same skin
 const loadImage = (src) => new Promise((ok, err) => {
   const i = new Image(); i.onload = () => ok(i); i.onerror = err; i.src = src;
@@ -221,6 +225,7 @@ function setPositions(time) {
 
 const ck = (id) => document.getElementById(id).checked;
 function draw() {
+  if (!vBg.paused) syncVideos();          // keep fg/light/matte locked to bg while playing
   upload(tBg, vBg); upload(tFg, vFg); upload(tLight, vLight);
   if (vMatte) upload(tMatte, vMatte);
   setPositions(vBg.currentTime);
@@ -277,7 +282,7 @@ function draw() {
 document.getElementById('stats').textContent =
   `${uniqueN} unique / ${welded} welded verts, ${ntris} tris, ${K} keys @ ${keysFps} fps, ` +
   `${manifest.frames} frames @ ${manifest.fps} fps, ${W}x${H}`;
-const vids = [vBg, vFg, vLight];
+const vids = [vBg, vFg, vLight, ...(vMatte ? [vMatte] : [])];
 const playbtn = document.getElementById('playbtn');
 playbtn.onclick = () => {
   if (vBg.paused) { vids.forEach(v => v.play()); playbtn.textContent = '❚❚'; }
