@@ -292,10 +292,22 @@ well — and it is arguably a better fit there: one frame of positions is ~14 KB
 hundreds of KB of WebP UVs per player), resolution-independent (crisp at 4K from the
 same export), 16-bit UV precision, GPU-AA edges, per-pixel depth via the v2 z, part/
 variant toggles become triangle ranges, back faces come free (disable culling + depth
-test), and masks/bboxes/base_layer composites become unnecessary. The static variant
-would keep: TWO light images (base-only and full — each triangle range samples its
-layer's light, preserving the overlay-lighting semantics), a foreground image for
-scenery occlusion, and background/shadows as today. A single frame can afford a DENSE
+test), and masks/bboxes/base_layer composites become unnecessary. For the light, two screen-space images (base/full) are NOT enough (noted by the user):
+screen-space light bakes the front-most surface per pixel assuming a fixed opacity, but
+the SKIN decides transparency at runtime — when a skin reveals an occluded part (empty
+hat over a painted jacket), that part samples the front part's light. The correct model
+is a **UV-space light atlas** baked into the skin's UV layout (one per player), sampled
+by uv like the skin: `lit = skin(uv) * lightUV(uv) * 2`. Each Minecraft part has its own
+UV island, so each carries its own light and reveals work by construction — no base/full
+split needed. Bake it higher-res than the skin (e.g. 256/512, linear) for a smooth light
+gradient. (The current static export's per-part `<part>_light` images already get this
+right; the 2-image idea was an over-simplification.) The static variant also keeps a
+foreground image for scenery occlusion and background/shadows as today.
+
+Note: the UV-light atlas is a STATIC elegance — for animation the light changes per frame
+(it would be a small UV-space light video). The current base-layer animated mode dodges
+the problem: no overlays, and the base layer is rarely transparent, so there is almost
+nothing to reveal. A single frame can afford a DENSE
 mesh (subsurf 1, ~34k verts ≈ 136 KB) — render-matching silhouettes, no AntiLag
 compromise. Cost: the web tool must render WebGL instead of 2D canvas — which the
 animated integration already requires, so the right order is: integrate animated in
