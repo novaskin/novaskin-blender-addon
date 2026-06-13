@@ -2714,6 +2714,16 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         default='JPEG')
     jpeg_quality: IntProperty(name="Quality", default=90, min=1, max=100,
                               description="JPEG/WebP quality")
+    ui_tab: EnumProperty(
+        name="Section",
+        items=[('EXPORT', "Export", "Output, layers and quality for the static export",
+                'FILE_FOLDER', 0),
+               ('OPTIONAL', "Optional", "Optional toggleable scenery layers",
+                'OUTLINER_OB_MESH', 1),
+               ('ANIM', "Animated", "Animated wallpaper export (beta)",
+                'RENDER_ANIMATION', 2),
+               ('RIG', "Rig", "Rig fixes and detected players", 'ARMATURE_DATA', 3)],
+        default='EXPORT')
 
 
 def _apply_settings(scene, draft=False):
@@ -3081,95 +3091,107 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             row.operator("render.novaskin", text="Render Draft (fast preview)",
                          icon='MOD_FLUID').draft = True
 
-        if WALLPAPER_TOOL_URL:
-            # Web links honor the "Allow Online Access" preference (bpy.app.online_access):
-            # disabled in offline mode, as the extension guidelines require.
-            row = layout.row()
-            row.enabled = bpy.app.online_access
-            row.operator("wm.url_open", text="Open Wallpaper Tool",
-                         icon='URL').url = WALLPAPER_TOOL_URL
-            if not bpy.app.online_access:
-                layout.label(text="(enable Allow Online Access for web links)",
-                             icon='INFO')
+        # No-rig warning stays visible on every tab (the detail + link live in the Rig tab).
+        if not _player_armatures():
+            layout.label(text="No Thomas rig found — see the Rig tab", icon='ERROR')
 
-        box = layout.box()
-        box.label(text="Output", icon='FILE_FOLDER')
-        box.prop(st, "out_dir")
-        if os.path.isdir(_abs(st.out_dir)):
-            box.operator("wm.path_open", text="Open Output Folder",
-                         icon='FOLDER_REDIRECT').filepath = _abs(st.out_dir)
-        box.prop(st, "uv_format")
-        if st.uv_format == 'OPEN_EXR':
+        # Tab row: only the selected section's settings are drawn below (keeps the panel
+        # compact; the render buttons above stay visible on every tab).
+        layout.row().prop(st, "ui_tab", expand=True)
+        tab = st.ui_tab
+
+        if tab == 'EXPORT':
+            box = layout.box()
+            box.label(text="Output", icon='FILE_FOLDER')
+            box.prop(st, "out_dir")
+            if os.path.isdir(_abs(st.out_dir)):
+                box.operator("wm.path_open", text="Open Output Folder",
+                             icon='FOLDER_REDIRECT').filepath = _abs(st.out_dir)
+            box.prop(st, "uv_format")
+            if st.uv_format == 'OPEN_EXR':
+                row = box.row(align=True)
+                row.prop(st, "exr_half", toggle=True)
+                row.prop(st, "exr_codec", text="")
+                box.label(text="+ light layer (when illum on)", icon='LIGHT')
+
+            box = layout.box()
+            box.label(text="Layers", icon='RENDERLAYERS')
+            box.prop(st, "export_backface_uv")
+            box.prop(st, "export_illum")
+            box.prop(st, "export_shadow")
+            box.prop(st, "composite_base_layer")
+            box.prop(st, "export_background")
+
+            box = layout.box()
+            box.label(text="Quality", icon='SETTINGS')
+            box.prop(st, "illum_samples")
             row = box.row(align=True)
-            row.prop(st, "exr_half", toggle=True)
-            row.prop(st, "exr_codec", text="")
-            box.label(text="+ light layer (when illum on)", icon='LIGHT')
+            row.prop(st, "lightshadow_format", text="")
+            if st.lightshadow_format in {'JPEG', 'WEBP'}:
+                row.prop(st, "jpeg_quality", text="Q")
 
-        box = layout.box()
-        box.label(text="Layers", icon='RENDERLAYERS')
-        box.prop(st, "export_backface_uv")
-        box.prop(st, "export_illum")
-        box.prop(st, "export_shadow")
-        box.prop(st, "composite_base_layer")
-        box.prop(st, "export_background")
+            if WALLPAPER_TOOL_URL:
+                # web links honor the "Allow Online Access" preference (extension guideline)
+                row = layout.row()
+                row.enabled = bpy.app.online_access
+                row.operator("wm.url_open", text="Open Wallpaper Tool",
+                             icon='URL').url = WALLPAPER_TOOL_URL
+                if not bpy.app.online_access:
+                    layout.label(text="(enable Allow Online Access for web links)",
+                                 icon='INFO')
 
-        box = layout.box()
-        box.label(text="Quality", icon='SETTINGS')
-        box.prop(st, "illum_samples")
-        row = box.row(align=True)
-        row.prop(st, "lightshadow_format", text="")
-        if st.lightshadow_format in {'JPEG', 'WEBP'}:
-            row.prop(st, "jpeg_quality", text="Q")
+        elif tab == 'OPTIONAL':
+            box = layout.box()
+            box.label(text="Optional Layers", icon='OUTLINER_OB_MESH')
+            box.operator("object.novaskin_layer_toggle", icon='PINNED')
+            if not any(o.type in {'MESH', 'ARMATURE'} for o in context.selected_objects):
+                c = context.collection
+                box.label(text=f"(active collection: {c.name})" if c else "(nothing selected)",
+                          icon='OUTLINER_COLLECTION')
+            groups = discover_layers()
+            if groups:
+                col = box.column(align=True)
+                icons = {"collection": 'OUTLINER_COLLECTION', "armature": 'ARMATURE_DATA',
+                         "mesh": 'LAYER_ACTIVE'}
+                for g in groups:
+                    n = len(g["meshes"])
+                    txt = f"{g['object']}  ({n} mesh)" if n > 1 else g["object"]
+                    row = col.row(align=True)
+                    row.label(text=txt, icon=icons.get(g["kind"], 'LAYER_ACTIVE'))
+                    rm = row.operator("object.novaskin_layer_remove", text="", icon='X',
+                                      emboss=False)
+                    rm.target = g["object"]
+                    rm.is_collection = (g["kind"] == "collection")
+            else:
+                box.label(text="none marked", icon='LAYER_USED')
 
-        box = layout.box()
-        box.label(text="Optional Layers", icon='OUTLINER_OB_MESH')
-        box.operator("object.novaskin_layer_toggle", icon='PINNED')
-        # hint: which source the one button will act on right now
-        if not any(o.type in {'MESH', 'ARMATURE'} for o in context.selected_objects):
-            c = context.collection
-            box.label(text=f"(active collection: {c.name})" if c else "(nothing selected)",
-                      icon='OUTLINER_COLLECTION')
-        groups = discover_layers()
-        if groups:
-            col = box.column(align=True)
-            icons = {"collection": 'OUTLINER_COLLECTION', "armature": 'ARMATURE_DATA',
-                     "mesh": 'LAYER_ACTIVE'}
-            for g in groups:
-                n = len(g["meshes"])
-                txt = f"{g['object']}  ({n} mesh)" if n > 1 else g["object"]
-                row = col.row(align=True)
-                row.label(text=txt, icon=icons.get(g["kind"], 'LAYER_ACTIVE'))
-                rm = row.operator("object.novaskin_layer_remove", text="", icon='X',
-                                  emboss=False)
-                rm.target = g["object"]
-                rm.is_collection = (g["kind"] == "collection")
-        else:
-            box.label(text="none marked", icon='LAYER_USED')
+        elif tab == 'ANIM':
+            box = layout.box()
+            box.label(text="Animated (beta)", icon='RENDER_ANIMATION')
+            box.operator("render.novaskin_animated", icon='RENDER_ANIMATION').draft = False
+            box.operator("render.novaskin_animated", text="Export Animation Draft",
+                         icon='MOD_FLUID').draft = True
+            box.label(text=f"frames {context.scene.frame_start}-{context.scene.frame_end}"
+                           f" @ {context.scene.render.fps} fps, base layer only")
 
-        box = layout.box()
-        box.label(text="Animated (beta)", icon='RENDER_ANIMATION')
-        box.operator("render.novaskin_animated", icon='RENDER_ANIMATION').draft = False
-        box.operator("render.novaskin_animated", text="Export Animation Draft",
-                     icon='MOD_FLUID').draft = True
-        box.label(text=f"frames {context.scene.frame_start}-{context.scene.frame_end}"
-                       f" @ {context.scene.render.fps} fps, base layer only")
-
-        box = layout.box()
-        box.label(text="Rig", icon='ARMATURE_DATA')
-        box.prop(st, "fix_2layer_position")
-        arms = _player_armatures()
-        if arms:
-            box.label(text=f"{len(arms)} player(s) detected:", icon='OUTLINER_OB_ARMATURE')
-            col = box.column(align=True)
-            for a in arms:
-                col.label(text=a.name, icon='DOT')
-        else:
-            box.label(text=f"no '{RIG_ID_VALUE or RIG_ID_PROP}' rig found", icon='ERROR')
-            box.label(text="This exporter needs the Thomas Rig Legacy.")
-            row = box.row()
-            row.enabled = bpy.app.online_access   # honor offline mode (extension guideline)
-            row.operator("wm.url_open", text="Get the rig (extensions.blender.org)",
-                         icon='URL').url = RIG_SOURCE_URL
+        elif tab == 'RIG':
+            box = layout.box()
+            box.label(text="Rig", icon='ARMATURE_DATA')
+            box.prop(st, "fix_2layer_position")
+            arms = _player_armatures()
+            if arms:
+                box.label(text=f"{len(arms)} player(s) detected:",
+                          icon='OUTLINER_OB_ARMATURE')
+                col = box.column(align=True)
+                for a in arms:
+                    col.label(text=a.name, icon='DOT')
+            else:
+                box.label(text=f"no '{RIG_ID_VALUE or RIG_ID_PROP}' rig found", icon='ERROR')
+                box.label(text="This exporter needs the Thomas Rig Legacy.")
+                row = box.row()
+                row.enabled = bpy.app.online_access
+                row.operator("wm.url_open", text="Get the rig (extensions.blender.org)",
+                             icon='URL').url = RIG_SOURCE_URL
 
 
 _classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_animated,
