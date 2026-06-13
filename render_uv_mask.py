@@ -2524,19 +2524,21 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         st = _anim_collect_static(players, W, H)
         yield prog(f"static mesh ({len(st['src'])} welded / {len(st['uniq'])} unique verts)")
 
-        # Pre-pass: capture all mesh keys (cheap, no render) and the crop rect = bbox of
-        # every key's vertex positions + padding (foreground/light only matter there).
+        # Pre-pass: capture the crop rect from EVERY frame's vertex bbox (+ padding) and the
+        # mesh keys (every ANIM_KEYS_STEP frames) for anim.bin. Capturing every frame -- not
+        # just keys -- is cheap (~2 ms/frame) and bounds the real (non-linear) motion between
+        # keys, so a non-key silhouette can't extend past the crop and get clipped.
         keys = []
         pmin = np.array([W, H], 'float64')
         pmax = np.array([0.0, 0.0], 'float64')
         for i, f in enumerate(range(f0, f1 + 1)):
+            s.frame_set(f)
+            setup()
+            p = _anim_frame_positions(st, W, H)
+            pmin = np.minimum(pmin, p[:, :2].min(0))
+            pmax = np.maximum(pmax, p[:, :2].max(0))
             if i % ANIM_KEYS_STEP == 0 or f == f1:
-                s.frame_set(f)
-                setup()
-                p = _anim_frame_positions(st, W, H)
                 keys.append(p)
-                pmin = np.minimum(pmin, p[:, :2].min(0))
-                pmax = np.maximum(pmax, p[:, :2].max(0))
         if ANIM_CROP_PAD > 0:
             cx0 = max(0, int(np.floor(pmin[0] - ANIM_CROP_PAD)))
             cy0 = max(0, int(np.floor(pmin[1] - ANIM_CROP_PAD)))
@@ -2641,7 +2643,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), keys,
                                 ANIM_QUANT, fps / ANIM_KEYS_STEP)
         manifest = {
-            "animated_version": 1,
+            "animated_version": 2,   # 2: NSKA v2 depth, cropped fg/light, foreground matte
             "addon_version": ADDON_VERSION,
             "fps": fps,
             "frames": nf,
@@ -2673,6 +2675,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         if ANIM_ENCODE:
             ok, msg = _anim_encode(adir, fps)
             print("[ANIM] encode:", msg)
+            if op is not None and not ok:
+                # encode failed/skipped -> the PNG sequences are kept; surface it instead of
+                # reporting a clean success with no videos.
+                op.report({'WARNING'}, f"NovaSkin animated: {msg}")
             if ok and not ANIM_KEEP_SEQUENCES:
                 import shutil as _sh
                 _sh.rmtree(os.path.join(adir, "seq"), ignore_errors=True)
