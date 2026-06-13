@@ -309,6 +309,12 @@ ANIM_BASE_LABELS = ["head", "body", "arm_left_classic", "arm_right_classic",
 # background), but mesh edges can sample 1-3 px outside the rendered silhouette (12fps key
 # lerp vs 24fps video + VP9 edge blur) -- padding prevents black fringes. 0 disables.
 ANIM_LIGHT_PAD = 8
+# Crop the foreground + light videos to the players' screen region (union over all frames +
+# this padding). Both only have content where the players are, so the rest of the frame is
+# wasted bytes (foreground is mostly transparent yet nearly as big as the background). The
+# background is NOT cropped (it is the whole wallpaper). The manifest records the crop rect;
+# the web player positions the foreground quad and offsets the light sampling. 0 disables.
+ANIM_CROP_PAD = 24
 
 # Web wallpaper tool (the panel has a button that opens this URL in the browser).
 WALLPAPER_TOOL_URL = "https://minecraft.novaskin.me/wallpapers/tools/blender/"
@@ -2495,15 +2501,40 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         st = _anim_collect_static(players, W, H)
         yield prog(f"static mesh ({len(st['src'])} welded / {len(st['uniq'])} unique verts)")
 
-        keys, key_frames = [], []
+        # Pre-pass: capture all mesh keys (cheap, no render) and the crop rect = bbox of
+        # every key's vertex positions + padding (foreground/light only matter there).
+        keys = []
+        pmin = np.array([W, H], 'float64')
+        pmax = np.array([0.0, 0.0], 'float64')
+        for i, f in enumerate(range(f0, f1 + 1)):
+            if i % ANIM_KEYS_STEP == 0 or f == f1:
+                s.frame_set(f)
+                setup()
+                p = _anim_frame_positions(st, W, H)
+                keys.append(p)
+                pmin = np.minimum(pmin, p[:, :2].min(0))
+                pmax = np.maximum(pmax, p[:, :2].max(0))
+        if ANIM_CROP_PAD > 0:
+            cx0 = max(0, int(np.floor(pmin[0] - ANIM_CROP_PAD)))
+            cy0 = max(0, int(np.floor(pmin[1] - ANIM_CROP_PAD)))
+            cx1 = min(W, int(np.ceil(pmax[0] + ANIM_CROP_PAD)))
+            cy1 = min(H, int(np.ceil(pmax[1] + ANIM_CROP_PAD)))
+            cx1 -= (cx1 - cx0) % 2      # even dims for yuv420p
+            cy1 -= (cy1 - cy0) % 2
+        else:
+            cx0, cy0, cx1, cy1 = 0, 0, W, H
+
+        def _crop(flat):
+            """Crop a flat RGBA (full WxH, bottom-up) to the player rect -> (flat, w, h)."""
+            sub = flat.reshape(H, W, 4)[cy0:cy1, cx0:cx1, :]
+            return np.ascontiguousarray(sub).reshape(-1), cx1 - cx0, cy1 - cy0
+
+        print(f"[ANIM] crop rect (bottom-up px): x{cx0}-{cx1} y{cy0}-{cy1} "
+              f"= {cx1-cx0}x{cy1-cy0} ({100*(cx1-cx0)*(cy1-cy0)/(W*H):.0f}% of frame)")
         gray = _gray_diffuse_material()
         scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in char_names]
         for i, f in enumerate(range(f0, f1 + 1)):
             s.frame_set(f)
-            if i % ANIM_KEYS_STEP == 0 or f == f1:
-                setup()
-                keys.append(_anim_frame_positions(st, W, H))
-                key_frames.append(i)
             fn = f"{i+1:04d}.png"
             # 1) BACKGROUND: players camera-invisible (still casting -> shadows baked in)
             setup()
@@ -2537,9 +2568,14 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             straight = np.where(ca[:, None] > 1e-4,
                                 C[:, :3] / np.maximum(ca[:, None], 1e-4), 0.0)
             fgb = np.zeros((C.shape[0], 4), 'float32')
-            fgb[:, :3] = _to_display(straight)
-            fgb[:, 3] = np.where(D[:, 3] > 0.5, ca, 0.0)
-            _save_image(fgb.reshape(-1), rW, rH, os.path.join(adir, "seq", "fg", fn))
+            alpha = np.where(D[:, 3] > 0.5, ca, 0.0)
+            fgb[:, 3] = alpha
+            # only keep RGB where it shows (alpha>0) -- zeroing the rest gives the encoder a
+            # flat region instead of the full scenery detail it would otherwise carry.
+            vis = alpha > 1e-4
+            fgb[vis, :3] = _to_display(straight[vis])
+            cflat, cW, cH = _crop(fgb.reshape(-1))
+            _save_image(cflat, cW, cH, os.path.join(adir, "seq", "fg", fn))
             yield prog(f"frame {i+1}/{nf} foreground")
             # 3) LIGHT: base parts gray, scenery camera-invisible (still lighting)
             setup()
@@ -2558,7 +2594,8 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             lst = _anim_dilate_light(lst, la > 0.01, rW, rH)
             lbuf = np.ones((L.shape[0], 4), 'float32')
             lbuf[:, :3] = _lin_to_srgb(lst)
-            _save_image(lbuf.reshape(-1), rW, rH, os.path.join(adir, "seq", "light", fn))
+            cflat, cW, cH = _crop(lbuf.reshape(-1))
+            _save_image(cflat, cW, cH, os.path.join(adir, "seq", "light", fn))
             yield prog(f"frame {i+1}/{nf} light")
 
         welded, unique, ntris = _anim_write_mesh(os.path.join(adir, "mesh.bin"), st)
@@ -2570,6 +2607,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             "fps": fps,
             "frames": nf,
             "resolution": [W, H],
+            # crop rect for the foreground+light videos, in TOP-LEFT pixels (background is
+            # full-frame). The fg quad covers this rect; light is sampled at
+            # (fragScreenTopLeft - crop.xy) / crop.wh.
+            "crop": {"x": cx0, "y": H - cy1, "w": cx1 - cx0, "h": cy1 - cy0},
             "videos": {"background": "background.webm",
                        "foreground": "foreground.webm",
                        "light": "light.webm"},

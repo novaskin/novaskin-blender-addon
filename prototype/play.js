@@ -16,6 +16,9 @@ async function inflate(bytes) {
 
 const manifest = await (await fetch(DIR + 'manifest.json')).json();
 const [W, H] = manifest.resolution;
+// foreground+light crop (top-left px); default = full frame (older exports)
+const crop = manifest.crop || { x: 0, y: 0, w: W, h: H };
+const cropBL = { x: crop.x, y: H - crop.y - crop.h, w: crop.w, h: crop.h };  // bottom-up
 
 // --- mesh.bin: NSKM | u32 version, welded, unique, ntris | zlib(uv u16x2, src u16, tris u16x3)
 const mb = await bin(DIR + manifest.mesh.file);
@@ -94,11 +97,14 @@ function prog(v, f) { const p = gl.createProgram(); gl.attachShader(p, sh(gl.VER
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw gl.getProgramInfoLog(p); return p; }
 const quadP = prog(
   `#version 300 es
-   layout(location=0) in vec2 aPos; out vec2 vUv;
-   void main(){ vUv=aPos; gl_Position=vec4(aPos*2.-1.,0.,1.); }`,
+   layout(location=0) in vec2 aPos; uniform vec4 uRect; out vec2 vUv;
+   void main(){ vUv=aPos; gl_Position=vec4(uRect.xy + aPos*uRect.zw, 0., 1.); }`,
   `#version 300 es
    precision highp float; uniform sampler2D uTex; in vec2 vUv; out vec4 frag;
    void main(){ frag=texture(uTex,vUv); }`);
+const FULLRECT = [-1, -1, 2, 2];
+// crop rect in NDC (bottom-up px -> clip space)
+const cropRectNDC = [cropBL.x/W*2-1, cropBL.y/H*2-1, cropBL.w/W*2, cropBL.h/H*2];
 const meshP = prog(
   `#version 300 es
    layout(location=0) in vec3 aPx; layout(location=1) in vec2 aUv;
@@ -108,12 +114,14 @@ const meshP = prog(
   `#version 300 es
    precision highp float;
    uniform sampler2D uSkin; uniform sampler2D uLight; uniform vec2 uRes;
+   uniform vec2 uLightOrigin; uniform vec2 uLightSize;
    uniform bool uUseLight;
    in vec2 vUv; out vec4 frag;
    void main(){
      vec4 s=texture(uSkin,vUv);
      if(s.a<0.5) discard;
-     vec3 l=uUseLight ? texture(uLight,gl_FragCoord.xy/uRes).rgb*2.0 : vec3(1.0);
+     vec2 luv=(gl_FragCoord.xy - uLightOrigin)/uLightSize;
+     vec3 l=uUseLight ? texture(uLight,luv).rgb*2.0 : vec3(1.0);
      frag=vec4(s.rgb*l,1.0);
    }`);
 function tex(nearest) {
@@ -202,6 +210,7 @@ function draw() {
     gl.useProgram(quadP); gl.bindVertexArray(quadVao);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tBg);
     gl.uniform1i(gl.getUniformLocation(quadP, 'uTex'), 0);
+    gl.uniform4fv(gl.getUniformLocation(quadP, 'uRect'), FULLRECT);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
   if (ck('ck_pl')) {
@@ -211,6 +220,8 @@ function draw() {
     gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), ck('ck_li') ? 1 : 0);
     gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLight);
     gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
+    gl.uniform2f(gl.getUniformLocation(meshP, 'uLightOrigin'), cropBL.x, cropBL.y);
+    gl.uniform2f(gl.getUniformLocation(meshP, 'uLightSize'), cropBL.w, cropBL.h);
     gl.activeTexture(gl.TEXTURE0);
     if (CH === 3) {         // v2: per-vertex camera depth -> correct self-occlusion
       gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
@@ -228,6 +239,8 @@ function draw() {
     gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(quadP); gl.bindVertexArray(quadVao);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tFg);
+    gl.uniform1i(gl.getUniformLocation(quadP, 'uTex'), 0);
+    gl.uniform4fv(gl.getUniformLocation(quadP, 'uRect'), cropRectNDC);  // positioned crop
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     gl.disable(gl.BLEND);
   }
