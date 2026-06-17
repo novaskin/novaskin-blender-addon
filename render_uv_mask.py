@@ -325,6 +325,52 @@ ANIM_LIGHT_PAD = 8
 # the web player positions the foreground quad and offsets the light sampling. 0 disables.
 ANIM_CROP_PAD = 24
 
+# ---- Static export v2 (mesh K=1 + UV light atlas) -------------------------------------
+# A per-player light atlas in the skin's UV layout: each texel stores the scene lighting on a
+# 0.5-gray Lambertian body, so the browser relights any skin per-pixel with
+# `lit = skin(uv) * atlas(uv) * 2`. Replaces the screen-space per-part `_light` images with one
+# UV-space texture per player. Baked in a single Cycles pass (Option B): overlay parts are made
+# non-occluding via ray visibility so the base regions are lit overlay-free (a skin that leaves
+# an overlay empty samples the base's own light, not a phantom shadow under it). See
+# docs/static-mesh-plan.md. The atlas stores display-encoded light (`_to_display`), saved with
+# the panel Quality "Illum/Shadow" format/quality -- same model as the screen-space `_light`.
+ATLAS_RES = 512            # atlas resolution (square); higher than the 64px skin for a smooth
+                           # light gradient (skin samples nearest, atlas linear). Up to 1024.
+ATLAS_BAKE_SAMPLES = None   # Cycles samples for the bake (denoised). None = follow the panel
+                            # "Illum samples" (ILLUM_SAMPLES, live); set a fixed int to override.
+ATLAS_BAKE_MARGIN = 8      # UV island edge bleed (px), avoids seams at island borders
+ATLAS_OVERLAY_LABELS = ("hat", "jacket", "sleeve", "pant")   # 2nd-layer parts -> non-occluding
+# The rig models each skin pixel as its own quad and SMOOTH-shades it (an "Auto Smooth" geometry-
+# nodes modifier) over a pose-curved, subdivided surface -- so a sharp bake captures a per-skin-
+# pixel lighting LATTICE (a pillowed grid). The light should be low-frequency (the per-pixel detail
+# belongs to the skin albedo), with clean, crisp separation between a part's faces. Fix at the
+# SOURCE: bake FLAT-shaded on the un-subdivided cage (Auto Smooth + Subdivision off) -> each face
+# is lit per its own orientation, uniform within and sharply separated at face edges. (The geometry
+# stream still uses the dense mesh; only the light bake is flattened, and the atlas is UV-sampled.)
+ATLAS_BAKE_FLAT = True     # disable Auto-Smooth + Subdivision during the bake (clean per-face light)
+# Optional residual low-pass (atlas px; 8 px = 1 skin texel at 512/64). 0 = off -- flat shading
+# removes the lattice without it; raise only to soften faceting on strongly pose-curved parts.
+ATLAS_BLUR_RADIUS = 0
+ATLAS_BLUR_PASSES = 2      # box passes (2-3 ~ Gaussian)
+STATIC_OUT_SUBDIR = "static"   # self-contained static-v2 export dir (alongside the legacy one)
+# Static background + foreground images. The foreground is ALWAYS WebP because it needs a real
+# alpha channel (the scenery in front of the players over transparency); the matte split is a
+# VIDEO-only workaround (no in-browser video codec carries alpha on Safari) -- a still image
+# carries alpha natively, so static needs no matte. The background is opaque (full wallpaper).
+STATIC_BG_FORMAT = 'WEBP'      # 'WEBP', 'JPEG' or 'PNG' (opaque background)
+STATIC_BG_QUALITY = 90         # 0..100 (JPEG/WebP)
+STATIC_BG_EXT = {'JPEG': '.jpg', 'WEBP': '.webp'}.get(STATIC_BG_FORMAT, '.png')
+# Foreground alpha contract: STRAIGHT alpha, composited with rgb multiplied by alpha at sample
+# time -- out = fg.rgb*fg.a + behind*(1 - fg.a). That makes the soft anti-aliased silhouette edge
+# blend correctly with the player underneath (no straight/premult mismatch fringe -- the original
+# bug was a premult-style `fg.rgb + behind*(1-a)` over straight data). We do NOT pre-premultiply
+# into the file: WebP discards the rgb of fully transparent texels (fills them white), which would
+# blow out a premult composite; multiplying by alpha at runtime makes that garbage harmless (x0).
+# Lossless keeps the alpha edge crisp (lossy WebP blurs/widens it); the fg is ~99% transparent so
+# lossless is still tiny.
+STATIC_FG_LOSSLESS = True      # lossless WebP -> crisp alpha edge (recommended)
+STATIC_FG_QUALITY = 90         # used only when STATIC_FG_LOSSLESS is False
+
 # Web wallpaper tool (the panel has a button that opens this URL in the browser).
 WALLPAPER_TOOL_URL = "https://minecraft.novaskin.me/wallpapers/tools/blender/"
 # The rig this exporter targets. Blender extensions can't declare another extension as a
@@ -660,7 +706,15 @@ def discover_layers():
     A mesh already claimed by a marked collection/armature is not also emitted on its own.
     Returns a list of {name, object, kind, meshes:[...]} sorted by name."""
     scene = bpy.context.scene
-    scene_meshes = {o.name for o in scene.objects if o.type == 'MESH'}
+    # single pass over scene.objects: the mesh-name set + the marked armatures/meshes at once
+    scene_meshes, marked_arms, marked_meshes = set(), [], []
+    for o in scene.objects:
+        if o.type == 'MESH':
+            scene_meshes.add(o.name)
+            if LAYER_ID_PROP in o.keys():
+                marked_meshes.append(o)
+        elif o.type == 'ARMATURE' and LAYER_ID_PROP in o.keys():
+            marked_arms.append(o)
     groups, claimed = [], set()
 
     def _add(name, source_name, kind, meshes):
@@ -670,16 +724,15 @@ def discover_layers():
                            "kind": kind, "meshes": meshes})
             claimed.update(m.name for m in meshes)
 
+    # order matters: collections claim their meshes first, then armatures, then standalone meshes
     for coll in bpy.data.collections:               # 1) marked collections
         if LAYER_ID_PROP in coll.keys():
             _add(coll.name, coll.name, "collection",
                  [o for o in coll.all_objects if o.type == 'MESH'])
-    for o in scene.objects:                          # 2) marked armatures (whole rig)
-        if o.type == 'ARMATURE' and LAYER_ID_PROP in o.keys():
-            _add(o.name, o.name, "armature", _rig_meshes(o))
-    for o in scene.objects:                          # 3) standalone marked meshes
-        if o.type == 'MESH' and LAYER_ID_PROP in o.keys():
-            _add(o.name, o.name, "mesh", [o])
+    for o in marked_arms:                            # 2) marked armatures (whole rig)
+        _add(o.name, o.name, "armature", _rig_meshes(o))
+    for o in marked_meshes:                          # 3) standalone marked meshes
+        _add(o.name, o.name, "mesh", [o])
 
     groups.sort(key=lambda g: g["name"])
     return groups
@@ -1330,6 +1383,201 @@ def _gray_diffuse_material():
     dif.inputs['Color'].default_value = ILLUM_GRAY_RGBA
     nt.links.new(dif.outputs['BSDF'], out.inputs['Surface'])
     return m
+
+
+def _box_blur_2d(x, r):
+    """Separable box blur (radius r px) over the first two axes, edge-clamped. x: (H, W) or
+    (H, W, C). Cumulative-sum implementation -- O(n) regardless of radius."""
+    if r <= 0:
+        return x
+    x = np.asarray(x, 'float32')
+    k = 2 * r + 1
+    for ax in (0, 1):
+        n = x.shape[ax]
+        pad = [(0, 0)] * x.ndim
+        pad[ax] = (r, r)
+        xp = np.pad(x, pad, mode='edge')
+        z = list(xp.shape); z[ax] = 1
+        c = np.concatenate([np.zeros(z, 'float32'), np.cumsum(xp, axis=ax, dtype='float32')],
+                           axis=ax)
+        hi = np.take(c, np.arange(k, n + k), axis=ax)
+        lo = np.take(c, np.arange(0, n), axis=ax)
+        x = (hi - lo) / k
+    return x
+
+
+def _masked_blur(rgb, mask, r, passes):
+    """Blur `rgb` (H, W, 3) within `mask` (H, W, 0/1) without bleeding the zeroed background in:
+    blur(rgb*mask)/blur(mask). Smooths the per-pixel lighting lattice while keeping the light's
+    low-frequency gradient; the un-covered texels are left untouched by the caller."""
+    if r <= 0 or passes <= 0:
+        return rgb
+    num = rgb * mask[:, :, None]
+    den = mask.copy()
+    for _ in range(passes):
+        num = _box_blur_2d(num, r)
+        den = _box_blur_2d(den, r)
+    return num / np.maximum(den, 1e-4)[:, :, None]
+
+
+def _atlas_bake_material(img):
+    """Gray-0.5 diffuse with an Image Texture node = `img`, set active so it is the bake
+    target. Same lighting response as `_gray_diffuse_material`, plus the destination image."""
+    name = "__ATLAS_BAKE__"
+    m = bpy.data.materials.get(name) or bpy.data.materials.new(name)
+    m.use_nodes = True
+    nt = m.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new('ShaderNodeOutputMaterial')
+    dif = nt.nodes.new('ShaderNodeBsdfDiffuse')
+    dif.inputs['Color'].default_value = ILLUM_GRAY_RGBA
+    tex = nt.nodes.new('ShaderNodeTexImage')
+    tex.image = img
+    nt.links.new(dif.outputs['BSDF'], out.inputs['Surface'])
+    nt.nodes.active = tex            # bake writes to the active image node
+    return m
+
+
+def _bake_player_light_atlas(player, atlas_res=None, samples=None, out_dir=None, stem=None):
+    """Bake a player's scene lighting into a UV-space light atlas (skin layout) and save it. By
+    default goes to `<OUT_DIR>/<player>/light_atlas.<ext>`; pass `out_dir` (absolute) + `stem` to
+    place it elsewhere (e.g. the self-contained `static/<label>_atlas.<ext>`). Returns the
+    OUT_DIR-relative path. ONE Cycles COMBINED pass: every part wears the gray-0.5 diffuse
+    bake material (shared Image Texture node), and the overlay parts (hat/jacket/sleeve/pant)
+    are made NON-OCCLUDING via ray visibility (Option B) so the base UV regions are lit
+    overlay-free -- a skin that leaves an overlay empty then samples the base's own light, not a
+    phantom shadow under it. The saved atlas is display-encoded (`_to_display`) and written with
+    the panel Quality "Illum/Shadow" format -- the same model as the screen-space `_light`, so
+    the browser relights with `lit = skin(uv) * atlas(uv) * 2`.
+
+    The bake integrates the CURRENT scene (lights + scenery shadows/bounce), so the caller must
+    put the scene in its normal look first (e.g. `sess.restore_visibility()`); other players keep
+    their own materials and correctly cast shadows. Returns the OUT_DIR-relative path, or None if
+    the player has no parts. Self-contained: restores materials, ray visibility, engine, samples,
+    bake margin and selection. Runs entirely in one call (reads `img.pixels` in-memory and saves
+    via `_save_image`/`save_render` -- never `img.save()`, which would zero the baked buffer)."""
+    atlas_res = atlas_res or ATLAS_RES
+    samples = samples or ATLAS_BAKE_SAMPLES or ILLUM_SAMPLES   # follow the panel quality (live)
+    # Only the parts actually rendered for this player (visible): the unused arm style (slim vs
+    # classic) and per-player 2nd-layer toggles are driven hide_render=True. Baking the hidden
+    # duplicates would contaminate shared UV islands (e.g. the hidden slim arm, parked far away
+    # with different lighting, overlaps the classic arm's UV region). Matches the mesh selection.
+    parts = [o for o in (player.get("uv_parts") or []) if not o.hide_render]
+    if not parts:
+        return None
+    scene = bpy.context.scene
+    labels = _assign_part_labels(parts, player.get("label"))
+    overlays = [o for o in parts
+                if any(k in labels[o.name].lower() for k in ATLAS_OVERLAY_LABELS)]
+
+    # ---- snapshot state to restore in finally ----
+    saved_mats = {o.name: [s.material for s in o.material_slots] for o in parts}
+    saved_slots = {o.name: len(o.material_slots) for o in parts}
+    saved_vis = {o.name: (o.visible_diffuse, o.visible_shadow, o.visible_glossy)
+                 for o in overlays}
+    saved_eng = scene.render.engine
+    cyc = getattr(scene, 'cycles', None)
+    saved_samp = getattr(cyc, 'samples', None) if cyc else None
+    saved_den = getattr(cyc, 'use_denoising', None) if cyc else None
+    saved_margin = scene.render.bake.margin
+    saved_active = bpy.context.view_layer.objects.active
+    saved_sel = list(bpy.context.selected_objects)
+    # Flat-shade the bake: disable the per-pixel "Auto Smooth" (geometry nodes) + Subdivision so
+    # each face is lit per its own orientation (uniform within, sharp at face edges) instead of a
+    # smooth-shaded per-pixel lattice. Snapshot show_render to restore.
+    flat_mods = []
+    if ATLAS_BAKE_FLAT:
+        for o in parts:
+            for m in o.modifiers:
+                if m.type == 'SUBSURF' or (m.type == 'NODES' and 'smooth' in m.name.lower()):
+                    flat_mods.append((m, m.show_render))
+
+    name = "__ATLAS_IMG__"
+    if bpy.data.images.get(name):
+        bpy.data.images.remove(bpy.data.images[name])
+    img = bpy.data.images.new(name, atlas_res, atlas_res, alpha=True, float_buffer=True)
+    mat = _atlas_bake_material(img)
+    try:
+        for o in parts:
+            if len(o.material_slots) == 0:        # bake target needs a material slot
+                o.data.materials.append(None)
+            for i in range(len(o.material_slots)):
+                o.material_slots[i].material = mat
+        for o in overlays:                        # Option B: overlays don't occlude the base
+            o.visible_diffuse = False
+            o.visible_shadow = False
+            o.visible_glossy = False
+        for m, _ in flat_mods:                    # flat-shaded, un-subdivided cage for the bake
+            m.show_render = False
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in parts:
+            o.select_set(True)
+        bpy.context.view_layer.objects.active = parts[0]
+        parts[0].active_material_index = 0
+        scene.render.engine = 'CYCLES'
+        if cyc:
+            scene.cycles.samples = samples
+            scene.cycles.use_denoising = True
+        scene.render.bake.margin = ATLAS_BAKE_MARGIN
+        bpy.context.view_layer.update()
+        print(f"[ATLAS] baking '{player.get('label')}' -> {atlas_res}x{atlas_res}, {samples} spp"
+              f" ({len(parts)} parts, {len(overlays)} non-occluding overlays)")
+        bpy.ops.object.bake(type='COMBINED', use_clear=True)
+
+        # read the baked LINEAR light in-memory
+        flat = np.empty(atlas_res * atlas_res * 4, dtype='float32')
+        img.pixels.foreach_get(flat)
+        grid = flat.reshape(atlas_res, atlas_res, 4)
+        # Low-pass the light (masked, within coverage) to kill the per-pixel relief lattice that
+        # a sharp bake captures -- the light is low-frequency; the per-pixel detail is the skin's.
+        if ATLAS_BLUR_RADIUS > 0:
+            rgb = grid[:, :, :3]
+            mask = (rgb.sum(2) > 1e-4).astype('float32')   # covered + margin bleed
+            grid[:, :, :3] = _masked_blur(rgb, mask, ATLAS_BLUR_RADIUS, ATLAS_BLUR_PASSES) \
+                * mask[:, :, None]
+        rgba = grid.reshape(-1, 4)
+        rgba[:, :3] = _to_display(rgba[:, :3])    # display-encode (same as the _light maps)
+        rgba[:, 3] = 1.0                          # opaque light texture (JPEG has no alpha)
+
+        label = player.get("label") or player.get("armature") or "player"
+        fname = (stem or "light_atlas") + LIGHTSHADOW_EXT
+        adir = out_dir or os.path.join(_abs(OUT_DIR), label)
+        path = os.path.join(adir, fname)
+        os.makedirs(adir, exist_ok=True)
+        _save_image(rgba.reshape(-1), atlas_res, atlas_res, path,
+                    colorspace='Non-Color', file_format=LIGHTSHADOW_FORMAT)
+        rel = os.path.relpath(path, _abs(OUT_DIR)).replace("\\", "/")
+        print(f"[ATLAS] saved {rel}")
+        return rel
+    finally:
+        for o in parts:
+            for i, mm in enumerate(saved_mats[o.name]):
+                if i < len(o.material_slots):
+                    o.material_slots[i].material = mm
+            while len(o.material_slots) > saved_slots[o.name]:   # drop any slot we added
+                o.data.materials.pop()
+        for o in overlays:
+            d, sh, g = saved_vis[o.name]
+            o.visible_diffuse, o.visible_shadow, o.visible_glossy = d, sh, g
+        for m, sr in flat_mods:
+            m.show_render = sr
+        scene.render.engine = saved_eng
+        if saved_samp is not None:
+            scene.cycles.samples = saved_samp
+        if saved_den is not None:
+            scene.cycles.use_denoising = saved_den
+        scene.render.bake.margin = saved_margin
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in saved_sel:
+            try:
+                o.select_set(True)
+            except RuntimeError:
+                pass
+        if saved_active is not None:
+            bpy.context.view_layer.objects.active = saved_active
+        if bpy.data.images.get(name):
+            bpy.data.images.remove(bpy.data.images[name])
+        bpy.context.view_layer.update()
 
 
 def _render_illum_background(players, sess, slim_value, vname):
@@ -2415,6 +2663,336 @@ def _anim_write_anim(path, keys, quant, keys_fps):
     return K, V
 
 
+def _static_collect(players, W, H):
+    """Like `_anim_collect_static`, but for the static export: includes BOTH the base parts AND
+    the overlays (2nd layer) -- the base first, then the overlays per player, in painter's order
+    -- so the browser renders the overlay as a shell over the base and samples its own atlas UV
+    region (the whole point of the Option B atlas). Players are back-to-front. Records, per
+    player: welded_range, tri_range, and `overlay_tri_start` (the tri index where the overlay
+    shell begins) so the renderer can draw base then overlay (depth-tested) and alpha-discard the
+    overlay's transparent texels. Returns the dict used by `_anim_frame_positions`/
+    `_anim_write_mesh`."""
+    dg = bpy.context.evaluated_depsgraph_get()
+    ordered = sorted(players, key=lambda p: _player_camera_depth(p) or 0.0, reverse=True)
+    st = {"parts": [], "uv": [], "src": [], "tris": [], "players": [], "uniq": []}
+    weld, uniq_keys = {}, {}
+
+    def add_part(o):
+        pi = len(st["parts"]); st["parts"].append(o.name)
+        ev = o.evaluated_get(dg); me = ev.to_mesh(); me.calc_loop_triangles()
+        uvl = me.uv_layers.active.data
+        for lt in me.loop_triangles:
+            for li, vi in zip(lt.loops, lt.vertices):
+                u, v = uvl[li].uv
+                k = (pi, vi, round(u * 4096), round(v * 4096))
+                j = weld.get(k)
+                if j is None:
+                    j = len(st["src"]); weld[k] = j
+                    uk = (pi, vi)
+                    ui = uniq_keys.get(uk)
+                    if ui is None:
+                        ui = len(st["uniq"]); uniq_keys[uk] = ui
+                        st["uniq"].append(uk)
+                    st["uv"] += [min(max(u, 0.0), 1.0), min(max(v, 0.0), 1.0)]
+                    st["src"].append(ui)
+                st["tris"].append(j)
+        ev.to_mesh_clear()
+
+    for p in ordered:
+        labs = p.get("uv_labels") or _assign_part_labels(p["uv_parts"], label=p["label"])
+        # Select the geometry actually rendered for THIS player: hidden parts (the unused arm
+        # style -- slim vs classic -- and per-player 2nd-layer toggles) are driven hide_render=
+        # True, so filtering by visibility picks the right arm variant and the overlays the
+        # player uses, without the basic-look duplicates discover_players carries for the UV
+        # export. Base = visible non-overlay (head/body/legs + the visible arm style); overlay =
+        # visible 2nd-layer (hat/jacket/sleeve/pant).
+        vis = [o for o in p["uv_parts"] if not o.hide_render]
+        def _is_ov(o, _labs=labs):
+            return any(k in (_labs.get(o.name) or "").lower() for k in ATLAS_OVERLAY_LABELS)
+        base = sorted([o for o in vis if not _is_ov(o)], key=lambda o: o.name)
+        ov = sorted([o for o in vis if _is_ov(o)], key=lambda o: o.name)
+        w0, t0 = len(st["src"]), len(st["tris"]) // 3
+        for o in base:
+            add_part(o)
+        ov_t0 = len(st["tris"]) // 3
+        for o in ov:
+            add_part(o)
+        st["players"].append({"label": p["label"],
+                              "welded_range": [w0, len(st["src"])],
+                              "tri_range": [t0, len(st["tris"]) // 3],
+                              "overlay_tri_start": ov_t0,
+                              "n_base_parts": len(base), "n_overlay_parts": len(ov),
+                              "camera_depth": round(_player_camera_depth(p) or 0.0, 3)})
+    gather = {}
+    for ui, (pi, vi) in enumerate(st["uniq"]):
+        gather.setdefault(pi, ([], []))
+        gather[pi][0].append(vi); gather[pi][1].append(ui)
+    st["gather"] = {pi: (np.asarray(v, np.int64), np.asarray(u, np.int64))
+                    for pi, (v, u) in gather.items()}
+    return st
+
+
+def _static_write_mesh(path, st):
+    """static mesh.bin: 'NSKM' **v2** -- u32 `src` + u32 `tris` (the DENSE mesh exceeds the u16
+    the animated NSKM v1 uses); `uv` stays u16 (0..65535). Header `<4sIIII>` = magic, ver=2,
+    welded, unique, ntris; payload = zlib(uv u16x2/65535, src u32, tris u32x3). Browser-side:
+    DecompressionStream('deflate'), then read indices as Uint32 (v2) vs Uint16 (v1)."""
+    import struct, zlib
+    welded, unique, ntris = len(st["src"]), len(st["uniq"]), len(st["tris"]) // 3
+    uv = np.round(np.asarray(st["uv"], np.float64) * 65535).astype('<u2')
+    src = np.asarray(st["src"], '<u4')
+    tris = np.asarray(st["tris"], '<u4')
+    payload = zlib.compress(uv.tobytes() + src.tobytes() + tris.tobytes(), 9)
+    with open(path, "wb") as f:
+        f.write(struct.pack('<4sIIII', b'NSKM', 2, welded, unique, ntris))
+        f.write(payload)
+    return welded, unique, ntris
+
+
+def _static_write_geometry(players, out_dir=None):
+    """Write the static `mesh.bin` (K=1) + `positions.bin` for the CURRENT frame, using the DENSE
+    mesh (full subdivision, no AntiLag/Slim reduction -- one key, so there is no per-frame delta
+    budget to fit). Reuses `_static_collect` / `_anim_frame_positions` / `_anim_write_mesh` /
+    `_anim_write_anim` (positions.bin = NSKA v3 with K=1: one absolute key; the consumer
+    degenerates to "use key 0"). Returns a stats dict (incl. per-player ranges for the manifest).
+    Self-contained: restores AntiLag / Slim / simplify state."""
+    s = bpy.context.scene
+    W = s.render.resolution_x * MASK_RES_PCT // 100
+    H = s.render.resolution_y * MASK_RES_PCT // 100
+    out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
+    os.makedirs(out_dir, exist_ok=True)
+    for p in players:
+        p["uv_labels"] = _assign_part_labels(p["uv_parts"], label=p["label"])
+    arms = list({p["arm"] for p in players if p.get("arm")})
+    simp = (s.render.use_simplify, s.render.simplify_subdivision_render)
+    rig_snap = {}
+    for a in arms:
+        pb = a.pose.bones.get('Main_Properties')
+        if pb is not None:
+            rig_snap[a.name] = (pb.get('AntiLag'), pb.get('Slim main'))
+    try:
+        # DENSE: full subdivision + no AntiLag (render-matching silhouettes; K=1 has no per-frame
+        # delta budget to fit). Each player's arm STYLE (Slim main) is left UNTOUCHED so the
+        # hide_render-based selection in _static_collect picks the variant the player actually
+        # uses (classic vs slim) instead of overriding it.
+        for a in arms:
+            pb = a.pose.bones.get('Main_Properties')
+            if pb is not None and 'AntiLag' in pb.keys():
+                pb['AntiLag'] = False
+                a.update_tag()
+        s.render.use_simplify = False
+        bpy.context.view_layer.update()
+        st = _static_collect(players, W, H)
+        pos = _anim_frame_positions(st, W, H)
+        welded, unique, ntris = _static_write_mesh(os.path.join(out_dir, "mesh.bin"), st)
+        K, V = _anim_write_anim(os.path.join(out_dir, "positions.bin"), [pos], ANIM_QUANT, 0.0)
+        return {"resolution": [W, H], "welded": welded, "unique": unique, "tris": ntris,
+                "keys": K, "verts": V, "players": st["players"],
+                "mesh_bytes": os.path.getsize(os.path.join(out_dir, "mesh.bin")),
+                "pos_bytes": os.path.getsize(os.path.join(out_dir, "positions.bin")),
+                "mesh_file": STATIC_OUT_SUBDIR + "/mesh.bin",
+                "positions_file": STATIC_OUT_SUBDIR + "/positions.bin"}
+    finally:
+        s.render.use_simplify, s.render.simplify_subdivision_render = simp
+        for a in arms:
+            pb = a.pose.bones.get('Main_Properties')
+            snap = rig_snap.get(a.name)
+            if pb is not None and snap is not None:
+                if snap[0] is not None:
+                    pb['AntiLag'] = snap[0]
+                if snap[1] is not None:
+                    pb['Slim main'] = snap[1]
+                a.update_tag()
+        bpy.context.view_layer.update()
+
+
+def _static_render_images(players, out_dir=None):
+    """Render the static `background` + `foreground` still images for the CURRENT frame, matching
+    the DENSE mesh (AntiLag off, no simplify). `background.<ext>` = the scene with the players
+    camera-invisible (their cast shadows stay baked in), opaque. `foreground.webp` = the scenery
+    IN FRONT of the players (scenery-with-players-holdout INTERSECT the player silhouette) saved
+    with a real WebP **alpha** channel (straight) -- no matte (that split is a video-only
+    workaround). The renderer composites it as `out = fg.rgb*fg.a + behind*(1-fg.a)` (multiply by
+    alpha at sample time), so the silhouette AA edge blends over the player without a fringe.
+    Returns {'background', 'foreground', 'resolution'} (rel paths). Self-contained: restores
+    AntiLag/simplify, the full session, and visibility."""
+    s = bpy.context.scene
+    W = s.render.resolution_x * MASK_RES_PCT // 100
+    H = s.render.resolution_y * MASK_RES_PCT // 100
+    out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
+    os.makedirs(out_dir, exist_ok=True)
+    char_names = {o.name for p in players for o in p["char_all"]}
+    arms = list({p["arm"] for p in players if p.get("arm")})
+    simp = (s.render.use_simplify, s.render.simplify_subdivision_render)
+    rig_snap = {a.name: a.pose.bones['Main_Properties'].get('AntiLag')
+                for a in arms if a.pose.bones.get('Main_Properties')}
+    sess = _Session()
+    bg_rel = STATIC_OUT_SUBDIR + "/background" + STATIC_BG_EXT
+    fg_rel = STATIC_OUT_SUBDIR + "/foreground.webp"
+    try:
+        # DENSE render (silhouettes match the exported mesh); arm style left as the player's own
+        for a in arms:
+            pb = a.pose.bones.get('Main_Properties')
+            if pb is not None and 'AntiLag' in pb.keys():
+                pb['AntiLag'] = False
+                a.update_tag()
+        s.render.use_simplify = False
+        sess.restore_visibility()          # drivers active -> real per-player visibility
+        bpy.context.view_layer.update()
+        player_objs = [o for o in s.objects if o.name in char_names and not o.hide_render]
+        player_set = {o.name for o in player_objs}
+
+        # 1) BACKGROUND: players camera-invisible (still cast shadows -> baked into the bg)
+        sc = {o: o.visible_camera for o in player_objs}
+        for o in player_objs:
+            o.visible_camera = False
+        bpy.context.view_layer.update()
+        bg, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT)
+        for o, v in sc.items():
+            o.visible_camera = v
+        buf = np.ones((bg.shape[0], 4), 'float32')
+        buf[:, :3] = _to_display(bg)
+        _save_image(buf.reshape(-1), rW, rH, os.path.join(out_dir, "background" + STATIC_BG_EXT),
+                    file_format=STATIC_BG_FORMAT, quality=STATIC_BG_QUALITY)
+
+        # 2) FOREGROUND: scenery-with-players-holdout INTERSECT the player silhouette, WebP+alpha
+        hold = {o: o.is_holdout for o in player_objs}
+        for o in player_objs:
+            o.is_holdout = True
+        bpy.context.view_layer.update()
+        C, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+        for o, v in hold.items():
+            o.is_holdout = v
+        # player silhouette: render only the players
+        camsnap = {}
+        for o in s.objects:
+            if o.type == 'MESH' and o.name not in player_set:
+                camsnap[o.name] = o.hide_render
+                o.hide_render = True
+        bpy.context.view_layer.update()
+        D, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+        for n, v in camsnap.items():
+            ob = s.objects.get(n)
+            if ob is not None:
+                ob.hide_render = v
+        ca = np.clip(C[:, 3], 0.0, 1.0)
+        straight = np.where(ca[:, None] > 1e-4, C[:, :3] / np.maximum(ca[:, None], 1e-4), 0.0)
+        alpha = np.where(D[:, 3] > 0.5, ca, 0.0)        # scenery in front AND over the player
+        vis = alpha > 1e-4
+        fg = np.zeros((C.shape[0], 4), 'float32')
+        fg[vis, :3] = _to_display(straight[vis])
+        # STRAIGHT alpha, composited as out = fg.rgb*fg.a + behind*(1-fg.a) (multiply by alpha at
+        # sample time). Dilate the color outward so partial-alpha EDGE texels carry real scenery
+        # color (not zeroed black); the fully transparent rgb is don't-care (x alpha=0).
+        fg[:, :3] = _anim_dilate_light(fg[:, :3], vis, rW, rH)
+        fg[:, 3] = alpha
+        _save_image(fg.reshape(-1), rW, rH, os.path.join(out_dir, "foreground.webp"),
+                    file_format='WEBP', lossless=STATIC_FG_LOSSLESS, quality=STATIC_FG_QUALITY)
+        return {"background": bg_rel, "foreground": fg_rel, "resolution": [W, H]}
+    finally:
+        sess.restore()
+        s.render.use_simplify, s.render.simplify_subdivision_render = simp
+        for a in arms:
+            pb = a.pose.bones.get('Main_Properties')
+            if pb is not None and rig_snap.get(a.name) is not None:
+                pb['AntiLag'] = rig_snap[a.name]
+                a.update_tag()
+        bpy.context.view_layer.update()
+
+
+def _static_write_manifest(out_dir, geo, imgs, atlas_by_label):
+    """Write `static/manifest.json` tying the static-v2 pieces together (paths are bare file
+    names, relative to the manifest's own dir). `light_space: "uv"` tells the renderer to sample
+    the per-player atlas in UV space; each player carries its tri/overlay ranges + atlas file."""
+    players_meta = []
+    for pm in geo["players"]:
+        e = dict(pm)
+        e["atlas"] = atlas_by_label.get(pm["label"])
+        players_meta.append(e)
+    manifest = {
+        "static_version": 1,
+        "addon_version": ADDON_VERSION,
+        "resolution": geo["resolution"],
+        "light_space": "uv",
+        "background": os.path.basename(imgs["background"]),
+        "foreground": os.path.basename(imgs["foreground"]),   # WebP with alpha -- no matte
+        "foreground_alpha": "straight",                       # out = fg.rgb*fg.a + behind*(1-fg.a)
+        "mesh": {"file": "mesh.bin", "format": "NSKM2",
+                 "welded": geo["welded"], "unique": geo["unique"], "tris": geo["tris"],
+                 "layout": ("NSKM v2: u32x4 header (magic, ver=2, welded, unique, ntris) + "
+                            "zlib(uv u16x2/65535, src u32, tris u32x3)")},
+        "positions": {"file": "positions.bin", "format": "NSKA3", "keys": geo["keys"],
+                      "verts": geo["verts"], "quant": ANIM_QUANT, "z_bits": ANIM_Z_BITS,
+                      "layout": ("NSKA v3 header (magic, u32 ver/V/K, f32 quant/keys_fps/zmin/"
+                                 "zmax/zq) + zlib(int16 xyz, K=1 absolute); x,y = px*quant; "
+                                 "z = (camDepth-zmin)/(zmax-zmin)*zq for the depth test "
+                                 "(shared scale, smaller = nearer)")},
+        "players": players_meta,
+        "shader_note": ("draw background; draw each player mesh depth-tested with "
+                        "color = skin(uv) * atlas(uv) * 2 (display space), base tris then overlay "
+                        "tris [overlay_tri_start] (alpha-discard the overlay's transparent "
+                        "texels); composite foreground (straight alpha) over the top: "
+                        "out = fg.rgb*fg.a + behind*(1 - fg.a)."),
+    }
+    with open(os.path.join(out_dir, "manifest.json"), "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    return manifest
+
+
+def _static_export_steps(players, op=None, out_dir=None):
+    """Generator for the static-v2 export (yields (frac, msg) like `_anim_render_steps`) into
+    `<OUT_DIR>/static/`: per-player UV light atlas + DENSE `mesh.bin`/`positions.bin` (K=1) +
+    `background`/`foreground` (WebP) + `manifest.json`. Returns the manifest dict (the
+    StopIteration value). Each sub-step is self-contained (restores its own state): the atlases
+    bake in the scene's normal look (`restore_visibility`), the geometry/images in the DENSE
+    state. Cancellation only happens at a yield (between phases), where every sub-step has already
+    restored -- so it is always clean."""
+    out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
+    os.makedirs(out_dir, exist_ok=True)
+    total = len(players) + 3            # atlases (one per player) + geometry + images + manifest
+    state = {"done": 0}
+    def prog(msg):
+        state["done"] += 1
+        print(f"[STATIC {state['done']}/{total}] {msg}")
+        return (state["done"] / total, msg)
+    # 1) per-player UV light atlases (normal look so the bake sees the real scene lighting)
+    atlas_by_label = {}
+    sess = _Session()
+    try:
+        sess.restore_visibility()
+        bpy.context.view_layer.update()
+        for p in players:
+            rel = _bake_player_light_atlas(p, out_dir=out_dir, stem=f"{p['label']}_atlas")
+            if rel:
+                atlas_by_label[p["label"]] = os.path.basename(rel)
+            yield prog(f"atlas {p['label']}")
+    finally:
+        sess.restore()
+        bpy.context.view_layer.update()
+    # 2) DENSE mesh.bin + positions.bin (K=1)
+    geo = _static_write_geometry(players, out_dir=out_dir)
+    yield prog(f"mesh.bin / positions.bin ({geo['tris']} tris)")
+    # 3) background + foreground (WebP) still images
+    imgs = _static_render_images(players, out_dir=out_dir)
+    yield prog("background / foreground")
+    # 4) manifest
+    manifest = _static_write_manifest(out_dir, geo, imgs, atlas_by_label)
+    yield prog("manifest.json")
+    print(f"[STATIC] export complete -> {out_dir} "
+          f"({geo['tris']} tris, {len(atlas_by_label)} atlases)")
+    return manifest
+
+
+def _static_export(players, out_dir=None, op=None):
+    """Synchronous drain of `_static_export_steps` (scripts/standalone). Returns the manifest."""
+    gen = _static_export_steps(players, op=op, out_dir=out_dir)
+    try:
+        while True:
+            next(gen)
+    except StopIteration as e:
+        return e.value
+
+
 def _anim_encode(adir, fps):
     """Encode the PNG sequences to WebM/VP9 with ffmpeg. The foreground is split into an RGB
     video + a grayscale MATTE video (its alpha) -- no alpha channel anywhere, so it decodes
@@ -2758,8 +3336,8 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
                 'FILE_FOLDER', 0),
                ('OPTIONAL', "Optional", "Optional toggleable scenery layers",
                 'OUTLINER_OB_MESH', 1),
-               ('ANIM', "Animated", "Animated wallpaper export (beta)",
-                'RENDER_ANIMATION', 2),
+               ('ANIM', "Mesh", "Mesh-based wallpaper exports: static (v2) and animated (beta)",
+                'MESH_DATA', 2),
                ('RIG', "Rig", "Rig fixes and detected players", 'ARMATURE_DATA', 3)],
         default='EXPORT')
 
@@ -2825,26 +3403,62 @@ def _set_progress_header(text):
                 area.tag_redraw()
 
 
-class RENDER_OT_novaskin(bpy.types.Operator):
-    """Export per-part UV + occlusion mask + illum/shadow per player to <blend>/novaskin/"""
-    bl_idname = "render.novaskin"
-    bl_label = "Render for NovaSkin"
-    bl_options = {'REGISTER'}
+class _NovaSkinModalMixin:
+    """Shared modal / progress-bar / Esc-cancel plumbing for the three export operators. This is a
+    plain mixin -- NOT a `bpy.types.Operator` and NOT registered -- so each operator inherits
+    `bpy.types.Operator` directly. Subclassing a *registered* operator (the old design) breaks the
+    parent's RNA binding in Blender ("unable to get Python class for RNA struct 'RENDER_OT_...'"),
+    which silently kills the parent's button. Each operator provides `_start_msg` and
+    `_make_gen(players)` (its work generator); `draft` defaults to False if the operator has none.
 
-    draft: BoolProperty(
-        name="Draft", default=False, options={'SKIP_SAVE'},
-        description="Fast preview: render everything at 50% resolution with few samples "
-                    "(framing/marking iteration -- not for the final export)")
+    Responsiveness note: bpy is single-threaded, so a render always blocks the main thread for its
+    duration. The modal/timer runs the work in small chunks, redrawing + updating progress between
+    them and allowing Esc to cancel -- the UI is responsive between steps (each step still blocks
+    briefly while its render runs). True non-blocking rendering is not possible."""
+    _start_msg = "starting..."
 
-    # Note on responsiveness: bpy is single-threaded and not thread-safe, so an actual
-    # render call always blocks the main thread for its duration. The modal/timer below
-    # runs the work in many small chunks and redraws + updates progress between them, and
-    # lets the user cancel with Esc -- the UI is responsive between steps (each step still
-    # blocks briefly while its render runs). True non-blocking rendering is not possible.
+    def _make_gen(self, players):
+        raise NotImplementedError
 
     def invoke(self, context, event):
-        # Interactive launch (from the menu/panel): run as a modal job with a progress bar.
-        _apply_settings(context.scene, draft=self.draft)
+        # Interactive launch (menu/panel): run as a modal job with a progress bar.
+        _apply_settings(context.scene, draft=getattr(self, "draft", False))
+        players = discover_players()
+        errors = _preflight(players)
+        if errors:
+            for e in errors:
+                self.report({'ERROR'}, e)
+            return {'CANCELLED'}
+        self.report({'INFO'}, "NovaSkin: starting export…")   # early feedback in the Info editor
+        self._players = players
+        try:
+            self._gen = self._make_gen(players)
+            self._wm = context.window_manager
+            self._result = None
+            self._wm.progress_begin(0.0, 1.0)
+            # robust window: a panel-button context may not carry context.window in some builds
+            win = context.window or (self._wm.windows[0] if self._wm.windows else None)
+            self._timer = self._wm.event_timer_add(0.01, window=win)
+            self._wm.modal_handler_add(self)
+            _PROGRESS.update(running=True, frac=0.0, msg=self._start_msg, cancel=False)
+            bpy.app.driver_namespace[_ACTIVE_KEY] = self   # for teardown on reload/unregister
+            context.workspace.status_text_set(f"NovaSkin: {self._start_msg} (Esc to cancel)")
+            _set_progress_header(f"NovaSkin: {self._start_msg} (Esc to cancel)")
+            return {'RUNNING_MODAL'}
+        except Exception as ex:
+            # The modal couldn't start (context / timer / window). Fall back to a SYNCHRONOUS run so
+            # the export still happens (the UI blocks, no progress bar, but it works and writes the
+            # output). The warning surfaces why in the Info editor.
+            self.report({'WARNING'},
+                        f"NovaSkin: modal unavailable ({ex}); running synchronously (UI will block)")
+            print(f"[NovaSkin] modal start failed: {ex!r}; falling back to synchronous execute()")
+            _PROGRESS.update(running=False, frac=0.0, msg="", cancel=False)
+            return self.execute(context)
+
+    def execute(self, context):
+        # Non-interactive launch (e.g. bpy.ops.render.novaskin() from a script, or the modal
+        # fallback above): run the whole batch synchronously and block until done.
+        _apply_settings(context.scene, draft=getattr(self, "draft", False))
         players = discover_players()
         errors = _preflight(players)
         if errors:
@@ -2852,23 +3466,22 @@ class RENDER_OT_novaskin(bpy.types.Operator):
                 self.report({'ERROR'}, e)
             return {'CANCELLED'}
         self._players = players
-        self._gen = _render_steps(players, op=self)
-        self._wm = context.window_manager
-        self._result = None
-        self._wm.progress_begin(0.0, 1.0)
-        self._timer = self._wm.event_timer_add(0.001, window=context.window)
-        self._wm.modal_handler_add(self)
-        _PROGRESS.update(running=True, frac=0.0, msg="starting...", cancel=False)
-        bpy.app.driver_namespace[_ACTIVE_KEY] = self   # for teardown on reload/unregister
-        context.workspace.status_text_set("NovaSkin: starting... (Esc to cancel)")
-        _set_progress_header("NovaSkin: starting... (Esc to cancel)")
-        return {'RUNNING_MODAL'}
+        gen = self._make_gen(players)
+        try:
+            while True:
+                next(gen)
+        except StopIteration:
+            self.report({'INFO'}, f"NovaSkin: exported {len(players)} player(s) -> {OUT_DIR}")
+            return {'FINISHED'}
+        except Exception as ex:
+            print(f"NovaSkin failed: {ex!r}")
+            self.report({'ERROR'}, f"NovaSkin failed: {ex}")
+            return {'CANCELLED'}
 
     def modal(self, context, event):
         if event.type == 'ESC' and event.value == 'PRESS':
-            # confirm before throwing away a long batch: Esc arms, a second Esc within
-            # 3 s cancels (the panel's Cancel button stays immediate -- clicking it is
-            # deliberate; a stray Esc with the mouse in the viewport is not).
+            # confirm before throwing away a long batch: Esc arms, a second Esc within 3 s cancels
+            # (the panel's Cancel button stays immediate -- a stray Esc in the viewport is not).
             import time
             if getattr(self, "_esc_armed_until", 0.0) > time.time():
                 return self._finish(context, cancelled=True)
@@ -2921,64 +3534,51 @@ class RENDER_OT_novaskin(bpy.types.Operator):
                     f"NovaSkin: exported {len(self._players)} player(s) -> {OUT_DIR}")
         return {'FINISHED'}
 
-    def execute(self, context):
-        # Non-interactive launch (e.g. bpy.ops.render.novaskin() from a script): run the
-        # whole batch synchronously and block until done.
-        return {'FINISHED'} if render_all(op=self, draft=self.draft) is not None \
-            else {'CANCELLED'}
+
+class RENDER_OT_novaskin(_NovaSkinModalMixin, bpy.types.Operator):
+    """Export per-part UV + occlusion mask + illum/shadow per player to <blend>/novaskin/"""
+    bl_idname = "render.novaskin"
+    bl_label = "Render for NovaSkin"
+    bl_options = {'REGISTER'}
+    _start_msg = "starting..."
+
+    draft: BoolProperty(
+        name="Draft", default=False, options={'SKIP_SAVE'},
+        description="Fast preview: render everything at 50% resolution with few samples "
+                    "(framing/marking iteration -- not for the final export)")
+
+    def _make_gen(self, players):
+        return _render_steps(players, op=self)
 
 
-class RENDER_OT_novaskin_animated(RENDER_OT_novaskin):
+class RENDER_OT_novaskin_animated(_NovaSkinModalMixin, bpy.types.Operator):
     """Export the ANIMATED wallpaper (scene frame range): background/foreground/light
     videos + the players' base-layer mesh stream (docs/animated-export-plan.md).
     Base layer only; optional-layer marks are ignored (they render as scenery)"""
     bl_idname = "render.novaskin_animated"
     bl_label = "Export Animation (beta)"
     bl_options = {'REGISTER'}
+    _start_msg = "animated: starting..."
 
     draft: BoolProperty(
         name="Draft", default=False, options={'SKIP_SAVE'},
         description="Fast preview: 50% resolution, few samples")
 
-    def invoke(self, context, event):
-        _apply_settings(context.scene, draft=self.draft)
-        players = discover_players()
-        errors = _preflight(players)
-        if errors:
-            for e in errors:
-                self.report({'ERROR'}, e)
-            return {'CANCELLED'}
-        self._players = players
-        self._gen = _anim_render_steps(players, op=self)
-        self._wm = context.window_manager
-        self._result = None
-        self._wm.progress_begin(0.0, 1.0)
-        self._timer = self._wm.event_timer_add(0.001, window=context.window)
-        self._wm.modal_handler_add(self)
-        _PROGRESS.update(running=True, frac=0.0, msg="animated: starting...", cancel=False)
-        bpy.app.driver_namespace[_ACTIVE_KEY] = self
-        context.workspace.status_text_set("NovaSkin animated: starting... (Esc to cancel)")
-        _set_progress_header("NovaSkin animated: starting... (Esc to cancel)")
-        return {'RUNNING_MODAL'}
+    def _make_gen(self, players):
+        return _anim_render_steps(players, op=self)
 
-    def execute(self, context):
-        # synchronous run (scripts): drain the generator
-        _apply_settings(context.scene, draft=self.draft)
-        players = discover_players()
-        errors = _preflight(players)
-        if errors:
-            for e in errors:
-                self.report({'ERROR'}, e)
-            return {'CANCELLED'}
-        gen = _anim_render_steps(players, op=self)
-        try:
-            while True:
-                next(gen)
-        except StopIteration:
-            return {'FINISHED'}
-        except Exception as ex:
-            self.report({'ERROR'}, f"NovaSkin animated failed: {ex}")
-            return {'CANCELLED'}
+
+class RENDER_OT_novaskin_static(_NovaSkinModalMixin, bpy.types.Operator):
+    """Export the STATIC wallpaper v2 (current frame): per-player UV light atlas + DENSE mesh
+    (mesh.bin/positions.bin) + background/foreground (WebP) + manifest, to <OUT_DIR>/static/.
+    Includes base + 2nd-layer overlays; lives alongside the legacy per-part UV export"""
+    bl_idname = "render.novaskin_static"
+    bl_label = "Export Static (mesh v2, beta)"
+    bl_options = {'REGISTER'}
+    _start_msg = "static: starting..."
+
+    def _make_gen(self, players):
+        return _static_export_steps(players, op=self)
 
 
 class RENDER_OT_novaskin_cancel(bpy.types.Operator):
@@ -3205,6 +3805,11 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 
         elif tab == 'ANIM':
             box = layout.box()
+            box.label(text="Static (mesh v2, beta)", icon='MESH_DATA')
+            box.operator("render.novaskin_static", icon='RENDER_STILL')
+            box.label(text="vertices + UV light atlas, current frame", icon='INFO')
+
+            box = layout.box()
             box.label(text="Animated (beta)", icon='RENDER_ANIMATION')
             box.operator("render.novaskin_animated", icon='RENDER_ANIMATION').draft = False
             box.operator("render.novaskin_animated",
@@ -3236,8 +3841,9 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 
 
 _classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_animated,
-            RENDER_OT_novaskin_cancel, OBJECT_OT_novaskin_layer_toggle,
-            OBJECT_OT_novaskin_layer_remove, VIEW3D_PT_novaskin)
+            RENDER_OT_novaskin_static, RENDER_OT_novaskin_cancel,
+            OBJECT_OT_novaskin_layer_toggle, OBJECT_OT_novaskin_layer_remove,
+            VIEW3D_PT_novaskin)
 
 
 def _teardown_active_batch():
@@ -3271,11 +3877,6 @@ def unregister():
 
 
 if __name__ == "__main__":
-    # Re-running from the Text Editor: refresh the registration cleanly.
-    try:
-        unregister()
-    except Exception:
-        pass
     register()
     print("NovaSkin: registered. Run it from  Render > Render for NovaSkin  "
           "(or bpy.ops.render.novaskin()).")

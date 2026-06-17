@@ -8,7 +8,7 @@ maintainer = "saviski"
 type = "add-on"
 
 website = "https://github.com/novaskin/novaskin-blender-addon"
-tags = ["Render", "Pipeline", "UV"]
+tags = ["Render", "Pipeline"]
 
 blender_version_min = "4.2.0"
 

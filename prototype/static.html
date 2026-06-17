@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NovaSkin static wallpaper — mesh v2 prototype</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 13px/1.4 system-ui, sans-serif; }
+  #wrap { width: 960px; margin: 16px auto; }
+  canvas { display: block; width: 960px; }
+  #hud { width: 960px; margin: 8px auto; display: flex; gap: 16px; align-items: center;
+         flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="gl"></canvas></div>
+<div id="hud">
+  <label><input type="checkbox" id="ck_bg" checked> background</label>
+  <label><input type="checkbox" id="ck_pl" checked> players</label>
+  <label><input type="checkbox" id="ck_li" checked> light (atlas)</label>
+  <label><input type="checkbox" id="ck_fg" checked> foreground</label>
+  <span id="skins"></span>
+  <span id="stats">loading…</span>
+</div>
+<script type="module" src="static.js"></script>
+</body>
+</html>
