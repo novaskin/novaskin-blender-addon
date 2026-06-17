@@ -2884,10 +2884,13 @@ def _static_write_geometry(players, out_dir=None):
         bpy.context.view_layer.update()
 
 
-def _static_render_images(players, out_dir=None):
+def _static_render_images(players, out_dir=None, layer_mesh_names=None):
     """Render the static `background` + `foreground` still images for the CURRENT frame, matching
     the DENSE mesh (AntiLag off, no simplify). `background.<ext>` = the scene with the players
-    camera-invisible (their cast shadows stay baked in), opaque. `foreground.webp` = the scenery
+    camera-invisible (their cast shadows stay baked in), opaque. Meshes in `layer_mesh_names`
+    (optional toggleable layers) are HIDDEN from both images -- they are exported as independent
+    sprites (`_static_render_layers`) and composited by depth, so baking them here would double-draw
+    them and defeat the toggle. `foreground.webp` = the scenery
     IN FRONT of the players (scenery-with-players-holdout INTERSECT the player silhouette) saved
     with a real WebP **alpha** channel (straight) -- no matte (that split is a video-only
     workaround). The renderer composites it as `out = fg.rgb*fg.a + behind*(1-fg.a)` (multiply by
@@ -2916,6 +2919,9 @@ def _static_render_images(players, out_dir=None):
                 a.update_tag()
         s.render.use_simplify = False
         sess.restore_visibility()          # drivers active -> real per-player visibility
+        for o in s.objects:                # toggleable layers are their own sprites: keep them out
+            if layer_mesh_names and o.name in layer_mesh_names:   # of the baked bg/fg
+                o.hide_render = True
         bpy.context.view_layer.update()
         player_objs = [o for o in s.objects if o.name in char_names and not o.hide_render]
         player_set = {o.name for o in player_objs}
@@ -3005,11 +3011,83 @@ def _static_render_images(players, out_dir=None):
         bpy.context.view_layer.update()
 
 
-def _static_write_manifest(out_dir, geo, imgs, atlas_by_label):
+def _static_render_layers(players, groups, out_dir=None):
+    """Render each optional-layer GROUP as an independent RGBA sprite for the static wallpaper.
+    Each group's meshes render ALONE over a transparent film (players + the OTHER groups hidden, so
+    every layer is whole and independently toggleable), OCCLUDED by the real scenery as a HOLDOUT
+    (camera rays hitting scenery cut the sprite's alpha where it is in front, while the scenery
+    still lights/shadows the group -- lighting stays real). Straight alpha, display-encoded like
+    `background`, edge-dilated, saved as `<name>.webp`. The web renderer composites the sprites by
+    `camera_depth`, interleaved with the players in painter's order. The layer's own cast shadow /
+    water reflection is NOT baked anywhere (the meshes are hidden from bg/fg), so a toggle is clean
+    -- same trade-off as the legacy `_layer_steps`. Returns a list of
+    {name, object, kind, image, camera_depth}, sorted back -> front. Self-contained (restores)."""
+    if not groups:
+        return []
+    s = bpy.context.scene
+    out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
+    os.makedirs(out_dir, exist_ok=True)
+    char_names = {o.name for p in players for o in p["char_all"]}
+    layer_mesh_names = {m.name for g in groups for m in g["meshes"]}
+    sess = _Session()
+    infos = []
+    try:
+        for g in groups:
+            meshes = g["meshes"]
+            safe = g["name"]
+            group_names = {m.name for m in meshes}
+            # real scenery that occludes this group (not the group, players or any other layer)
+            scenery = [o for o in s.objects if o.type == 'MESH'
+                       and o.name not in group_names and o.name not in char_names
+                       and o.name not in layer_mesh_names]
+            # isolate: only this group visible (players + every other layer hidden)
+            sess.restore_visibility()
+            sess.mute_drivers(True)
+            for o in s.objects:
+                if o.name in char_names or o.name in layer_mesh_names:
+                    o.hide_render = True
+            for m in meshes:
+                m.hide_render = False
+            sc = {o: o.is_holdout for o in scenery}
+            for o in scenery:
+                o.is_holdout = True
+            bpy.context.view_layer.update()
+            try:
+                comb, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+            finally:
+                for o, v in sc.items():
+                    o.is_holdout = v
+            alpha = np.clip(comb[:, 3], 0.0, 1.0)
+            straight = np.where(alpha[:, None] > 1e-4,
+                                comb[:, :3] / np.maximum(alpha[:, None], 1e-4), 0.0)
+            vis = alpha > 1e-4
+            spr = np.zeros((comb.shape[0], 4), 'float32')
+            spr[vis, :3] = _to_display(straight[vis])
+            # dilate color outward so partial-alpha EDGE texels carry real color (not black); the
+            # fully-transparent rgb is don't-care (x alpha=0). Same as the foreground.
+            spr[:, :3] = _anim_dilate_light(spr[:, :3], vis, rW, rH)
+            spr[:, 3] = alpha
+            _save_image(spr.reshape(-1), rW, rH, os.path.join(out_dir, safe + ".webp"),
+                        file_format='WEBP', lossless=STATIC_FG_LOSSLESS, quality=STATIC_FG_QUALITY)
+            cd = _group_camera_depth(meshes)
+            infos.append({"name": safe, "object": g["object"], "kind": g["kind"],
+                          "image": safe + ".webp",
+                          "camera_depth": round(cd, 4) if cd is not None else None})
+            print(f"[STATIC layer] {safe} -> camera_depth={cd}")
+        # back -> front, so the manifest's order is the painter's order (None depth -> farthest)
+        infos.sort(key=lambda i: (i["camera_depth"] is None, -(i["camera_depth"] or 0.0)))
+        return infos
+    finally:
+        sess.restore()
+        bpy.context.view_layer.update()
+
+
+def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None):
     """Write `static/manifest.json` tying the static-v2 pieces together (paths are bare file names,
     relative to the manifest's own dir). `light_space` selects how the renderer samples the light:
     "screen" -> one `light` image sampled by screen position (viewport-quality, default); "uv" ->
-    each player's `atlas` sampled by uv. Players carry their tri/overlay ranges."""
+    each player's `atlas` sampled by uv. Players carry their tri/overlay ranges. `layers` (optional)
+    are independent scenery sprites, each with a `camera_depth` for depth-ordered compositing."""
     light_space = STATIC_LIGHT_SPACE
     players_meta = []
     for pm in geo["players"]:
@@ -3037,12 +3115,16 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label):
                                  "z = (camDepth-zmin)/(zmax-zmin)*zq for the depth test "
                                  "(shared scale, smaller = nearer)")},
         "players": players_meta,
-        "shader_note": (f"draw background; draw each player mesh depth-tested with "
+        "shader_note": (f"draw background; then draw players and `layers` together back -> front "
+                        f"by camera_depth (larger = farther): a player mesh is depth-tested with "
                         f"color = skin(uv) * {light_term} * 2, base tris then overlay tris "
-                        "[overlay_tri_start] (alpha-discard the overlay's transparent texels); "
-                        "composite foreground (straight alpha) over the top: "
+                        "[overlay_tri_start] (alpha-discard the overlay's transparent texels); a "
+                        "layer is a straight-alpha sprite quad (depth test off, painter's order). "
+                        "Finally composite foreground (straight alpha) over the top: "
                         "out = fg.rgb*fg.a + behind*(1 - fg.a)."),
     }
+    if layers:
+        manifest["layers"] = layers           # scenery sprites, ordered back -> front
     if light_space == "screen" and imgs.get("light"):
         # screen-space light image, sampled at the fragment's screen pixel (full frame, no crop)
         manifest["light"] = os.path.basename(imgs["light"])
@@ -3054,7 +3136,8 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label):
 def _static_export_steps(players, op=None, out_dir=None):
     """Generator for the static-v2 export (yields (frac, msg) like `_anim_render_steps`) into
     `<OUT_DIR>/static/`: per-player UV light atlas + DENSE `mesh.bin`/`positions.bin` (K=1) +
-    `background`/`foreground` (WebP) + `manifest.json`. Returns the manifest dict (the
+    `background`/`foreground` (WebP) + one `<name>.webp` sprite per optional toggleable layer
+    (depth-ordered scenery, excluded from bg/fg) + `manifest.json`. Returns the manifest dict (the
     StopIteration value). Each sub-step is self-contained (restores its own state): the atlases
     bake in the scene's normal look (`restore_visibility`), the geometry/images in the DENSE
     state. Cancellation only happens at a yield (between phases), where every sub-step has already
@@ -3062,7 +3145,10 @@ def _static_export_steps(players, op=None, out_dir=None):
     out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
     os.makedirs(out_dir, exist_ok=True)
     uv_light = (STATIC_LIGHT_SPACE == "uv")        # else screen-space light (default)
-    total = (len(players) if uv_light else 0) + 3  # atlases + geometry + images + manifest
+    groups = discover_layers()                     # optional toggleable scenery layers (sprites)
+    layer_mesh_names = {m.name for g in groups for m in g["meshes"]}
+    # atlases + geometry + images + (layers) + manifest
+    total = (len(players) if uv_light else 0) + 3 + (1 if groups else 0)
     state = {"done": 0}
     def prog(msg):
         state["done"] += 1
@@ -3095,11 +3181,18 @@ def _static_export_steps(players, op=None, out_dir=None):
         # 2) DENSE mesh.bin + positions.bin (K=1)
         geo = _static_write_geometry(players, out_dir=out_dir)
         yield prog(f"mesh.bin / positions.bin ({geo['tris']} tris)")
-        # 3) background + foreground images (+ screen-space light when light_space="screen")
-        imgs = _static_render_images(players, out_dir=out_dir)
+        # 3) background + foreground images (+ screen-space light when light_space="screen"),
+        #    with the toggleable layers excluded (they are their own sprites)
+        imgs = _static_render_images(players, out_dir=out_dir,
+                                     layer_mesh_names=layer_mesh_names)
         yield prog("background / foreground" + ("" if uv_light else " / light"))
-        # 4) manifest
-        manifest = _static_write_manifest(out_dir, geo, imgs, atlas_by_label)
+        # 4) optional-layer sprites (depth-ordered scenery, toggleable in the wallpaper)
+        layer_infos = []
+        if groups:
+            layer_infos = _static_render_layers(players, groups, out_dir=out_dir)
+            yield prog(f"layers ({len(layer_infos)})")
+        # 5) manifest
+        manifest = _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=layer_infos)
         yield prog("manifest.json")
         print(f"[STATIC] export complete -> {out_dir} ({geo['tris']} tris, "
               f"light={STATIC_LIGHT_SPACE})")

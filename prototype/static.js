@@ -67,6 +67,9 @@ const imgLight = (lightSpace === 'screen' && manifest.light)
 const atlasImgs = (lightSpace === 'uv')
   ? await Promise.all(manifest.players.map(p => loadImage(DIR + p.atlas + _cb))) : [];
 const skins = await Promise.all(manifest.players.map(() => loadImage('data/skin.png' + _cb)));
+// optional toggleable scenery sprites (straight-alpha, full-frame), composited by camera_depth
+const layers = manifest.layers || [];
+const layerImgs = await Promise.all(layers.map(L => loadImage(DIR + L.image + _cb)));
 
 // --- GL setup ---
 const canvas = document.getElementById('gl');
@@ -126,6 +129,7 @@ function upload(t, srcEl) {
 const tBg = tex(), tFg = tex(), tLight = tex(false);   // tLight: LINEAR screen-space light
 const tAtlas = atlasImgs.map(img => { const t = tex(false); upload(t, img); return t; });  // LINEAR
 const tSkins = skins.map(img => { const t = tex(true); upload(t, img); return t; });        // NEAREST
+const tLayers = layerImgs.map(img => { const t = tex(false); upload(t, img); return t; });  // LINEAR sprites
 upload(tBg, imgBg); upload(tFg, imgFg);
 if (imgLight) upload(tLight, imgLight);
 
@@ -158,6 +162,35 @@ function blitQuad(t) {
   gl.uniform1i(gl.getUniformLocation(quadP, 'uTex'), 0);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
+function blitQuadBlend(t) {     // straight-alpha sprite over what's behind: out = rgb*a + behind*(1-a)
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  blitQuad(t);
+  gl.disable(gl.BLEND);
+}
+
+// players + layer sprites merged back -> front by camera_depth (larger = farther; null = farthest)
+const drawOrder = [
+  ...manifest.players.map((p, i) => ({ kind: 'player', i, depth: p.camera_depth ?? Infinity })),
+  ...layers.map((L, i) => ({ kind: 'layer', i, depth: L.camera_depth ?? Infinity })),
+].sort((a, b) => b.depth - a.depth);
+const layerOn = (i) => { const e = document.getElementById('ck_layer_' + i); return !e || e.checked; };
+
+function drawPlayer(i) {
+  const p = manifest.players[i];
+  gl.useProgram(meshP); gl.bindVertexArray(meshVao);
+  gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), ck('ck_li') ? 1 : 0);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uScreenLight'), lightSpace === 'screen' ? 1 : 0);
+  gl.activeTexture(gl.TEXTURE1);                     // screen-space light or per-player UV atlas
+  gl.bindTexture(gl.TEXTURE_2D, lightSpace === 'screen' ? tLight : tAtlas[i]);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);   // per-vertex depth: self + inter-player
+  const [t0, t1] = p.tri_range;
+  gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, idxType, t0 * 3 * idxSize);
+  gl.disable(gl.DEPTH_TEST);
+}
 
 function draw() {
   gl.viewport(0, 0, W, H);
@@ -167,34 +200,13 @@ function draw() {
 
   if (ck('ck_bg')) blitQuad(tBg);
 
-  if (ck('ck_pl')) {
-    gl.useProgram(meshP); gl.bindVertexArray(meshVao);
-    gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
-    gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
-    gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
-    gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), ck('ck_li') ? 1 : 0);
-    gl.uniform1i(gl.getUniformLocation(meshP, 'uScreenLight'), lightSpace === 'screen' ? 1 : 0);
-    if (lightSpace === 'screen') {   // one shared screen-space light for all players
-      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLight);
-    }
-    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);   // per-vertex depth: self + inter-player
-    // players stored back-to-front; depth-tested, so base/overlay shells sort correctly
-    manifest.players.forEach((p, i) => {
-      if (lightSpace === 'uv') {     // per-player UV atlas
-        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tAtlas[i]);
-      }
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
-      const [t0, t1] = p.tri_range;
-      gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, idxType, t0 * 3 * idxSize);
-    });
-    gl.disable(gl.DEPTH_TEST);
+  const showPlayers = ck('ck_pl');                   // walk the merged list, back -> front
+  for (const it of drawOrder) {
+    if (it.kind === 'player') { if (showPlayers) drawPlayer(it.i); }
+    else if (layerOn(it.i)) blitQuadBlend(tLayers[it.i]);   // flat sprite, painter's order
   }
 
-  if (ck('ck_fg')) {                                 // straight-alpha over: rgb*a + behind*(1-a)
-    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    blitQuad(tFg);
-    gl.disable(gl.BLEND);
-  }
+  if (ck('ck_fg')) blitQuadBlend(tFg);               // real scenery in front of everything
 }
 
 // swap a player's skin at runtime (file input, or __dbg.setSkin(i, src))
@@ -219,8 +231,22 @@ function setSkin(i, source) { upload(tSkins[i], source); draw(); }
 for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_fg'])
   document.getElementById(id).addEventListener('change', draw);
 
+// per-layer toggles (one checkbox each, default on), labelled by the layer's object name
+{
+  const box = document.getElementById('layers');
+  layers.forEach((L, i) => {
+    const lab = document.createElement('label');
+    const inp = document.createElement('input');
+    inp.type = 'checkbox'; inp.id = 'ck_layer_' + i; inp.checked = true;
+    inp.addEventListener('change', draw);
+    lab.appendChild(inp);
+    lab.appendChild(document.createTextNode(' ' + (L.object || L.name)));
+    box.appendChild(lab);
+  });
+}
+
 document.getElementById('stats').textContent =
   `${uniqueN} unique / ${welded} welded verts, ${ntris} tris, ${manifest.players.length} player(s), ` +
-  `${W}x${H}, light=${manifest.light_space}`;
+  `${layers.length} layer(s), ${W}x${H}, light=${manifest.light_space}`;
 window.__dbg = { manifest, setSkin, draw, keys: { welded, uniqueN, ntris, V }, posArr };
 draw();
