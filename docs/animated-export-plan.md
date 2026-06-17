@@ -313,6 +313,8 @@ player; also speeds the fg/light render passes (fewer px).
 
 ## Future discussion: the mesh stream as a STATIC format too (v2 of the static export)
 
+> Detailed plan: [static-mesh-plan.md](static-mesh-plan.md).
+
 The screen-space mesh could replace the per-part UV images in the static pipeline as
 well — and it is arguably a better fit there: one frame of positions is ~14 KB (vs
 hundreds of KB of WebP UVs per player), resolution-independent (crisp at 4K from the
