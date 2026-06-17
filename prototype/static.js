@@ -59,9 +59,13 @@ for (let i = 0; i < welded; i++) {
 }
 
 // --- images: background + foreground + per-player atlas + per-player skin ---
+const lightSpace = manifest.light_space || 'uv';   // 'screen' (one light image) | 'uv' (per-player atlas)
 const [imgBg, imgFg] = await Promise.all([
   loadImage(DIR + manifest.background + _cb), loadImage(DIR + manifest.foreground + _cb)]);
-const atlasImgs = await Promise.all(manifest.players.map(p => loadImage(DIR + p.atlas + _cb)));
+const imgLight = (lightSpace === 'screen' && manifest.light)
+  ? await loadImage(DIR + manifest.light + _cb) : null;
+const atlasImgs = (lightSpace === 'uv')
+  ? await Promise.all(manifest.players.map(p => loadImage(DIR + p.atlas + _cb))) : [];
 const skins = await Promise.all(manifest.players.map(() => loadImage('data/skin.png' + _cb)));
 
 // --- GL setup ---
@@ -84,7 +88,8 @@ const quadP = prog(
    precision highp float; uniform sampler2D uTex; in vec2 vUv; out vec4 frag;
    void main(){ frag=texture(uTex,vUv); }`);
 
-// player mesh: screen-space px positions + per-vertex camera depth; relit skin(uv)*atlas(uv)*2
+// player mesh: screen-space px positions + per-vertex camera depth; relit skin*light*2.
+// light is either a screen-space image (sampled by gl_FragCoord) or a per-player UV atlas (vUv).
 const meshP = prog(
   `#version 300 es
    layout(location=0) in vec3 aPx; layout(location=1) in vec2 aUv;
@@ -92,12 +97,14 @@ const meshP = prog(
    void main(){ vUv=aUv; gl_Position=vec4(aPx.xy/uRes*2.-1., aPx.z*2.-1., 1.); }`,
   `#version 300 es
    precision highp float;
-   uniform sampler2D uSkin; uniform sampler2D uAtlas; uniform bool uUseLight;
+   uniform sampler2D uSkin; uniform sampler2D uLight; uniform vec2 uRes;
+   uniform bool uUseLight; uniform bool uScreenLight;
    in vec2 vUv; out vec4 frag;
    void main(){
      vec4 s=texture(uSkin,vUv);
      if(s.a<0.5) discard;                       // overlay's transparent texels reveal the base
-     vec3 l=uUseLight ? texture(uAtlas,vUv).rgb*2.0 : vec3(1.0);
+     vec2 luv = uScreenLight ? gl_FragCoord.xy/uRes : vUv;
+     vec3 l = uUseLight ? texture(uLight, luv).rgb*2.0 : vec3(1.0);
      frag=vec4(s.rgb*l, 1.0);
    }`);
 
@@ -116,10 +123,11 @@ function upload(t, srcEl) {
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);   // keep straight alpha
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcEl);
 }
-const tBg = tex(), tFg = tex();
+const tBg = tex(), tFg = tex(), tLight = tex(false);   // tLight: LINEAR screen-space light
 const tAtlas = atlasImgs.map(img => { const t = tex(false); upload(t, img); return t; });  // LINEAR
 const tSkins = skins.map(img => { const t = tex(true); upload(t, img); return t; });        // NEAREST
 upload(tBg, imgBg); upload(tFg, imgFg);
+if (imgLight) upload(tLight, imgLight);
 
 // quad VAO (location 0 = 2D position in [0,1])
 const quadVao = gl.createVertexArray();
@@ -163,12 +171,18 @@ function draw() {
     gl.useProgram(meshP); gl.bindVertexArray(meshVao);
     gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
     gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
-    gl.uniform1i(gl.getUniformLocation(meshP, 'uAtlas'), 1);
+    gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
     gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), ck('ck_li') ? 1 : 0);
+    gl.uniform1i(gl.getUniformLocation(meshP, 'uScreenLight'), lightSpace === 'screen' ? 1 : 0);
+    if (lightSpace === 'screen') {   // one shared screen-space light for all players
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLight);
+    }
     gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);   // per-vertex depth: self + inter-player
     // players stored back-to-front; depth-tested, so base/overlay shells sort correctly
     manifest.players.forEach((p, i) => {
-      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tAtlas[i]);
+      if (lightSpace === 'uv') {     // per-player UV atlas
+        gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tAtlas[i]);
+      }
       gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
       const [t0, t1] = p.tri_range;
       gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, idxType, t0 * 3 * idxSize);

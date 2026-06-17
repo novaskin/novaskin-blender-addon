@@ -144,27 +144,36 @@ re-rendering the atlas as emission.
 Still open: whether static keeps the legacy `mask`/`bbox`/`base_layer` outputs, and the
 positions.bin format (NSKA K=1 vs a dedicated blob) — both deferred to the build step.
 
-### Per-pixel lighting lattice — fixed by flat-shading the bake
+### Atlas light quality — the real cause was the rig's UV map ✅
 
-A sharp 512px bake showed a regular **grid** in the light, aligned with the skin pixels (visible
-in-browser, less clean than the screen-space light). Diagnosed: NOT JPEG 8×8 blocking (a lossless
-PNG bake had the same lattice) and NOT subsurf alone — the rig models **each skin pixel as its own
-quad** (a body = 352 polys = one quad per face texel) and **SMOOTH-shades** it (an "Auto Smooth"
-geometry-nodes modifier) over a pose-curved, subdivided surface, so the gray bake captures a
-per-skin-pixel *pillowed* normal variation. The screen-space light hid it by under-resolving at the
-player's on-screen size.
+The atlas showed a **grid** aligned with the skin pixels. After several dead ends (it is NOT JPEG
+blocking — a lossless bake still gridded; NOT geometry relief — the faces measure perfectly flat,
+0° normal spread; NOT Subdivision — the grid persists with it off; NOT a normal map — the material
+has none), the cause was found in the **rig's UV map**: every per-pixel face is **inset to ~50% of
+its 1/64 skin-pixel cell** (an anti-bleed trick so LINEAR filtering never crosses a pixel boundary),
+leaving **gaps** between faces. Those gaps bake as the grid, and they also make HD (512px) skins lose
+detail (only each pixel's centre is sampled). The UV is **stored in the mesh** (`UVMap` layer), not
+node-generated; the inset is uniform 50% across parts (a handful of faces are already full).
 
-A masked low-pass blur removed the lattice but softened the real light/shadow boundaries (the user
-wanted those crisp), so the fix is at the **source**: `_bake_player_light_atlas` **flat-shades the
-bake** — disables the per-pixel Auto-Smooth + Subdivision modifiers (`ATLAS_BAKE_FLAT=True`,
-snapshot/restore `show_render`) so each face is lit per its own orientation: uniform within, sharply
-separated at face edges. `ATLAS_BLUR_RADIUS` now defaults to **0** (the blur helpers stay as an
-optional knob for strongly pose-curved parts). The geometry stream still uses the dense mesh; only
-the light bake is flattened, and the atlas is UV-sampled, so the slight base-vs-dense surface
-mismatch is negligible for low-frequency light. The atlas part list is also `hide_render`-filtered
-so hidden slim-arm/overlay duplicates don't contaminate shared UV islands. Verified in-browser
-(3.2× zoom): clean per-face lighting, crisp light/shadow separation, lattice gone, skin pixels still
-crisp (NEAREST), no blur.
+**Fix — `_expand_pixel_uvs` (`STATIC_EXPAND_PIXEL_UVS=True`):** scale each face's UVs out around its
+own centre to fill the cell (`scale = (1/skin_px) / face_size`, clamped to [1, 2.5]; already-full
+faces unchanged). It modifies the base mesh UVs so the atlas bake AND the collected `mesh.bin` UVs
+both use them (they stay consistent, so `skin(uv) * atlas(uv)` still aligns); restored after the
+export. With the gaps gone, the atlas runs at **high resolution again without a grid**
+(`ATLAS_RES = 256`), so it captures **sub-pixel cast-shadow detail**, and **HD skins work**. The skin
+still samples NEAREST so 64px skins look identical. (Welded-vert count drops — adjacent faces' UVs
+now coincide at the closed gaps and merge.)
+
+Earlier-found contributors, still applied: bake **SMOOTH** (`ATLAS_BAKE_FLAT=False`, like the
+viewport — flat faceted the quads) and encode **LOSSLESS** (`ATLAS_FORMAT='WEBP'`,
+`ATLAS_LOSSLESS=True` — lossy JPEG's 8×8 blocks align with the skin pixels and re-introduce a grid).
+Verified in-browser: smooth realistic shadows, **no grid**, crisp skin pixels, sub-pixel detail,
+~28–38 KB per atlas at 256.
+
+`STATIC_LIGHT_SPACE` selects the path: **"uv"** (this atlas, default) or **"screen"** (one
+screen-space light image — `_static_render_light`, sampled by `gl_FragCoord` — kept as a fallback).
+The atlas part list is `hide_render`-filtered so hidden slim-arm/overlay duplicates don't contaminate
+shared UV islands. `ATLAS_BLUR_RADIUS` (0 = off) stays as an optional knob.
 
 ## Mesh + positions ✅ implemented
 

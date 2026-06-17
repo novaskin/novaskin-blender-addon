@@ -334,25 +334,43 @@ ANIM_CROP_PAD = 24
 # an overlay empty samples the base's own light, not a phantom shadow under it). See
 # docs/static-mesh-plan.md. The atlas stores display-encoded light (`_to_display`), saved with
 # the panel Quality "Illum/Shadow" format/quality -- same model as the screen-space `_light`.
-ATLAS_RES = 512            # atlas resolution (square); higher than the 64px skin for a smooth
-                           # light gradient (skin samples nearest, atlas linear). Up to 1024.
+# The grid in the bake was the rig's UV map: each skin-pixel face is INSET to ~50% of its 1/64
+# cell (an anti-bleed trick), so the gaps between faces baked as a grid (and HD skins lost detail).
+# STATIC_EXPAND_PIXEL_UVS scales each face's UVs out to fill its cell -> no gaps -> the atlas can run
+# at high resolution again WITHOUT a grid, capturing sub-pixel cast-shadow detail, and 512px skins
+# work. (With the expand off, keep ATLAS_RES low (~64) so the gaps average away.)
+STATIC_EXPAND_PIXEL_UVS = True   # expand the rig's inset per-pixel UVs to fill their skin-pixel cells
+STATIC_SKIN_PX = 64              # Minecraft skin resolution -> UV cell pitch = 1/64
+# Atlas resolution (panel: 64/128/256/512/1024). With the UV-expand on, higher = more sub-pixel light
+# detail and headroom for high-res player renders, with NO grid. Default 1024 (better too much than
+# too little). _apply_settings overrides it from the panel.
+ATLAS_RES = 1024
 ATLAS_BAKE_SAMPLES = None   # Cycles samples for the bake (denoised). None = follow the panel
                             # "Illum samples" (ILLUM_SAMPLES, live); set a fixed int to override.
-ATLAS_BAKE_MARGIN = 8      # UV island edge bleed (px), avoids seams at island borders
+ATLAS_BAKE_MARGIN = 4      # UV island edge bleed (px)
 ATLAS_OVERLAY_LABELS = ("hat", "jacket", "sleeve", "pant")   # 2nd-layer parts -> non-occluding
-# The rig models each skin pixel as its own quad and SMOOTH-shades it (an "Auto Smooth" geometry-
-# nodes modifier) over a pose-curved, subdivided surface -- so a sharp bake captures a per-skin-
-# pixel lighting LATTICE (a pillowed grid). The light should be low-frequency (the per-pixel detail
-# belongs to the skin albedo), with clean, crisp separation between a part's faces. Fix at the
-# SOURCE: bake FLAT-shaded on the un-subdivided cage (Auto Smooth + Subdivision off) -> each face
-# is lit per its own orientation, uniform within and sharply separated at face edges. (The geometry
-# stream still uses the dense mesh; only the light bake is flattened, and the atlas is UV-sampled.)
-ATLAS_BAKE_FLAT = True     # disable Auto-Smooth + Subdivision during the bake (clean per-face light)
-# Optional residual low-pass (atlas px; 8 px = 1 skin texel at 512/64). 0 = off -- flat shading
-# removes the lattice without it; raise only to soften faceting on strongly pose-curved parts.
+# The atlas is baked SMOOTH-shaded -- exactly like the viewport / screen-space light -- for soft,
+# realistic shadows. (Flat shading facets the rig's per-pixel quads into a blocky grid, which looked
+# worse than the screen render; smooth keeps the gradients.) Encode the atlas LOSSLESS: a lossy
+# JPEG's 8x8 DCT blocks land exactly on the skin pixels (512/64 = 8) and amplify the per-pixel
+# relief into a visible grid -- lossless WebP avoids that and is still tiny (the light is low-freq).
+ATLAS_BAKE_FLAT = False    # True = flat per-face bake (faceted, faster); False = smooth (recommended)
+ATLAS_FORMAT = 'WEBP'      # atlas image format ('WEBP' or 'PNG') -- lossless, NOT the panel's lossy
+ATLAS_LOSSLESS = True      # JPEG/lossy block boundaries align with skin pixels -> grid; keep lossless
+ATLAS_EXT = {'WEBP': '.webp', 'PNG': '.png'}.get(ATLAS_FORMAT, '.png')
+# Optional residual low-pass (atlas px; 8 px = 1 skin texel at 512/64). 0 = off; raise only if the
+# per-pixel relief still shows after smooth+lossless.
 ATLAS_BLUR_RADIUS = 0
 ATLAS_BLUR_PASSES = 2      # box passes (2-3 ~ Gaussian)
 STATIC_OUT_SUBDIR = "static"   # self-contained static-v2 export dir (alongside the legacy one)
+# Static lighting space:
+#   "uv"     = per-player UV light atlas (`_bake_player_light_atlas`). ONE texture per player, baked
+#              in one step, covering every region -- and overlay-reveal correct (Option B). With
+#              smooth shading + lossless encoding it matches the screen render closely. Default.
+#   "screen" = one screen-space light image (players rendered gray at screen resolution, like the
+#              old per-part export and the animated mode). Sampled by screen position. Use this if
+#              the atlas ever looks off on a different rig.
+STATIC_LIGHT_SPACE = "uv"
 # Static background + foreground images. The foreground is ALWAYS WebP because it needs a real
 # alpha channel (the scenery in front of the players over transparency); the matte split is a
 # VIDEO-only workaround (no in-browser video codec carries alpha on Safari) -- a still image
@@ -1540,12 +1558,12 @@ def _bake_player_light_atlas(player, atlas_res=None, samples=None, out_dir=None,
         rgba[:, 3] = 1.0                          # opaque light texture (JPEG has no alpha)
 
         label = player.get("label") or player.get("armature") or "player"
-        fname = (stem or "light_atlas") + LIGHTSHADOW_EXT
+        fname = (stem or "light_atlas") + ATLAS_EXT
         adir = out_dir or os.path.join(_abs(OUT_DIR), label)
         path = os.path.join(adir, fname)
         os.makedirs(adir, exist_ok=True)
-        _save_image(rgba.reshape(-1), atlas_res, atlas_res, path,
-                    colorspace='Non-Color', file_format=LIGHTSHADOW_FORMAT)
+        _save_image(rgba.reshape(-1), atlas_res, atlas_res, path, colorspace='Non-Color',
+                    file_format=ATLAS_FORMAT, lossless=ATLAS_LOSSLESS)
         rel = os.path.relpath(path, _abs(OUT_DIR)).replace("\\", "/")
         print(f"[ATLAS] saved {rel}")
         return rel
@@ -2663,6 +2681,66 @@ def _anim_write_anim(path, keys, quant, keys_fps):
     return K, V
 
 
+def _expand_pixel_uvs(parts, skin_px=None):
+    """The rig insets each per-pixel UV face to ~50% of its skin-pixel cell (an anti-bleed trick),
+    leaving gaps that bake as a grid and lose HD-skin detail. SNAP each per-pixel quad to fill its
+    whole cell (cell = 1/skin_px): the cell is `floor(centre/cell)`, and each loop is sent to the
+    cell corner on its own side. This handles every case the rig throws at it:
+      * inset faces                 -> grow to the full cell;
+      * already-full faces          -> unchanged (already at the cell bounds, e.g. arm/sleeve bottoms);
+      * degenerate faces (one axis collapsed to extent 0, e.g. the front face's last row, w=1/128,
+        h=0) -> the collapsed axis is rebuilt from the quad's two opposite edges (the loop-pair that
+        varies in the OTHER axis), one edge to each cell side. The top/bottom choice there is
+        arbitrary but harmless: a skin pixel is ~uniform, so flipping a single cell's V is invisible.
+    The skin still samples NEAREST, so 64px skins look identical (the pixel centre is unchanged) and
+    512px skins now use the full pixel. Modifies the BASE mesh UVs (Subdivision interpolates them),
+    so the atlas bake AND the collected geometry stay consistent. Returns `restore()`. Dedups by mesh."""
+    skin_px = skin_px or STATIC_SKIN_PX
+    cell = 1.0 / float(skin_px)
+    edges = ((0, 1), (1, 2), (2, 3), (3, 0))
+    saved, meshes = [], set()
+    for o in parts:
+        me = getattr(o, "data", None)
+        uvl = me.uv_layers.active if me else None
+        if uvl is None or me in meshes:
+            continue
+        meshes.add(me)
+        orig = np.empty(len(uvl.data) * 2, 'f'); uvl.data.foreach_get("uv", orig)
+        saved.append((uvl, orig))
+        uv = orig.reshape(-1, 2).copy()
+        for poly in me.polygons:
+            li = list(poly.loop_indices)
+            if len(li) != 4:
+                continue                                            # per-pixel faces are quads
+            pts = uv[li]
+            cu, cv = pts[:, 0].mean(), pts[:, 1].mean()
+            col = int(np.floor(cu / cell)); row = int(np.floor(cv / cell))
+            u0, u1, v0, v1 = col * cell, (col + 1) * cell, row * cell, (row + 1) * cell
+            new = pts.copy()
+            if pts[:, 0].max() - pts[:, 0].min() > 1e-6:            # U from each loop's side
+                new[:, 0] = np.where(pts[:, 0] > cu, u1, u0)
+            else:                                                  # U collapsed: rebuild from V-edges
+                vert = [e for e in edges if abs(pts[e[0], 1] - pts[e[1], 1]) > 1e-6]
+                if len(vert) == 2:
+                    new[list(vert[0]), 0] = u0; new[list(vert[1]), 0] = u1
+            if pts[:, 1].max() - pts[:, 1].min() > 1e-6:            # V from each loop's side
+                new[:, 1] = np.where(pts[:, 1] > cv, v1, v0)
+            else:                                                  # V collapsed: rebuild from U-edges
+                horiz = [e for e in edges if abs(pts[e[0], 0] - pts[e[1], 0]) > 1e-6]
+                if len(horiz) == 2:
+                    new[list(horiz[0]), 1] = v0; new[list(horiz[1]), 1] = v1
+            uv[li] = new
+        uvl.data.foreach_set("uv", uv.reshape(-1))
+        me.update()
+
+    def restore():
+        for uvl, orig in saved:
+            uvl.data.foreach_set("uv", orig)
+        for m in meshes:
+            m.update()
+    return restore
+
+
 def _static_collect(players, W, H):
     """Like `_anim_collect_static`, but for the static export: includes BOTH the base parts AND
     the overlays (2nd layer) -- the base first, then the overlays per player, in painter's order
@@ -2888,7 +2966,34 @@ def _static_render_images(players, out_dir=None):
         fg[:, 3] = alpha
         _save_image(fg.reshape(-1), rW, rH, os.path.join(out_dir, "foreground.webp"),
                     file_format='WEBP', lossless=STATIC_FG_LOSSLESS, quality=STATIC_FG_QUALITY)
-        return {"background": bg_rel, "foreground": fg_rel, "resolution": [W, H]}
+
+        # 3) LIGHT (screen-space): the visible players rendered GRAY, scenery camera-invisible but
+        # still lighting/shadowing -- the combined lit-gray at screen resolution, like the old
+        # per-part export and the animated 'light' frame. VIEWPORT-quality soft shadows, no UV
+        # lattice. The renderer samples it by screen position and relights as skin*light*2.
+        light_rel = None
+        if STATIC_LIGHT_SPACE == "screen":
+            scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in player_set]
+            gray = _gray_diffuse_material()
+            sv = _swap_materials(player_objs, gray)
+            sc2 = {o: o.visible_camera for o in scenery}
+            for o in scenery:
+                o.visible_camera = False
+            bpy.context.view_layer.update()
+            L, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+            for o, v in sc2.items():
+                o.visible_camera = v
+            _restore_materials(sv)
+            la = np.clip(L[:, 3], 0.0, 1.0)
+            lst = np.where(la[:, None] > 1e-4, L[:, :3] / np.maximum(la[:, None], 1e-4), 0.0)
+            lst = _anim_dilate_light(lst, la > 0.01, rW, rH)
+            lbuf = np.ones((L.shape[0], 4), 'float32')
+            lbuf[:, :3] = _lin_to_srgb(lst)
+            _save_image(lbuf.reshape(-1), rW, rH, os.path.join(out_dir, "light" + STATIC_BG_EXT),
+                        file_format=STATIC_BG_FORMAT, quality=STATIC_BG_QUALITY)
+            light_rel = STATIC_OUT_SUBDIR + "/light" + STATIC_BG_EXT
+        return {"background": bg_rel, "foreground": fg_rel, "light": light_rel,
+                "resolution": [W, H]}
     finally:
         sess.restore()
         s.render.use_simplify, s.render.simplify_subdivision_render = simp
@@ -2901,19 +3006,23 @@ def _static_render_images(players, out_dir=None):
 
 
 def _static_write_manifest(out_dir, geo, imgs, atlas_by_label):
-    """Write `static/manifest.json` tying the static-v2 pieces together (paths are bare file
-    names, relative to the manifest's own dir). `light_space: "uv"` tells the renderer to sample
-    the per-player atlas in UV space; each player carries its tri/overlay ranges + atlas file."""
+    """Write `static/manifest.json` tying the static-v2 pieces together (paths are bare file names,
+    relative to the manifest's own dir). `light_space` selects how the renderer samples the light:
+    "screen" -> one `light` image sampled by screen position (viewport-quality, default); "uv" ->
+    each player's `atlas` sampled by uv. Players carry their tri/overlay ranges."""
+    light_space = STATIC_LIGHT_SPACE
     players_meta = []
     for pm in geo["players"]:
         e = dict(pm)
-        e["atlas"] = atlas_by_label.get(pm["label"])
+        if light_space == "uv":
+            e["atlas"] = atlas_by_label.get(pm["label"])
         players_meta.append(e)
+    light_term = ("atlas(uv)" if light_space == "uv" else "light(screenUv)")
     manifest = {
         "static_version": 1,
         "addon_version": ADDON_VERSION,
         "resolution": geo["resolution"],
-        "light_space": "uv",
+        "light_space": light_space,
         "background": os.path.basename(imgs["background"]),
         "foreground": os.path.basename(imgs["foreground"]),   # WebP with alpha -- no matte
         "foreground_alpha": "straight",                       # out = fg.rgb*fg.a + behind*(1-fg.a)
@@ -2928,12 +3037,15 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label):
                                  "z = (camDepth-zmin)/(zmax-zmin)*zq for the depth test "
                                  "(shared scale, smaller = nearer)")},
         "players": players_meta,
-        "shader_note": ("draw background; draw each player mesh depth-tested with "
-                        "color = skin(uv) * atlas(uv) * 2 (display space), base tris then overlay "
-                        "tris [overlay_tri_start] (alpha-discard the overlay's transparent "
-                        "texels); composite foreground (straight alpha) over the top: "
+        "shader_note": (f"draw background; draw each player mesh depth-tested with "
+                        f"color = skin(uv) * {light_term} * 2, base tris then overlay tris "
+                        "[overlay_tri_start] (alpha-discard the overlay's transparent texels); "
+                        "composite foreground (straight alpha) over the top: "
                         "out = fg.rgb*fg.a + behind*(1 - fg.a)."),
     }
+    if light_space == "screen" and imgs.get("light"):
+        # screen-space light image, sampled at the fragment's screen pixel (full frame, no crop)
+        manifest["light"] = os.path.basename(imgs["light"])
     with open(os.path.join(out_dir, "manifest.json"), "w") as fh:
         json.dump(manifest, fh, indent=2)
     return manifest
@@ -2949,38 +3061,53 @@ def _static_export_steps(players, op=None, out_dir=None):
     restored -- so it is always clean."""
     out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
     os.makedirs(out_dir, exist_ok=True)
-    total = len(players) + 3            # atlases (one per player) + geometry + images + manifest
+    uv_light = (STATIC_LIGHT_SPACE == "uv")        # else screen-space light (default)
+    total = (len(players) if uv_light else 0) + 3  # atlases + geometry + images + manifest
     state = {"done": 0}
     def prog(msg):
         state["done"] += 1
         print(f"[STATIC {state['done']}/{total}] {msg}")
         return (state["done"] / total, msg)
-    # 1) per-player UV light atlases (normal look so the bake sees the real scene lighting)
-    atlas_by_label = {}
-    sess = _Session()
+    # Expand the rig's inset per-pixel UVs to fill their skin-pixel cells (no gap-grid in the atlas,
+    # high-res atlas usable again, HD skins work). Modifies the base mesh UVs so the atlas bake AND
+    # the collected mesh.bin UVs both use them; restored in the finally.
+    restore_uv = None
+    if STATIC_EXPAND_PIXEL_UVS:
+        restore_uv = _expand_pixel_uvs([o for p in players for o in (p.get("uv_parts") or [])])
+        bpy.context.view_layer.update()
     try:
-        sess.restore_visibility()
-        bpy.context.view_layer.update()
-        for p in players:
-            rel = _bake_player_light_atlas(p, out_dir=out_dir, stem=f"{p['label']}_atlas")
-            if rel:
-                atlas_by_label[p["label"]] = os.path.basename(rel)
-            yield prog(f"atlas {p['label']}")
+        # 1) per-player UV light atlases (only for light_space="uv"; the screen-space light is
+        #    rendered in step 3 instead). Baked in the normal look so it sees the real lighting.
+        atlas_by_label = {}
+        if uv_light:
+            sess = _Session()
+            try:
+                sess.restore_visibility()
+                bpy.context.view_layer.update()
+                for p in players:
+                    rel = _bake_player_light_atlas(p, out_dir=out_dir, stem=f"{p['label']}_atlas")
+                    if rel:
+                        atlas_by_label[p["label"]] = os.path.basename(rel)
+                    yield prog(f"atlas {p['label']}")
+            finally:
+                sess.restore()
+                bpy.context.view_layer.update()
+        # 2) DENSE mesh.bin + positions.bin (K=1)
+        geo = _static_write_geometry(players, out_dir=out_dir)
+        yield prog(f"mesh.bin / positions.bin ({geo['tris']} tris)")
+        # 3) background + foreground images (+ screen-space light when light_space="screen")
+        imgs = _static_render_images(players, out_dir=out_dir)
+        yield prog("background / foreground" + ("" if uv_light else " / light"))
+        # 4) manifest
+        manifest = _static_write_manifest(out_dir, geo, imgs, atlas_by_label)
+        yield prog("manifest.json")
+        print(f"[STATIC] export complete -> {out_dir} ({geo['tris']} tris, "
+              f"light={STATIC_LIGHT_SPACE})")
+        return manifest
     finally:
-        sess.restore()
-        bpy.context.view_layer.update()
-    # 2) DENSE mesh.bin + positions.bin (K=1)
-    geo = _static_write_geometry(players, out_dir=out_dir)
-    yield prog(f"mesh.bin / positions.bin ({geo['tris']} tris)")
-    # 3) background + foreground (WebP) still images
-    imgs = _static_render_images(players, out_dir=out_dir)
-    yield prog("background / foreground")
-    # 4) manifest
-    manifest = _static_write_manifest(out_dir, geo, imgs, atlas_by_label)
-    yield prog("manifest.json")
-    print(f"[STATIC] export complete -> {out_dir} "
-          f"({geo['tris']} tris, {len(atlas_by_label)} atlases)")
-    return manifest
+        if restore_uv is not None:
+            restore_uv()
+            bpy.context.view_layer.update()
 
 
 def _static_export(players, out_dir=None, op=None):
@@ -3330,6 +3457,13 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         default='JPEG')
     jpeg_quality: IntProperty(name="Quality", default=90, min=1, max=100,
                               description="JPEG/WebP quality")
+    atlas_res: EnumProperty(
+        name="Atlas res",
+        description="Light-atlas texture size for the static (v2) export. Higher keeps finer "
+                    "sub-pixel shadows; 1024 is generous (\"better too much than too little\")",
+        items=[('64', "64", ""), ('128', "128", ""), ('256', "256", ""),
+               ('512', "512", ""), ('1024', "1024", "")],
+        default='1024')
     ui_tab: EnumProperty(
         name="Section",
         items=[('EXPORT', "Export", "Output, layers and quality for the static export",
@@ -3367,6 +3501,7 @@ def _apply_settings(scene, draft=False):
     g["FIX_2LAYER_POSITION"] = st.fix_2layer_position
     g["LIGHTSHADOW_FORMAT"] = st.lightshadow_format
     g["JPEG_QUALITY"] = st.jpeg_quality
+    g["ATLAS_RES"] = int(st.atlas_res)
     g["UV_EXT"] = {'OPEN_EXR': '.exr', 'WEBP': '.webp'}.get(st.uv_format, '.png')
     g["LIGHTSHADOW_EXT"] = {'JPEG': '.jpg', 'WEBP': '.webp'}.get(st.lightshadow_format,
                                                                  '.png')
@@ -3807,6 +3942,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             box = layout.box()
             box.label(text="Static (mesh v2, beta)", icon='MESH_DATA')
             box.operator("render.novaskin_static", icon='RENDER_STILL')
+            box.prop(st, "atlas_res")
             box.label(text="vertices + UV light atlas, current frame", icon='INFO')
 
             box = layout.box()
