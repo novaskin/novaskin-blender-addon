@@ -4319,21 +4319,19 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                 row.prop(st, "exr_codec", text="")
                 box.label(text="+ light layer (when illum on)", icon='LIGHT')
 
-            box = layout.box()
-            box.label(text="Render", icon='RENDER_STILL')
-            if running:
-                box.label(text="rendering…", icon='SORTTIME')
-            elif st.export_mesh:
+            if not running:               # while running, the top progress bar is the indicator
+                box = layout.box()
+                box.label(text="Render", icon='RENDER_STILL')
                 col = box.column()
                 col.scale_y = 1.4
-                col.operator("render.novaskin_static", text="Render Mesh (v2)", icon='MESH_DATA')
-            else:
-                col = box.column()
-                col.scale_y = 1.4
-                col.operator("render.novaskin", text="Render NovaSkin (per-part)",
-                             icon='RENDER_STILL').draft = False
-                box.operator("render.novaskin", text="Render Draft (fast preview)",
-                             icon='MOD_FLUID').draft = True
+                if st.export_mesh:
+                    col.operator("render.novaskin_static", text="Render Mesh (v2)",
+                                 icon='MESH_DATA')
+                else:
+                    col.operator("render.novaskin", text="Render NovaSkin (per-part)",
+                                 icon='RENDER_STILL').draft = False
+                    box.operator("render.novaskin", text="Render Draft (fast preview)",
+                                 icon='MOD_FLUID').draft = True
 
             if WALLPAPER_TOOL_URL:
                 # web links honor the "Allow Online Access" preference (extension guideline)
@@ -4400,9 +4398,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         elif tab == 'ANIM':
             box = layout.box()
             box.label(text="Animated (beta)", icon='RENDER_ANIMATION')
-            if running:
-                box.label(text="rendering…", icon='SORTTIME')
-            else:
+            if not running:               # while running, the top progress bar is the indicator
                 box.operator("render.novaskin_animated", icon='RENDER_ANIMATION').draft = False
                 box.operator("render.novaskin_animated",
                              text=f"Export Animation Draft (~{ANIM_DRAFT_SECONDS}s)",
