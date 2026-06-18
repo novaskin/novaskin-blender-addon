@@ -70,6 +70,11 @@ const skins = await Promise.all(manifest.players.map(() => loadImage('data/skin.
 // optional toggleable scenery sprites (straight-alpha, full-frame), composited by camera_depth
 const layers = manifest.layers || [];
 const layerImgs = await Promise.all(layers.map(L => loadImage(DIR + L.image + _cb)));
+// per-entity shadow ratios (display-space multiply, 1 = untouched), keyed to player i / layer i
+const playerShadowImgs = await Promise.all(
+  manifest.players.map(p => p.shadow ? loadImage(DIR + p.shadow + _cb) : null));
+const layerShadowImgs = await Promise.all(
+  layers.map(L => L.shadow ? loadImage(DIR + L.shadow + _cb) : null));
 
 // --- GL setup ---
 const canvas = document.getElementById('gl');
@@ -130,6 +135,9 @@ const tBg = tex(), tFg = tex(), tLight = tex(false);   // tLight: LINEAR screen-
 const tAtlas = atlasImgs.map(img => { const t = tex(false); upload(t, img); return t; });  // LINEAR
 const tSkins = skins.map(img => { const t = tex(true); upload(t, img); return t; });        // NEAREST
 const tLayers = layerImgs.map(img => { const t = tex(false); upload(t, img); return t; });  // LINEAR sprites
+const mkShadow = (img) => { if (!img) return null; const t = tex(false); upload(t, img); return t; };
+const tPlayerShadow = playerShadowImgs.map(mkShadow);   // multiply ratio, LINEAR
+const tLayerShadow = layerShadowImgs.map(mkShadow);
 upload(tBg, imgBg); upload(tFg, imgFg);
 if (imgLight) upload(tLight, imgLight);
 
@@ -200,8 +208,19 @@ function draw() {
 
   if (ck('ck_bg')) blitQuad(tBg);
 
-  const showPlayers = ck('ck_pl');                   // walk the merged list, back -> front
-  for (const it of drawOrder) {
+  const showPlayers = ck('ck_pl');
+  // shadow pass: multiply each ENABLED entity's ratio onto the scenery (behind the meshes).
+  // out = bg * ratio (blendFunc ZERO, SRC_COLOR); ratio is ~1 outside the shadow -> no-op there.
+  if (ck('ck_sh')) {
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ZERO, gl.SRC_COLOR);
+    if (showPlayers) for (let i = 0; i < tPlayerShadow.length; i++)
+      if (tPlayerShadow[i]) blitQuad(tPlayerShadow[i]);
+    for (let i = 0; i < tLayerShadow.length; i++)
+      if (tLayerShadow[i] && layerOn(i)) blitQuad(tLayerShadow[i]);
+    gl.disable(gl.BLEND);
+  }
+
+  for (const it of drawOrder) {                      // walk the merged list, back -> front
     if (it.kind === 'player') { if (showPlayers) drawPlayer(it.i); }
     else if (layerOn(it.i)) blitQuadBlend(tLayers[it.i]);   // flat sprite, painter's order
   }
@@ -228,7 +247,7 @@ function setSkin(i, source) { upload(tSkins[i], source); draw(); }
     lab.appendChild(inp); box.appendChild(lab);
   });
 }
-for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_fg'])
+for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_sh', 'ck_fg'])
   document.getElementById(id).addEventListener('change', draw);
 
 // per-layer toggles (one checkbox each, default on), labelled by the layer's object name

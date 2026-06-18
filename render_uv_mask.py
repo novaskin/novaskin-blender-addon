@@ -389,6 +389,14 @@ STATIC_BG_EXT = {'JPEG': '.jpg', 'WEBP': '.webp'}.get(STATIC_BG_FORMAT, '.png')
 STATIC_FG_LOSSLESS = True      # lossless WebP -> crisp alpha edge (recommended)
 STATIC_FG_QUALITY = 90         # used only when STATIC_FG_LOSSLESS is False
 
+# Per-entity shadow (toggleable multiply ratio). The ratio is the LUMINANCE darkening
+# clip(lum(sh)/lum(clean), 0, 1) -- a single achromatic factor, NOT the per-channel ratio, so
+# render-noise differences between the two renders never tint the unaffected scenery (the per-channel
+# ratio turned low-blue foliage yellow). STATIC_SHADOW_FLOOR drops darkening below this fraction to
+# 0 (= keep ratio at 1): kills the faint denoiser-residual speckle far from the entity while keeping
+# real cast shadows.
+STATIC_SHADOW_FLOOR = 0.06     # darkening (1-ratio) below this -> no shadow (noise floor)
+
 # Web wallpaper tool (the panel has a button that opens this URL in the browser).
 WALLPAPER_TOOL_URL = "https://minecraft.novaskin.me/wallpapers/tools/blender/"
 # The rig this exporter targets. Blender extensions can't declare another extension as a
@@ -2884,24 +2892,30 @@ def _static_write_geometry(players, out_dir=None):
         bpy.context.view_layer.update()
 
 
-def _static_render_images(players, out_dir=None, layer_mesh_names=None):
-    """Render the static `background` + `foreground` still images for the CURRENT frame, matching
-    the DENSE mesh (AntiLag off, no simplify). `background.<ext>` = the scene with the players
-    camera-invisible (their cast shadows stay baked in), opaque. Meshes in `layer_mesh_names`
-    (optional toggleable layers) are HIDDEN from both images -- they are exported as independent
-    sprites (`_static_render_layers`) and composited by depth, so baking them here would double-draw
-    them and defeat the toggle. `foreground.webp` = the scenery
-    IN FRONT of the players (scenery-with-players-holdout INTERSECT the player silhouette) saved
-    with a real WebP **alpha** channel (straight) -- no matte (that split is a video-only
-    workaround). The renderer composites it as `out = fg.rgb*fg.a + behind*(1-fg.a)` (multiply by
-    alpha at sample time), so the silhouette AA edge blends over the player without a fringe.
-    Returns {'background', 'foreground', 'resolution'} (rel paths). Self-contained: restores
+def _static_render_images(players, out_dir=None, groups=None):
+    """Render the static scenery images for the CURRENT frame, matching the DENSE mesh (AntiLag
+    off, no simplify), plus a TOGGLEABLE per-entity shadow.
+      * `background.<ext>` = the CLEAN scene -- every player AND optional layer hidden (no baked
+        shadows). The players/layers and their shadows are composited on top in the browser.
+      * `foreground.webp` = the scenery IN FRONT of the players (scenery-with-players-holdout
+        INTERSECT the player silhouette), straight WebP alpha -- no matte (a video-only workaround);
+        composited `out = fg.rgb*fg.a + behind*(1-fg.a)` so the AA edge blends without a fringe.
+      * `<entity>_shadow.webp` per player and per layer group = the legacy DISPLAY-space multiply
+        ratio `clip(sh_display / clean_display, 0, 1)` (1 = untouched): the entity rendered
+        camera-invisible (still casting / reflecting / refracting), every OTHER entity hidden, over
+        the SAME clean baseline. The browser multiplies the clean bg by each ENABLED entity's ratio
+        before drawing the meshes, so a toggle removes the entity and its shadow together. Captures
+        cast shadows AND reflections darker than the water (brighter reflections clamp to 1 -- a
+        future additive pass). Optional layers (`groups`) are kept out of bg/fg (their own sprites).
+    Returns {'background', 'foreground', 'light', 'shadows', 'resolution'}. Self-contained: restores
     AntiLag/simplify, the full session, and visibility."""
     s = bpy.context.scene
     W = s.render.resolution_x * MASK_RES_PCT // 100
     H = s.render.resolution_y * MASK_RES_PCT // 100
     out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
     os.makedirs(out_dir, exist_ok=True)
+    groups = groups or []
+    layer_mesh_names = {m.name for g in groups for m in g["meshes"]}
     char_names = {o.name for p in players for o in p["char_all"]}
     arms = list({p["arm"] for p in players if p.get("arm")})
     simp = (s.render.use_simplify, s.render.simplify_subdivision_render)
@@ -2925,19 +2939,26 @@ def _static_render_images(players, out_dir=None, layer_mesh_names=None):
         bpy.context.view_layer.update()
         player_objs = [o for o in s.objects if o.name in char_names and not o.hide_render]
         player_set = {o.name for o in player_objs}
+        entity_names = char_names | layer_mesh_names   # everything that is composited on top
 
-        # 1) BACKGROUND: players camera-invisible (still cast shadows -> baked into the bg)
-        sc = {o: o.visible_camera for o in player_objs}
-        for o in player_objs:
-            o.visible_camera = False
+        # 1) BACKGROUND: the CLEAN scene -- every player + layer hidden (drivers muted), so no
+        #    baked shadows; the entities and their shadows composite on top in the browser.
+        sess.mute_drivers(True)
+        clean_hr = {o: o.hide_render for o in s.objects if o.name in entity_names}
+        for o in clean_hr:
+            o.hide_render = True
         bpy.context.view_layer.update()
         bg, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT)
-        for o, v in sc.items():
-            o.visible_camera = v
+        clean_disp = np.clip(_to_display(bg), 1e-4, None)   # shadow-ratio baseline (display space)
         buf = np.ones((bg.shape[0], 4), 'float32')
         buf[:, :3] = _to_display(bg)
         _save_image(buf.reshape(-1), rW, rH, os.path.join(out_dir, "background" + STATIC_BG_EXT),
                     file_format=STATIC_BG_FORMAT, quality=STATIC_BG_QUALITY)
+        sess.restore_visibility()                           # drivers back; layers stay hidden
+        for o in s.objects:
+            if o.name in layer_mesh_names:
+                o.hide_render = True
+        bpy.context.view_layer.update()
 
         # 2) FOREGROUND: scenery-with-players-holdout INTERSECT the player silhouette, WebP+alpha
         hold = {o: o.is_holdout for o in player_objs}
@@ -2998,8 +3019,50 @@ def _static_render_images(players, out_dir=None, layer_mesh_names=None):
             _save_image(lbuf.reshape(-1), rW, rH, os.path.join(out_dir, "light" + STATIC_BG_EXT),
                         file_format=STATIC_BG_FORMAT, quality=STATIC_BG_QUALITY)
             light_rel = STATIC_OUT_SUBDIR + "/light" + STATIC_BG_EXT
+
+        # 4) per-entity TOGGLEABLE shadow: each entity camera-invisible (still casting / reflecting)
+        #    over the same clean baseline, every OTHER entity hidden -> display-space multiply ratio.
+        shadows = {}
+        entities = ([("player", p["label"], list(p["char_all"])) for p in players]
+                    + [("layer", g["name"], list(g["meshes"])) for g in groups])
+        for kind, name, objs in entities:
+            obj_names = {o.name for o in objs}
+            sess.restore_visibility()                       # active entity keeps its real visibility
+            muted = []
+            for o in s.objects:                             # hide + mute every OTHER entity
+                if o.name in entity_names and o.name not in obj_names:
+                    if o.animation_data:
+                        for d in o.animation_data.drivers:
+                            if d.data_path == "hide_render" and not d.mute:
+                                d.mute = True
+                                muted.append(d)
+                    o.hide_render = True
+            cam_save = {o: o.visible_camera for o in objs if o.type == 'MESH'}
+            for o in cam_save:                              # camera-invisible: only casts/reflects
+                o.visible_camera = False
+            bpy.context.view_layer.update()
+            try:
+                sh, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+            finally:
+                for o, v in cam_save.items():
+                    o.visible_camera = v
+                for d in muted:
+                    d.mute = False
+            # LUMINANCE darkening (achromatic): a single factor per texel, so render-noise between
+            # the two renders never tints the unaffected scenery. Drop sub-floor darkening to 0.
+            w709 = np.array([0.2126, 0.7152, 0.0722], 'float32')
+            rL = np.clip((_to_display(sh) @ w709) / np.maximum(clean_disp @ w709, 1e-3), 0.0, 1.0)
+            dark = np.clip((1.0 - rL) - STATIC_SHADOW_FLOOR, 0.0, 1.0)   # noise-floor suppression
+            r = 1.0 - dark
+            sbuf = np.ones((r.shape[0], 4), 'float32')
+            sbuf[:, :3] = r[:, None]
+            fn = _layer_safe_name(name) + "_shadow.webp"
+            _save_image(sbuf.reshape(-1), rW, rH, os.path.join(out_dir, fn),
+                        file_format='WEBP', quality=STATIC_BG_QUALITY)
+            shadows[name] = fn
+            print(f"[STATIC shadow] {kind} {name} -> {fn}")
         return {"background": bg_rel, "foreground": fg_rel, "light": light_rel,
-                "resolution": [W, H]}
+                "shadows": shadows, "resolution": [W, H]}
     finally:
         sess.restore()
         s.render.use_simplify, s.render.simplify_subdivision_render = simp
@@ -3089,12 +3152,16 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None):
     each player's `atlas` sampled by uv. Players carry their tri/overlay ranges. `layers` (optional)
     are independent scenery sprites, each with a `camera_depth` for depth-ordered compositing."""
     light_space = STATIC_LIGHT_SPACE
+    shadows = imgs.get("shadows") or {}
     players_meta = []
     for pm in geo["players"]:
         e = dict(pm)
         if light_space == "uv":
             e["atlas"] = atlas_by_label.get(pm["label"])
+        e["shadow"] = shadows.get(pm["label"])    # display-space multiply ratio, toggleable
         players_meta.append(e)
+    if layers:
+        layers = [dict(l, shadow=shadows.get(l["name"])) for l in layers]
     light_term = ("atlas(uv)" if light_space == "uv" else "light(screenUv)")
     manifest = {
         "static_version": 1,
@@ -3115,13 +3182,14 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None):
                                  "z = (camDepth-zmin)/(zmax-zmin)*zq for the depth test "
                                  "(shared scale, smaller = nearer)")},
         "players": players_meta,
-        "shader_note": (f"draw background; then draw players and `layers` together back -> front "
-                        f"by camera_depth (larger = farther): a player mesh is depth-tested with "
-                        f"color = skin(uv) * {light_term} * 2, base tris then overlay tris "
-                        "[overlay_tri_start] (alpha-discard the overlay's transparent texels); a "
-                        "layer is a straight-alpha sprite quad (depth test off, painter's order). "
-                        "Finally composite foreground (straight alpha) over the top: "
-                        "out = fg.rgb*fg.a + behind*(1 - fg.a)."),
+        "shader_note": (f"draw the CLEAN background; multiply each ENABLED entity's `shadow` ratio "
+                        f"(players + layers, display-space, 1=untouched) onto it; then draw players "
+                        f"and `layers` together back -> front by camera_depth (larger = farther): a "
+                        f"player mesh is depth-tested with color = skin(uv) * {light_term} * 2, base "
+                        "tris then overlay tris [overlay_tri_start] (alpha-discard the overlay's "
+                        "transparent texels); a layer is a straight-alpha sprite quad (depth test "
+                        "off, painter's order). Finally composite foreground (straight alpha) over "
+                        "the top: out = fg.rgb*fg.a + behind*(1 - fg.a)."),
     }
     if layers:
         manifest["layers"] = layers           # scenery sprites, ordered back -> front
@@ -3146,7 +3214,6 @@ def _static_export_steps(players, op=None, out_dir=None):
     os.makedirs(out_dir, exist_ok=True)
     uv_light = (STATIC_LIGHT_SPACE == "uv")        # else screen-space light (default)
     groups = discover_layers()                     # optional toggleable scenery layers (sprites)
-    layer_mesh_names = {m.name for g in groups for m in g["meshes"]}
     # atlases + geometry + images + (layers) + manifest
     total = (len(players) if uv_light else 0) + 3 + (1 if groups else 0)
     state = {"done": 0}
@@ -3181,11 +3248,11 @@ def _static_export_steps(players, op=None, out_dir=None):
         # 2) DENSE mesh.bin + positions.bin (K=1)
         geo = _static_write_geometry(players, out_dir=out_dir)
         yield prog(f"mesh.bin / positions.bin ({geo['tris']} tris)")
-        # 3) background + foreground images (+ screen-space light when light_space="screen"),
-        #    with the toggleable layers excluded (they are their own sprites)
-        imgs = _static_render_images(players, out_dir=out_dir,
-                                     layer_mesh_names=layer_mesh_names)
-        yield prog("background / foreground" + ("" if uv_light else " / light"))
+        # 3) clean background + foreground (+ screen-space light when light_space="screen") +
+        #    per-entity toggleable shadow ratios. Layers are excluded from bg/fg (own sprites).
+        imgs = _static_render_images(players, out_dir=out_dir, groups=groups)
+        yield prog("background / foreground / shadows"
+                   + ("" if uv_light else " / light"))
         # 4) optional-layer sprites (depth-ordered scenery, toggleable in the wallpaper)
         layer_infos = []
         if groups:
