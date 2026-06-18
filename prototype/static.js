@@ -67,9 +67,15 @@ const imgLight = (lightSpace === 'screen' && manifest.light)
 const atlasImgs = (lightSpace === 'uv')
   ? await Promise.all(manifest.players.map(p => loadImage(DIR + p.atlas + _cb))) : [];
 const skins = await Promise.all(manifest.players.map(() => loadImage('data/skin.png' + _cb)));
-// optional toggleable scenery sprites (straight-alpha, full-frame), composited by camera_depth
+// optional toggleable scenery layers, composited by camera_depth. type 'mesh' = retexturable
+// geometry (its own base texture + UV atlas, drawn like a player); type 'sprite' = flat image.
 const layers = manifest.layers || [];
-const layerImgs = await Promise.all(layers.map(L => loadImage(DIR + L.image + _cb)));
+const layerTexImgs = await Promise.all(layers.map(
+  L => (L.type === 'mesh' && L.tex) ? loadImage(DIR + L.tex + _cb) : null));
+const layerAtlasImgs = await Promise.all(layers.map(
+  L => (L.type === 'mesh' && L.atlas) ? loadImage(DIR + L.atlas + _cb) : null));
+const layerSpriteImgs = await Promise.all(layers.map(
+  L => (L.type !== 'mesh' && L.image) ? loadImage(DIR + L.image + _cb) : null));
 // per-entity shadow ratios (display-space multiply, 1 = untouched), keyed to player i / layer i
 const playerShadowImgs = await Promise.all(
   manifest.players.map(p => p.shadow ? loadImage(DIR + p.shadow + _cb) : null));
@@ -134,7 +140,10 @@ function upload(t, srcEl) {
 const tBg = tex(), tFg = tex(), tLight = tex(false);   // tLight: LINEAR screen-space light
 const tAtlas = atlasImgs.map(img => { const t = tex(false); upload(t, img); return t; });  // LINEAR
 const tSkins = skins.map(img => { const t = tex(true); upload(t, img); return t; });        // NEAREST
-const tLayers = layerImgs.map(img => { const t = tex(false); upload(t, img); return t; });  // LINEAR sprites
+const mkTex = (nearest) => (img) => { if (!img) return null; const t = tex(nearest); upload(t, img); return t; };
+const tLayerTex = layerTexImgs.map(mkTex(true));        // NEAREST swappable base texture
+const tLayerAtlas = layerAtlasImgs.map(mkTex(false));   // LINEAR UV light atlas
+const tLayerSprite = layerSpriteImgs.map(mkTex(false)); // LINEAR flat sprite
 const mkShadow = (img) => { if (!img) return null; const t = tex(false); upload(t, img); return t; };
 const tPlayerShadow = playerShadowImgs.map(mkShadow);   // multiply ratio, LINEAR
 const tLayerShadow = layerShadowImgs.map(mkShadow);
@@ -183,21 +192,29 @@ const drawOrder = [
 ].sort((a, b) => b.depth - a.depth);
 const layerOn = (i) => { const e = document.getElementById('ck_layer_' + i); return !e || e.checked; };
 
-function drawPlayer(i) {
-  const p = manifest.players[i];
+// shared mesh draw (players + mesh-type layers): relit skin/tex * light * 2, depth-tested.
+function drawMesh(triRange, skinTex, atlasTex, screenLight) {
   gl.useProgram(meshP); gl.bindVertexArray(meshVao);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), ck('ck_li') ? 1 : 0);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uScreenLight'), lightSpace === 'screen' ? 1 : 0);
-  gl.activeTexture(gl.TEXTURE1);                     // screen-space light or per-player UV atlas
-  gl.bindTexture(gl.TEXTURE_2D, lightSpace === 'screen' ? tLight : tAtlas[i]);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
-  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);   // per-vertex depth: self + inter-player
-  const [t0, t1] = p.tri_range;
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uScreenLight'), screenLight ? 1 : 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, screenLight ? tLight : atlasTex);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, skinTex);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);   // per-vertex depth: self + inter-entity
+  const [t0, t1] = triRange;
   gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, idxType, t0 * 3 * idxSize);
   gl.disable(gl.DEPTH_TEST);
+}
+function drawPlayer(i) {
+  const p = manifest.players[i];
+  drawMesh(p.tri_range, tSkins[i], lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen');
+}
+function drawLayer(i) {                               // mesh-type -> geometry; sprite-type -> quad
+  const L = layers[i];
+  if (L.type === 'mesh') { if (tLayerTex[i] && tLayerAtlas[i]) drawMesh(L.tri_range, tLayerTex[i], tLayerAtlas[i], false); }
+  else if (tLayerSprite[i]) blitQuadBlend(tLayerSprite[i]);
 }
 
 function draw() {
@@ -222,14 +239,15 @@ function draw() {
 
   for (const it of drawOrder) {                      // walk the merged list, back -> front
     if (it.kind === 'player') { if (showPlayers) drawPlayer(it.i); }
-    else if (layerOn(it.i)) blitQuadBlend(tLayers[it.i]);   // flat sprite, painter's order
+    else if (layerOn(it.i)) drawLayer(it.i);         // mesh (geometry) or sprite (quad)
   }
 
   if (ck('ck_fg')) blitQuadBlend(tFg);               // real scenery in front of everything
 }
 
-// swap a player's skin at runtime (file input, or __dbg.setSkin(i, src))
+// swap a player's skin / a mesh-layer's texture at runtime (file input, or __dbg.setSkin)
 function setSkin(i, source) { upload(tSkins[i], source); draw(); }
+function setLayerTex(i, source) { if (tLayerTex[i]) { upload(tLayerTex[i], source); draw(); } }
 {
   const box = document.getElementById('skins');
   manifest.players.forEach((p, i) => {
@@ -259,13 +277,25 @@ for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_sh', 'ck_fg'])
     inp.type = 'checkbox'; inp.id = 'ck_layer_' + i; inp.checked = true;
     inp.addEventListener('change', draw);
     lab.appendChild(inp);
-    lab.appendChild(document.createTextNode(' ' + (L.object || L.name)));
+    lab.appendChild(document.createTextNode(' ' + (L.object || L.name) + (L.type === 'mesh' ? ' ' : '')));
+    if (L.type === 'mesh' && tLayerTex[i]) {          // retexture input (mesh-type layers only)
+      const inp2 = document.createElement('input');
+      inp2.type = 'file'; inp2.accept = 'image/png,image/webp,image/jpeg'; inp2.style.width = '90px';
+      inp2.onchange = () => {
+        const f = inp2.files[0]; if (!f) return;
+        const img = new Image();
+        img.onload = () => { setLayerTex(i, img); URL.revokeObjectURL(img.src); };
+        img.src = URL.createObjectURL(f);
+      };
+      lab.appendChild(inp2);
+    }
     box.appendChild(lab);
   });
 }
 
+const nMeshLayers = layers.filter(L => L.type === 'mesh').length;
 document.getElementById('stats').textContent =
   `${uniqueN} unique / ${welded} welded verts, ${ntris} tris, ${manifest.players.length} player(s), ` +
-  `${layers.length} layer(s), ${W}x${H}, light=${manifest.light_space}`;
-window.__dbg = { manifest, setSkin, draw, keys: { welded, uniqueN, ntris, V }, posArr };
+  `${layers.length} layer(s) (${nMeshLayers} mesh), ${W}x${H}, light=${manifest.light_space}`;
+window.__dbg = { manifest, setSkin, setLayerTex, draw, keys: { welded, uniqueN, ntris, V }, posArr };
 draw();

@@ -397,6 +397,14 @@ STATIC_FG_QUALITY = 90         # used only when STATIC_FG_LOSSLESS is False
 # real cast shadows.
 STATIC_SHADOW_FLOOR = 0.06     # darkening (1-ratio) below this -> no shadow (noise floor)
 
+# A "mesh-type" optional layer (one shared texture across its meshes) is exported like a player --
+# geometry in mesh.bin + a UV light atlas + its base texture -- so it can be re-textured in the
+# browser (skin(uv)*atlas(uv)*2). Layers that don't qualify (multiple textures, or an untextured
+# mesh like procedural eyes) stay flat sprites. LAYER_ATLAS_RES sizes the mesh-layer light atlas
+# (mobs are small, so 256 is plenty for the low-frequency light).
+STATIC_LAYERS_AS_MESH = True
+LAYER_ATLAS_RES = 256
+
 # Web wallpaper tool (the panel has a button that opens this URL in the browser).
 WALLPAPER_TOOL_URL = "https://minecraft.novaskin.me/wallpapers/tools/blender/"
 # The rig this exporter targets. Blender extensions can't declare another extension as a
@@ -1464,6 +1472,49 @@ def _atlas_bake_material(img):
     return m
 
 
+def _force_bake_visible(objs):
+    """Make `objs` selectable/visible in the view layer for a bake op. A marked layer object can
+    RENDER (hide_render False) while its collection is hidden in the VIEWPORT (eye off), which makes
+    visible_get() False and `bpy.ops.object.bake` fail with 'No valid selected objects'. Clear the
+    object- and collection-level VIEWPORT hide along the chain to each object (never `exclude`, which
+    would change what renders). Returns a restore callable."""
+    vl = bpy.context.view_layer
+    objset = set(objs)
+    saved = []
+    for o in objs:
+        saved.append(("obj", o, o.hide_viewport, o.hide_select))
+        o.hide_viewport = False
+        o.hide_select = False
+        try:
+            o.hide_set(False)
+        except RuntimeError:
+            pass
+    for coll in bpy.data.collections:                  # global (monitor) eye
+        if coll.hide_viewport and any(o.name in coll.all_objects for o in objset):
+            saved.append(("coll", coll, coll.hide_viewport, None))
+            coll.hide_viewport = False
+
+    def enable(lc):                                    # per-view-layer eye, along the chain
+        has = any([enable(c) for c in lc.children])    # eval ALL children (no short-circuit)
+        if lc.collection and any(o.name in lc.collection.objects for o in objset):
+            has = True
+        if has and lc.hide_viewport:
+            saved.append(("lc", lc, lc.hide_viewport, None))
+            lc.hide_viewport = False
+        return has
+    enable(vl.layer_collection)
+    bpy.context.view_layer.update()
+
+    def restore():
+        for kind, obj, a, _b in reversed(saved):
+            if kind == "obj":
+                obj.hide_viewport, obj.hide_select = a, _b
+            else:
+                obj.hide_viewport = a
+        bpy.context.view_layer.update()
+    return restore
+
+
 def _bake_player_light_atlas(player, atlas_res=None, samples=None, out_dir=None, stem=None):
     """Bake a player's scene lighting into a UV-space light atlas (skin layout) and save it. By
     default goes to `<OUT_DIR>/<player>/light_atlas.<ext>`; pass `out_dir` (absolute) + `stem` to
@@ -1523,6 +1574,7 @@ def _bake_player_light_atlas(player, atlas_res=None, samples=None, out_dir=None,
         bpy.data.images.remove(bpy.data.images[name])
     img = bpy.data.images.new(name, atlas_res, atlas_res, alpha=True, float_buffer=True)
     mat = _atlas_bake_material(img)
+    vis_restore = None
     try:
         for o in parts:
             if len(o.material_slots) == 0:        # bake target needs a material slot
@@ -1535,6 +1587,7 @@ def _bake_player_light_atlas(player, atlas_res=None, samples=None, out_dir=None,
             o.visible_glossy = False
         for m, _ in flat_mods:                    # flat-shaded, un-subdivided cage for the bake
             m.show_render = False
+        vis_restore = _force_bake_visible(parts)   # a hidden-in-viewport layer collection -> bake fails
         bpy.ops.object.select_all(action='DESELECT')
         for o in parts:
             o.select_set(True)
@@ -1593,6 +1646,8 @@ def _bake_player_light_atlas(player, atlas_res=None, samples=None, out_dir=None,
         if saved_den is not None:
             scene.cycles.use_denoising = saved_den
         scene.render.bake.margin = saved_margin
+        if vis_restore is not None:
+            vis_restore()
         bpy.ops.object.select_all(action='DESELECT')
         for o in saved_sel:
             try:
@@ -2749,7 +2804,7 @@ def _expand_pixel_uvs(parts, skin_px=None):
     return restore
 
 
-def _static_collect(players, W, H):
+def _static_collect(players, W, H, mesh_layers=None):
     """Like `_anim_collect_static`, but for the static export: includes BOTH the base parts AND
     the overlays (2nd layer) -- the base first, then the overlays per player, in painter's order
     -- so the browser renders the overlay as a shell over the base and samples its own atlas UV
@@ -2809,6 +2864,18 @@ def _static_collect(players, W, H):
                               "overlay_tri_start": ov_t0,
                               "n_base_parts": len(base), "n_overlay_parts": len(ov),
                               "camera_depth": round(_player_camera_depth(p) or 0.0, 3)})
+    # mesh-type layers (retexturable): each group's meshes appended as one entity, its own tri range
+    st["layers"] = []
+    for ml in (mesh_layers or []):
+        w0, t0 = len(st["src"]), len(st["tris"]) // 3
+        for o in ml["meshes"]:
+            if o.type == 'MESH' and o.data.uv_layers.active is not None:
+                add_part(o)
+        if len(st["tris"]) // 3 > t0:
+            st["layers"].append({"name": ml["name"], "object": ml["object"], "kind": ml["kind"],
+                                 "welded_range": [w0, len(st["src"])],
+                                 "tri_range": [t0, len(st["tris"]) // 3],
+                                 "camera_depth": round(ml.get("camera_depth") or 0.0, 3)})
     gather = {}
     for ui, (pi, vi) in enumerate(st["uniq"]):
         gather.setdefault(pi, ([], []))
@@ -2835,7 +2902,7 @@ def _static_write_mesh(path, st):
     return welded, unique, ntris
 
 
-def _static_write_geometry(players, out_dir=None):
+def _static_write_geometry(players, out_dir=None, mesh_layers=None):
     """Write the static `mesh.bin` (K=1) + `positions.bin` for the CURRENT frame, using the DENSE
     mesh (full subdivision, no AntiLag/Slim reduction -- one key, so there is no per-frame delta
     budget to fit). Reuses `_static_collect` / `_anim_frame_positions` / `_anim_write_mesh` /
@@ -2868,12 +2935,13 @@ def _static_write_geometry(players, out_dir=None):
                 a.update_tag()
         s.render.use_simplify = False
         bpy.context.view_layer.update()
-        st = _static_collect(players, W, H)
+        st = _static_collect(players, W, H, mesh_layers=mesh_layers)
         pos = _anim_frame_positions(st, W, H)
         welded, unique, ntris = _static_write_mesh(os.path.join(out_dir, "mesh.bin"), st)
         K, V = _anim_write_anim(os.path.join(out_dir, "positions.bin"), [pos], ANIM_QUANT, 0.0)
         return {"resolution": [W, H], "welded": welded, "unique": unique, "tris": ntris,
                 "keys": K, "verts": V, "players": st["players"],
+                "layers": st.get("layers", []),
                 "mesh_bytes": os.path.getsize(os.path.join(out_dir, "mesh.bin")),
                 "pos_bytes": os.path.getsize(os.path.join(out_dir, "positions.bin")),
                 "mesh_file": STATIC_OUT_SUBDIR + "/mesh.bin",
@@ -3074,6 +3142,60 @@ def _static_render_images(players, out_dir=None, groups=None):
         bpy.context.view_layer.update()
 
 
+def _static_layer_mesh_info(group):
+    """Decide whether an optional-layer GROUP can be exported as a retexturable MESH (like a player)
+    instead of a flat sprite. It qualifies when every mesh has an active UV and ALL the group's
+    materials share exactly ONE image texture (one UV/texture space) -- then the browser can
+    resample a swapped texture as tex(uv) * atlas(uv) * 2. Returns (image, True) for a mesh-type
+    layer, else (None, False) (e.g. the fish, whose eye meshes carry no texture)."""
+    meshes = [o for o in group["meshes"] if o.type == 'MESH']
+    if not meshes:
+        return None, False
+    images = set()
+    for o in meshes:
+        if o.data.uv_layers.active is None or not o.material_slots:
+            return None, False
+        for ms in o.material_slots:
+            mat = ms.material
+            imgs = ([n.image for n in mat.node_tree.nodes
+                     if n.type == 'TEX_IMAGE' and n.image is not None]
+                    if (mat and mat.use_nodes) else [])
+            if not imgs:
+                return None, False        # an untextured material -> keep the whole layer a sprite
+            images.update(imgs)
+    if len(images) != 1:
+        return None, False
+    return next(iter(images)), True
+
+
+def _static_export_layer_texture(image, out_dir, stem):
+    """Save a mesh-type layer's shared base texture (the swappable 'skin') as `<stem>_tex.png`
+    (lossless, sampled NEAREST as pixel art). Linear image pixels -> sRGB bytes (it is an sRGB
+    color map); same save path as the atlas so the two stay UV-aligned. Returns the bare name."""
+    w, h = image.size
+    buf = np.empty(w * h * 4, 'float32')
+    image.pixels.foreach_get(buf)
+    rgba = buf.reshape(-1, 4).copy()
+    rgba[:, :3] = _lin_to_srgb(rgba[:, :3])      # sRGB color map (alpha stays linear 0/1)
+    fn = stem + "_tex.png"
+    _save_image(rgba.reshape(-1), w, h, os.path.join(out_dir, fn), file_format='PNG')
+    return fn
+
+
+def _static_split_layers(groups):
+    """Split discovered layer groups into mesh-type (retexturable) and sprite-type. Each mesh entry
+    carries its shared `image`. Returns (mesh_layers, sprite_groups)."""
+    mesh_layers, sprite_groups = [], []
+    for g in groups:
+        image, is_mesh = (_static_layer_mesh_info(g) if STATIC_LAYERS_AS_MESH else (None, False))
+        if is_mesh:
+            mesh_layers.append(dict(g, image=image,
+                                    camera_depth=_group_camera_depth(g["meshes"])))
+        else:
+            sprite_groups.append(g)
+    return mesh_layers, sprite_groups
+
+
 def _static_render_layers(players, groups, out_dir=None):
     """Render each optional-layer GROUP as an independent RGBA sprite for the static wallpaper.
     Each group's meshes render ALONE over a transparent film (players + the OTHER groups hidden, so
@@ -3187,9 +3309,10 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None):
                         f"and `layers` together back -> front by camera_depth (larger = farther): a "
                         f"player mesh is depth-tested with color = skin(uv) * {light_term} * 2, base "
                         "tris then overlay tris [overlay_tri_start] (alpha-discard the overlay's "
-                        "transparent texels); a layer is a straight-alpha sprite quad (depth test "
-                        "off, painter's order). Finally composite foreground (straight alpha) over "
-                        "the top: out = fg.rgb*fg.a + behind*(1 - fg.a)."),
+                        "transparent texels); a layer is either type='mesh' (depth-tested "
+                        "tex(uv)*atlas(uv)*2 over its tri_range, retexturable) or type='sprite' (a "
+                        "straight-alpha quad, painter's order). Finally composite foreground "
+                        "(straight alpha) over the top: out = fg.rgb*fg.a + behind*(1 - fg.a)."),
     }
     if layers:
         manifest["layers"] = layers           # scenery sprites, ordered back -> front
@@ -3213,9 +3336,11 @@ def _static_export_steps(players, op=None, out_dir=None):
     out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
     os.makedirs(out_dir, exist_ok=True)
     uv_light = (STATIC_LIGHT_SPACE == "uv")        # else screen-space light (default)
-    groups = discover_layers()                     # optional toggleable scenery layers (sprites)
-    # atlases + geometry + images + (layers) + manifest
-    total = (len(players) if uv_light else 0) + 3 + (1 if groups else 0)
+    groups = discover_layers()                     # optional toggleable scenery layers
+    mesh_layers, sprite_groups = _static_split_layers(groups)   # retexturable meshes vs flat sprites
+    n_atlas = (len(players) if uv_light else 0) + len(mesh_layers)
+    # atlases/textures + geometry + images + (sprites) + manifest
+    total = n_atlas + 2 + (1 if sprite_groups else 0) + 1
     state = {"done": 0}
     def prog(msg):
         state["done"] += 1
@@ -3232,34 +3357,54 @@ def _static_export_steps(players, op=None, out_dir=None):
         # 1) per-player UV light atlases (only for light_space="uv"; the screen-space light is
         #    rendered in step 3 instead). Baked in the normal look so it sees the real lighting.
         atlas_by_label = {}
-        if uv_light:
+        mesh_layer_assets = {}      # layer name -> {"atlas": file, "tex": file}
+        if uv_light or mesh_layers:
             sess = _Session()
             try:
                 sess.restore_visibility()
                 bpy.context.view_layer.update()
-                for p in players:
-                    rel = _bake_player_light_atlas(p, out_dir=out_dir, stem=f"{p['label']}_atlas")
-                    if rel:
-                        atlas_by_label[p["label"]] = os.path.basename(rel)
-                    yield prog(f"atlas {p['label']}")
+                if uv_light:
+                    for p in players:
+                        rel = _bake_player_light_atlas(p, out_dir=out_dir,
+                                                       stem=f"{p['label']}_atlas")
+                        if rel:
+                            atlas_by_label[p["label"]] = os.path.basename(rel)
+                        yield prog(f"atlas {p['label']}")
+                for ml in mesh_layers:       # retexturable layer: own UV light atlas + base texture
+                    syn = {"uv_parts": ml["meshes"], "label": ml["name"]}
+                    rel = _bake_player_light_atlas(syn, atlas_res=LAYER_ATLAS_RES,
+                                                   out_dir=out_dir, stem=f"{ml['name']}_atlas")
+                    tex = _static_export_layer_texture(ml["image"], out_dir, ml["name"])
+                    mesh_layer_assets[ml["name"]] = {
+                        "atlas": os.path.basename(rel) if rel else None, "tex": tex}
+                    yield prog(f"atlas+tex {ml['name']}")
             finally:
                 sess.restore()
                 bpy.context.view_layer.update()
-        # 2) DENSE mesh.bin + positions.bin (K=1)
-        geo = _static_write_geometry(players, out_dir=out_dir)
+        # 2) DENSE mesh.bin + positions.bin (K=1), players + mesh-type layers
+        geo = _static_write_geometry(players, out_dir=out_dir, mesh_layers=mesh_layers)
         yield prog(f"mesh.bin / positions.bin ({geo['tris']} tris)")
         # 3) clean background + foreground (+ screen-space light when light_space="screen") +
         #    per-entity toggleable shadow ratios. Layers are excluded from bg/fg (own sprites).
         imgs = _static_render_images(players, out_dir=out_dir, groups=groups)
         yield prog("background / foreground / shadows"
                    + ("" if uv_light else " / light"))
-        # 4) optional-layer sprites (depth-ordered scenery, toggleable in the wallpaper)
-        layer_infos = []
-        if groups:
-            layer_infos = _static_render_layers(players, groups, out_dir=out_dir)
-            yield prog(f"layers ({len(layer_infos)})")
+        # 4) sprite-type layers only (the mesh-type ones are drawn from geometry)
+        sprite_infos = []
+        if sprite_groups:
+            sprite_infos = _static_render_layers(players, sprite_groups, out_dir=out_dir)
+            yield prog(f"sprites ({len(sprite_infos)})")
+        # unify layer manifest entries: mesh-type (geometry range + atlas + tex) + sprite-type
+        layer_entries = []
+        for lr in geo.get("layers", []):
+            a = mesh_layer_assets.get(lr["name"], {})
+            layer_entries.append({**lr, "type": "mesh",
+                                  "atlas": a.get("atlas"), "tex": a.get("tex")})
+        layer_entries += [dict(si, type="sprite") for si in sprite_infos]
+        layer_entries.sort(key=lambda e: (e.get("camera_depth") is None,
+                                          -(e.get("camera_depth") or 0.0)))   # back -> front
         # 5) manifest
-        manifest = _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=layer_infos)
+        manifest = _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=layer_entries)
         yield prog("manifest.json")
         print(f"[STATIC] export complete -> {out_dir} ({geo['tris']} tris, "
               f"light={STATIC_LIGHT_SPACE})")
