@@ -228,10 +228,10 @@ function drawPlayer(i) {
   drawMesh(playerRanges(p, i), tSkins[i],
            lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen');
 }
-function drawLayer(i) {                               // mesh-type -> geometry; sprite-type -> quad
+function drawLayer(i) {                               // mesh -> geometry; sprite -> flat painter quad
   const L = layers[i];
   if (L.type === 'mesh') { if (tLayerTex[i] && tLayerAtlas[i]) drawMesh([L.tri_range], tLayerTex[i], tLayerAtlas[i], false); }
-  else if (tLayerSprite[i]) blitQuadBlend(tLayerSprite[i]);
+  else if (tLayerSprite[i]) blitQuadBlend(tLayerSprite[i]);   // tight silhouette, camera-depth order
 }
 
 function draw() {

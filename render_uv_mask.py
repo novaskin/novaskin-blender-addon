@@ -397,14 +397,9 @@ STATIC_FG_QUALITY = 90         # used only when STATIC_FG_LOSSLESS is False
 # real cast shadows.
 STATIC_SHADOW_FLOOR = 0.06     # darkening (1-ratio) below this -> no shadow (noise floor)
 
-# Sprite layers are baked as a single beauty overlay: rgb = the scene WITH only that layer (so its
-# water reflection / refraction / cast shadow are already in the pixels), alpha = where the layer
-# changed the clean scene (|S - clean| linear luminance, plus the layer's own silhouette).
-# Composited straight over the clean background it reproduces the render exactly; toggling it removes
-# the layer and its reflection/shadow together. FLOOR kills the denoiser-residual speckle in the
-# unaffected scenery; KNEE is the delta range that ramps alpha 0 -> 1.
-STATIC_SPRITE_FLOOR = 0.004
-STATIC_SPRITE_KNEE = 0.03
+# Sprite layers are baked as a tight silhouette beauty (the layer alone over transparent, occluded by
+# scenery as a holdout) PLUS a separate multiply shadow ratio (the same one the mesh entities get),
+# so a sprite never paints scenery over a player and there is no double-water.
 
 # A "mesh-type" optional layer (one shared texture across its meshes) is exported like a player --
 # geometry in mesh.bin + a UV light atlas + its base texture -- so it can be re-textured in the
@@ -3229,9 +3224,9 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None):
 
         # 4) per-entity TOGGLEABLE shadow: each entity camera-invisible (still casting / reflecting)
         #    over the same clean baseline, every OTHER entity hidden -> display-space multiply ratio.
-        shadows = {}        # only MESH entities (players + retexturable layers); sprites fold it in
+        shadows = {}        # players + EVERY layer (mesh + sprite): each gets its own multiply ratio
         entities = ([("player", p["label"], list(p["char_all"])) for p in players]
-                    + [("layer", ml["name"], list(ml["meshes"])) for ml in mesh_layers])
+                    + [("layer", g["name"], list(g["meshes"])) for g in groups])
         for kind, name, objs in entities:
             obj_names = {o.name for o in objs}
             sess.restore_visibility()                       # active entity keeps its real visibility
@@ -3367,16 +3362,16 @@ def _static_split_layers(groups):
 
 
 def _static_render_layers(players, sprite_groups, all_layer_mesh_names, out_dir=None):
-    """Render each SPRITE-type layer as a single straight-alpha BEAUTY overlay. For each group:
-    render `S` = the scene with ONLY this group present (players + all other layers hidden) with the
-    scenery KEPT (so the group's water reflection / refraction / cast shadow are already in the
-    pixels), and a silhouette pass (group alone, scenery hidden). The sprite is `rgb = display(S)`,
-    `alpha = max(silhouette, ramp(|S - clean| luminance))` -- i.e. wherever the group changed the
-    clean scene. Composited straight over the clean background it reproduces the render (mob + its
-    reflection/shadow); toggling it off removes all of that together, so a sprite needs no separate
-    shadow file and carries its own foreground. Returns [{name, object, kind, image, camera_depth}],
-    back -> front. Self-contained (restores). `all_layer_mesh_names` = every layer mesh (mesh-type
-    AND sprite-type), so the other entities are hidden while this one renders."""
+    """Render each SPRITE-type layer as a straight-alpha beauty TIGHT to the group's silhouette: the
+    group alone over a transparent film, OCCLUDED by the real scenery as a holdout (front scenery
+    cuts its alpha so it sits correctly behind foliage/water lips). Display-encoded like the
+    background, edge-dilated. Its cast shadow / water darkening is NOT folded in here -- it is a
+    SEPARATE multiply ratio rendered in _static_render_images (exactly like the mesh entities),
+    composited on the background BEFORE the players. That keeps the sprite from painting scenery over
+    a player and avoids the double-water that folding the full scene into the sprite caused. Sprites
+    composite by camera_depth (painter order); no per-pixel depth. Returns
+    [{name, object, kind, image, camera_depth}], back -> front. Self-contained. `all_layer_mesh_names`
+    = every layer mesh (sprite + mesh-type), hidden while this group renders."""
     if not sprite_groups:
         return []
     s = bpy.context.scene
@@ -3384,48 +3379,39 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, out_dir=
     os.makedirs(out_dir, exist_ok=True)
     char_names = {o.name for p in players for o in p["char_all"]}
     entity_names = char_names | set(all_layer_mesh_names)
-    w709 = np.array([0.2126, 0.7152, 0.0722], 'float32')
     sess = _Session()
     infos = []
     try:
-        # clean baseline (every entity hidden) -- the |S - clean| reference
-        sess.restore_visibility()
-        sess.mute_drivers(True)
-        for o in s.objects:
-            if o.name in entity_names:
-                o.hide_render = True
-        bpy.context.view_layer.update()
-        clean, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT)
-        clean_lum = clean[:, :3] @ w709
-
         for g in sprite_groups:
             meshes = g["meshes"]
             safe = g["name"]
             group_names = {m.name for m in meshes}
-            # S: this group + scenery, every OTHER entity hidden (opaque -> water reflection shows)
+            # isolate: this group visible, players + every other layer hidden; scenery as holdout so
+            # the sprite is the group alone, transparent, cut where real scenery is in front of it
             sess.restore_visibility()
             sess.mute_drivers(True)
             for o in s.objects:
                 if o.name in entity_names and o.name not in group_names:
                     o.hide_render = True
-            bpy.context.view_layer.update()
-            S, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
-            # silhouette: the group alone (scenery hidden too), transparent -> crisp coverage
-            scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in group_names]
-            sc_hr = {o: o.hide_render for o in scenery}
+            scenery = [o for o in s.objects if o.type == 'MESH'
+                       and o.name not in group_names and o.name not in entity_names]
+            sc_ho = {o: o.is_holdout for o in scenery}
             for o in scenery:
-                o.hide_render = True
+                o.is_holdout = True
             bpy.context.view_layer.update()
-            sil, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
-            for o, v in sc_hr.items():
-                o.hide_render = v
-            bpy.context.view_layer.update()
+            try:
+                comb, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+            finally:
+                for o, v in sc_ho.items():
+                    o.is_holdout = v
 
-            delta = np.abs(S[:, :3] - clean[:, :3]) @ w709          # linear luminance change
-            eff = np.clip((delta - STATIC_SPRITE_FLOOR) / STATIC_SPRITE_KNEE, 0.0, 1.0)
-            alpha = np.maximum(np.clip(sil[:, 3], 0.0, 1.0), eff)
-            spr = np.empty((S.shape[0], 4), 'float32')
-            spr[:, :3] = _to_display(S[:, :3])         # full scene; masked by alpha (0 = clean shows)
+            alpha = np.clip(comb[:, 3], 0.0, 1.0)
+            straight = np.where(alpha[:, None] > 1e-4,
+                                comb[:, :3] / np.maximum(alpha[:, None], 1e-4), 0.0)
+            vis = alpha > 1e-4
+            spr = np.zeros((comb.shape[0], 4), 'float32')
+            spr[vis, :3] = _to_display(straight[vis])
+            spr[:, :3] = _anim_dilate_light(spr[:, :3], vis, rW, rH)
             spr[:, 3] = alpha
             _save_image(spr.reshape(-1), rW, rH, os.path.join(out_dir, safe + ".webp"),
                         file_format='WEBP', lossless=STATIC_FG_LOSSLESS, quality=STATIC_FG_QUALITY)
@@ -3579,7 +3565,7 @@ def _static_export_steps(players, op=None, out_dir=None):
                                      mesh_layers=mesh_layers)
         yield prog("background / foreground / shadows"
                    + ("" if uv_light else " / light"))
-        # 4) sprite-type layers: single beauty overlay each (reflection/shadow folded in)
+        # 4) sprite-type layers: tight silhouette beauty each (shadow is a separate ratio, step 3)
         sprite_infos = []
         if sprite_groups:
             all_layer_mesh_names = {m.name for g in groups for m in g["meshes"]}
