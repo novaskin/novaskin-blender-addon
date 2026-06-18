@@ -413,8 +413,16 @@ STATIC_SPRITE_KNEE = 0.03
 # (mobs are small, so 256 is plenty for the low-frequency light).
 STATIC_LAYERS_AS_MESH = True
 LAYER_ATLAS_RES = 256
-RETEX_ID_PROP = "novaskin_retexture"   # opt-in flag (on the marked object/collection): export this
-                                       # layer as a retexturable mesh instead of a flat sprite
+# How a marked optional layer is exported (a per-layer enum on the object/collection, registered in
+# register()). SPRITE (default) = a flat baked beauty image; TEXTURE/PLAYER = a re-skinnable mesh
+# (geometry + UV light atlas + base texture). PLAYER additionally tags it as a character in the
+# manifest, so the wallpaper tool presents it like a player. Opens room for more modes later.
+LAYER_MODE_PROP = "novaskin_layer_mode"
+LAYER_MODE_ITEMS = [
+    ('SPRITE', "Sprite", "Flat baked image -- matches the render exactly. For background props"),
+    ('TEXTURE', "Texture", "Re-skinnable 3D mesh: its own swappable texture + baked light"),
+    ('PLAYER', "Player", "Like Texture, but shown as a player/character in the wallpaper tool"),
+]
 
 # Web wallpaper tool (the panel has a button that opens this URL in the browser).
 WALLPAPER_TOOL_URL = "https://minecraft.novaskin.me/wallpapers/tools/blender/"
@@ -2927,6 +2935,7 @@ def _static_collect(players, W, H, mesh_layers=None):
                 add_part(o)
         if len(st["tris"]) // 3 > t0:
             st["layers"].append({"name": ml["name"], "object": ml["object"], "kind": ml["kind"],
+                                 "role": ml.get("role", "layer"),
                                  "welded_range": [w0, len(st["src"])],
                                  "tri_range": [t0, len(st["tris"]) // 3],
                                  "camera_depth": round(ml.get("camera_depth") or 0.0, 3)})
@@ -3243,33 +3252,34 @@ def _static_export_layer_texture(image, out_dir, stem):
     return fn
 
 
-def _layer_wants_retexture(group):
-    """True if the layer's source (collection / armature / mesh) is flagged for retexture export
-    via the RETEX_ID_PROP custom property -- retexture is an explicit OPT-IN (default = sprite)."""
+def _layer_mode(group):
+    """The export mode set on the layer's source (collection / armature / mesh): 'SPRITE' (default),
+    'TEXTURE' or 'PLAYER' -- the LAYER_MODE_PROP enum registered on Object/Collection."""
     src, kind = group.get("object"), group.get("kind")
     holder = (bpy.data.collections.get(src) if kind == "collection"
               else bpy.context.scene.objects.get(src))
-    return bool(holder and holder.get(RETEX_ID_PROP))
+    return getattr(holder, LAYER_MODE_PROP, "SPRITE") if holder is not None else "SPRITE"
 
 
 def _static_split_layers(groups):
-    """Split discovered layer groups into mesh-type (retexturable, player logic) and sprite-type.
-    A layer is mesh-type only if it is OPT-IN flagged (RETEX_ID_PROP) AND actually qualifies (its
-    meshes share one texture); otherwise it is a sprite (the safe default -- a single baked beauty
-    that matches the render exactly). Mesh entries carry their shared `image`. Returns
-    (mesh_layers, sprite_groups)."""
+    """Split discovered layer groups by their export mode into mesh-type (TEXTURE/PLAYER -- a
+    re-skinnable mesh with player logic) and sprite-type (SPRITE, the default -- a single baked
+    beauty that matches the render). A mesh-type layer must also QUALIFY (its meshes share one
+    texture), else it falls back to a sprite. Mesh entries carry their shared `image` and a `role`
+    ('player' for PLAYER mode, else 'layer'). Returns (mesh_layers, sprite_groups)."""
     mesh_layers, sprite_groups = [], []
     for g in groups:
-        want = STATIC_LAYERS_AS_MESH and _layer_wants_retexture(g)
-        image, ok = (_static_layer_mesh_info(g) if want else (None, False))
-        if want and not ok:
-            print(f"[STATIC] layer '{g['name']}' flagged retexture but its meshes don't share one "
+        mode = _layer_mode(g) if STATIC_LAYERS_AS_MESH else "SPRITE"
+        if mode in {"TEXTURE", "PLAYER"}:
+            image, ok = _static_layer_mesh_info(g)
+            if ok:
+                mesh_layers.append(dict(g, image=image,
+                                        camera_depth=_group_camera_depth(g["meshes"]),
+                                        role=("player" if mode == "PLAYER" else "layer")))
+                continue
+            print(f"[STATIC] layer '{g['name']}' set to {mode} but its meshes don't share one "
                   f"texture -- exporting as a sprite instead.")
-        if ok:
-            mesh_layers.append(dict(g, image=image,
-                                    camera_depth=_group_camera_depth(g["meshes"])))
-        else:
-            sprite_groups.append(g)
+        sprite_groups.append(g)
     return mesh_layers, sprite_groups
 
 
@@ -4219,33 +4229,6 @@ class OBJECT_OT_novaskin_layer_remove(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class OBJECT_OT_novaskin_retexture_toggle(bpy.types.Operator):
-    """Toggle 'retexturable' on this optional layer. ON: export it as a MESH + UV light atlas +
-    base texture (swappable like a player skin, depth-tested). OFF (default): a flat beauty sprite
-    that matches the render exactly. Retexture only works if the layer's meshes share ONE texture;
-    otherwise the export falls back to a sprite."""
-    bl_idname = "object.novaskin_retexture_toggle"
-    bl_label = "Toggle Layer Retexture"
-    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
-
-    target: StringProperty()
-    is_collection: BoolProperty(default=False)
-
-    def execute(self, context):
-        coll = bpy.data.collections if self.is_collection else bpy.data.objects
-        db = coll.get(self.target)
-        if db is None:
-            self.report({'WARNING'}, f"NovaSkin: '{self.target}' not found")
-            return {'CANCELLED'}
-        if db.get(RETEX_ID_PROP):
-            del db[RETEX_ID_PROP]
-            self.report({'INFO'}, f"NovaSkin: '{self.target}' -> sprite")
-        else:
-            db[RETEX_ID_PROP] = 1
-            self.report({'INFO'}, f"NovaSkin: '{self.target}' -> retexturable (mesh)")
-        return {'FINISHED'}
-
-
 def _menu_draw(self, context):
     self.layout.operator(RENDER_OT_novaskin.bl_idname, icon='RENDER_STILL').draft = False
     self.layout.operator(RENDER_OT_novaskin.bl_idname, text="Render Draft (NovaSkin preview)",
@@ -4371,18 +4354,18 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                     is_coll = (g["kind"] == "collection")
                     holder = (bpy.data.collections.get(g["object"]) if is_coll
                               else context.scene.objects.get(g["object"]))
-                    is_retex = bool(holder and holder.get(RETEX_ID_PROP))
                     row = col.row(align=True)
                     row.label(text=txt, icon=icons.get(g["kind"], 'LAYER_ACTIVE'))
-                    rx = row.operator("object.novaskin_retexture_toggle", text="retex",
-                                      icon=('CHECKBOX_HLT' if is_retex else 'CHECKBOX_DEHLT'),
-                                      emboss=False)             # checkbox: on = mesh, off = sprite
-                    rx.target = g["object"]; rx.is_collection = is_coll
+                    if holder is not None:           # per-layer mode: Sprite / Texture / Player
+                        sub = row.row(align=True)
+                        sub.ui_units_x = 5.0         # fixed -> the name keeps the rest of the row
+                        sub.prop(holder, LAYER_MODE_PROP, text="")
                     rm = row.operator("object.novaskin_layer_remove", text="", icon='X',
                                       emboss=False)
                     rm.target = g["object"]
                     rm.is_collection = is_coll
-                box.label(text="(checkbox = retexturable mesh; else sprite)", icon='INFO')
+                box.label(text="(Sprite = flat image; Texture/Player = re-skinnable mesh)",
+                          icon='INFO')
             else:
                 box.label(text="none marked", icon='LAYER_USED')
 
@@ -4403,7 +4386,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 _classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_animated,
             RENDER_OT_novaskin_static, RENDER_OT_novaskin_cancel,
             OBJECT_OT_novaskin_layer_toggle, OBJECT_OT_novaskin_layer_remove,
-            OBJECT_OT_novaskin_retexture_toggle, VIEW3D_PT_novaskin)
+            VIEW3D_PT_novaskin)
 
 
 def _teardown_active_batch():
@@ -4424,12 +4407,20 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.novaskin = PointerProperty(type=NovaSkinSettings)
+    # per-layer export mode (Sprite / Texture / Player), set on the marked object or collection
+    for T in (bpy.types.Object, bpy.types.Collection):
+        setattr(T, LAYER_MODE_PROP, EnumProperty(
+            name="Layer", items=LAYER_MODE_ITEMS, default='SPRITE',
+            description="How this optional layer is exported"))
     bpy.types.TOPBAR_MT_render.append(_menu_draw)
 
 
 def unregister():
     _teardown_active_batch()
     bpy.types.TOPBAR_MT_render.remove(_menu_draw)
+    for T in (bpy.types.Object, bpy.types.Collection):
+        if hasattr(T, LAYER_MODE_PROP):
+            delattr(T, LAYER_MODE_PROP)
     if hasattr(bpy.types.Scene, "novaskin"):
         del bpy.types.Scene.novaskin
     for cls in reversed(_classes):
