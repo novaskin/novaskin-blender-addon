@@ -2763,6 +2763,27 @@ def _anim_write_anim(path, keys, quant, keys_fps):
     return K, V
 
 
+def _mesh_uv_handedness(me, vco):
+    """Sign relating the texture (U,V) frame to the mesh's geometric winding-normal, from the first
+    non-degenerate per-pixel quad. Used to rebuild a COLLAPSED axis of a degenerate face in the
+    correct orientation (so its texture is not mirrored). +1 or -1 (defaults +1 if none found)."""
+    uvl = me.uv_layers.active.data
+    for poly in me.polygons:
+        if len(poly.loop_indices) != 4:
+            continue
+        p = np.array([uvl[l].uv for l in poly.loop_indices], 'f')
+        if p[:, 0].max() - p[:, 0].min() <= 1e-6 or p[:, 1].max() - p[:, 1].min() <= 1e-6:
+            continue
+        c = vco[list(poly.vertices)]
+        cu, cv = p[:, 0].mean(), p[:, 1].mean()
+        r, t = p[:, 0] > cu, p[:, 1] > cv
+        u3 = c[r].mean(0) - c[~r].mean(0)            # 3D dir of +U
+        v3 = c[t].mean(0) - c[~t].mean(0)            # 3D dir of +V
+        ng = np.cross(c[1] - c[0], c[2] - c[0])      # geometric normal (loop winding)
+        return 1.0 if float(np.dot(np.cross(u3, v3), ng)) >= 0 else -1.0
+    return 1.0
+
+
 def _expand_pixel_uvs(parts, skin_px=None):
     """The rig insets each per-pixel UV face to ~50% of its skin-pixel cell (an anti-bleed trick),
     leaving gaps that bake as a grid and lose HD-skin detail. SNAP each per-pixel quad to fill its
@@ -2771,12 +2792,15 @@ def _expand_pixel_uvs(parts, skin_px=None):
       * inset faces                 -> grow to the full cell;
       * already-full faces          -> unchanged (already at the cell bounds, e.g. arm/sleeve bottoms);
       * degenerate faces (one axis collapsed to extent 0, e.g. the front face's last row, w=1/128,
-        h=0) -> the collapsed axis is rebuilt from the quad's two opposite edges (the loop-pair that
-        varies in the OTHER axis), one edge to each cell side. The top/bottom choice there is
-        arbitrary but harmless: a skin pixel is ~uniform, so flipping a single cell's V is invisible.
+        h=0) -> the quad is real in 3D even though its UV collapsed, so the collapsed axis is rebuilt
+        from the GEOMETRY: the defined axis gives its 3D direction, the face normal + the mesh UV
+        handedness give the collapsed axis's 3D direction, and the loop-edge on the +side of it goes
+        to the cell's top/right. This keeps the texture upright (no vertical flip) -- invisible on a
+        64px skin but correct for higher-resolution textures.
     The skin still samples NEAREST, so 64px skins look identical (the pixel centre is unchanged) and
-    512px skins now use the full pixel. Modifies the BASE mesh UVs (Subdivision interpolates them),
-    so the atlas bake AND the collected geometry stay consistent. Returns `restore()`. Dedups by mesh."""
+    higher-res skins now use the full pixel, upright. Modifies the BASE mesh UVs (Subdivision
+    interpolates them), so the atlas bake AND the collected geometry stay consistent. Returns
+    `restore()`. Dedups by mesh."""
     skin_px = skin_px or STATIC_SKIN_PX
     cell = 1.0 / float(skin_px)
     edges = ((0, 1), (1, 2), (2, 3), (3, 0))
@@ -2790,6 +2814,22 @@ def _expand_pixel_uvs(parts, skin_px=None):
         orig = np.empty(len(uvl.data) * 2, 'f'); uvl.data.foreach_get("uv", orig)
         saved.append((uvl, orig))
         uv = orig.reshape(-1, 2).copy()
+        vco = np.empty(len(me.vertices) * 3, 'f'); me.vertices.foreach_get('co', vco)
+        vco = vco.reshape(-1, 3)
+        s_hand = _mesh_uv_handedness(me, vco)
+
+        def _split_collapsed(co, defined3, perp_edges, sign):
+            """Assign `perp_edges[0]/[1]` (the two edges crossing the collapsed axis) to the low/high
+            cell side, by where each edge sits along the collapsed axis's 3D direction
+            `sign * (normal x defined3)`. Returns (low_edge_loops, high_edge_loops)."""
+            ng = np.cross(co[1] - co[0], co[2] - co[0])
+            axis3 = sign * np.cross(ng, defined3)
+            c0 = co[list(perp_edges[0])].mean(0)
+            c1 = co[list(perp_edges[1])].mean(0)
+            if float(np.dot(c1 - c0, axis3)) >= 0.0:
+                return list(perp_edges[0]), list(perp_edges[1])     # edge0 low, edge1 high
+            return list(perp_edges[1]), list(perp_edges[0])
+
         for poly in me.polygons:
             li = list(poly.loop_indices)
             if len(li) != 4:
@@ -2799,18 +2839,25 @@ def _expand_pixel_uvs(parts, skin_px=None):
             col = int(np.floor(cu / cell)); row = int(np.floor(cv / cell))
             u0, u1, v0, v1 = col * cell, (col + 1) * cell, row * cell, (row + 1) * cell
             new = pts.copy()
-            if pts[:, 0].max() - pts[:, 0].min() > 1e-6:            # U from each loop's side
-                new[:, 0] = np.where(pts[:, 0] > cu, u1, u0)
-            else:                                                  # U collapsed: rebuild from V-edges
+            u_ok = pts[:, 0].max() - pts[:, 0].min() > 1e-6
+            v_ok = pts[:, 1].max() - pts[:, 1].min() > 1e-6
+            co = vco[list(poly.vertices)]
+            if u_ok:
+                new[:, 0] = np.where(pts[:, 0] > cu, u1, u0)        # U from each loop's side
+            else:                                                  # U collapsed: rebuild from geometry
                 vert = [e for e in edges if abs(pts[e[0], 1] - pts[e[1], 1]) > 1e-6]
                 if len(vert) == 2:
-                    new[list(vert[0]), 0] = u0; new[list(vert[1]), 0] = u1
-            if pts[:, 1].max() - pts[:, 1].min() > 1e-6:            # V from each loop's side
-                new[:, 1] = np.where(pts[:, 1] > cv, v1, v0)
-            else:                                                  # V collapsed: rebuild from U-edges
+                    v3 = co[pts[:, 1] > cv].mean(0) - co[pts[:, 1] <= cv].mean(0)
+                    lo, hi = _split_collapsed(co, v3, vert, -s_hand)   # U is normal x V, opposite sign
+                    new[lo, 0] = u0; new[hi, 0] = u1
+            if v_ok:
+                new[:, 1] = np.where(pts[:, 1] > cv, v1, v0)        # V from each loop's side
+            else:                                                  # V collapsed: rebuild from geometry
                 horiz = [e for e in edges if abs(pts[e[0], 0] - pts[e[1], 0]) > 1e-6]
                 if len(horiz) == 2:
-                    new[list(horiz[0]), 1] = v0; new[list(horiz[1]), 1] = v1
+                    u3 = co[pts[:, 0] > cu].mean(0) - co[pts[:, 0] <= cu].mean(0)
+                    lo, hi = _split_collapsed(co, u3, horiz, s_hand)
+                    new[lo, 1] = v0; new[hi, 1] = v1
             uv[li] = new
         uvl.data.foreach_set("uv", uv.reshape(-1))
         me.update()
