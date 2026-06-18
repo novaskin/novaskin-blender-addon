@@ -3125,19 +3125,17 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None):
         entity_names = char_names | layer_mesh_names   # everything that is composited on top
 
         # 1) BACKGROUND: the CLEAN scene -- every player + layer hidden (drivers muted), so no
-        #    baked shadows; the entities and their shadows composite on top in the browser.
-        #    Rendered TWICE: a low pass at the panel "Samples" for the shadow-ratio baseline (so it
-        #    matches the per-entity shadow renders), and the SAVED backdrop at the scene's OWN render
-        #    settings -- the background is the real beauty, so it follows Blender, not "Samples".
+        #    baked shadows; the entities and their shadows composite on top in the browser. Rendered
+        #    at the panel "Samples" -- the SAME quality as the per-entity shadow / sprite renders, so
+        #    the shadow ratio and the sprite |S - clean| stay consistent and the composite has no
+        #    quality seam. Raise "Samples" for a cleaner backdrop.
         sess.mute_drivers(True)
         clean_hr = {o: o.hide_render for o in s.objects if o.name in entity_names}
         for o in clean_hr:
             o.hide_render = True
         bpy.context.view_layer.update()
-        clean_lo, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT)   # shadow-ratio baseline
-        clean_disp = np.clip(_to_display(clean_lo), 1e-4, None)          # (display space, "Samples")
-        bg, _, _ = _render_combined_array(
-            sess, ILLUM_RES_PCT, use_scene_settings=(BACKGROUND_USE_SCENE_SETTINGS and not DRAFT_MODE))
+        bg, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT)
+        clean_disp = np.clip(_to_display(bg), 1e-4, None)   # shadow-ratio baseline (display space)
         buf = np.ones((bg.shape[0], 4), 'float32')
         buf[:, :3] = _to_display(bg)
         _save_image(buf.reshape(-1), rW, rH, os.path.join(out_dir, "background" + STATIC_BG_EXT),
@@ -3923,9 +3921,9 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
                     "Minecraft hat size (a bit bigger than the head)")
     illum_samples: IntProperty(
         name="Samples", default=48, min=1, max=4096,
-        description="How clean the relit characters and layers look (their light atlas and cast "
-                    "shadows). The background and scenery follow the scene's OWN render settings. "
-                    "Higher is cleaner but slower; lower for quick tests")
+        description="Cycles render samples for the whole static export -- the background, the "
+                    "character light atlas, the shadows and the layer sprites all use the same "
+                    "value so they stay consistent. Higher is cleaner but slower; lower for tests")
     lightshadow_format: EnumProperty(   # legacy file format; not shown in the UI (kept PNG)
         name="Illum/Shadow",
         items=[('JPEG', "JPEG", ""), ('WEBP', "WebP", ""), ('PNG', "PNG", "")],
@@ -4356,8 +4354,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             box = layout.box()
             box.label(text="Quality", icon='SETTINGS')
             box.prop(st, "illum_samples")
-            box.label(text="character & layer light + shadows", icon='LIGHT')
-            box.label(text="background uses the scene's render settings", icon='INFO')
+            box.label(text="render samples for the whole export", icon='LIGHT')
 
             box = layout.box()
             box.label(text="Output", icon='FILE_FOLDER')
