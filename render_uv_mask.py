@@ -1536,6 +1536,23 @@ def _force_bake_visible(objs):
     return restore
 
 
+def _hide_others_for_bake(s, active_names, entity_names):
+    """For an atlas bake, hide every OTHER entity (the other players + ALL optional layers) so the
+    baked light is INDEPENDENT -- no other player's or toggleable layer's shadow/occlusion bakes
+    into this atlas (which a toggle could then never remove). The scenery stays visible for the real
+    lighting. Mutes hide_render drivers. Returns the muted drivers to un-mute afterwards."""
+    muted = []
+    for o in s.objects:
+        if o.name in entity_names and o.name not in active_names:
+            if o.animation_data:
+                for d in o.animation_data.drivers:
+                    if d.data_path == "hide_render" and not d.mute:
+                        d.mute = True
+                        muted.append(d)
+            o.hide_render = True
+    return muted
+
+
 def _bake_player_light_atlas(player, atlas_res=None, samples=None, out_dir=None, stem=None):
     """Bake a player's scene lighting into a UV-space light atlas (skin layout) and save it. By
     default goes to `<OUT_DIR>/<player>/light_atlas.<ext>`; pass `out_dir` (absolute) + `stem` to
@@ -3518,21 +3535,34 @@ def _static_export_steps(players, op=None, out_dir=None):
         atlas_by_label = {}
         mesh_layer_assets = {}      # layer name -> {"atlas": file, "tex": file}
         if uv_light or mesh_layers:
+            s = bpy.context.scene
             sess = _Session()
+            # other entities are hidden per bake so each atlas is independent (keep the scenery)
+            entity_names = ({o.name for p in players for o in p["char_all"]}
+                            | {m.name for g in groups for m in g["meshes"]})
             try:
-                sess.restore_visibility()
-                bpy.context.view_layer.update()
                 if uv_light:
                     for p in players:
+                        sess.restore_visibility()
+                        muted = _hide_others_for_bake(s, {o.name for o in p["char_all"]},
+                                                      entity_names)
+                        bpy.context.view_layer.update()
                         rel = _bake_player_light_atlas(p, out_dir=out_dir,
                                                        stem=f"{p['label']}_atlas")
+                        for d in muted:
+                            d.mute = False
                         if rel:
                             atlas_by_label[p["label"]] = os.path.basename(rel)
                         yield prog(f"atlas {p['label']}")
                 for ml in mesh_layers:       # retexturable layer: own UV light atlas + base texture
+                    sess.restore_visibility()
+                    muted = _hide_others_for_bake(s, {m.name for m in ml["meshes"]}, entity_names)
+                    bpy.context.view_layer.update()
                     syn = {"uv_parts": ml["meshes"], "label": ml["name"]}
                     rel = _bake_player_light_atlas(syn, atlas_res=LAYER_ATLAS_RES,
                                                    out_dir=out_dir, stem=f"{ml['name']}_atlas")
+                    for d in muted:
+                        d.mute = False
                     tex = _static_export_layer_texture(ml["image"], out_dir, ml["name"])
                     mesh_layer_assets[ml["name"]] = {
                         "atlas": os.path.basename(rel) if rel else None, "tex": tex}
