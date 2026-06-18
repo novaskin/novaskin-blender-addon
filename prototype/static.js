@@ -193,7 +193,9 @@ const drawOrder = [
 const layerOn = (i) => { const e = document.getElementById('ck_layer_' + i); return !e || e.checked; };
 
 // shared mesh draw (players + mesh-type layers): relit skin/tex * light * 2, depth-tested.
-function drawMesh(triRange, skinTex, atlasTex, screenLight) {
+// `ranges` = the tri ranges to draw (per part, so disabled overlay parts are simply omitted).
+function drawMesh(ranges, skinTex, atlasTex, screenLight) {
+  if (!ranges.length) return;
   gl.useProgram(meshP); gl.bindVertexArray(meshVao);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
@@ -203,17 +205,25 @@ function drawMesh(triRange, skinTex, atlasTex, screenLight) {
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, screenLight ? tLight : atlasTex);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, skinTex);
   gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);   // per-vertex depth: self + inter-entity
-  const [t0, t1] = triRange;
-  gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, idxType, t0 * 3 * idxSize);
+  for (const [t0, t1] of ranges)
+    gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, idxType, t0 * 3 * idxSize);
   gl.disable(gl.DEPTH_TEST);
+}
+const overlayPartOn = (i, label) => {
+  const e = document.getElementById('ck_ov_' + i + '_' + label); return !e || e.checked;
+};
+function playerRanges(p, i) {                         // base parts always; overlay parts if enabled
+  const parts = p.parts || [{ tri_range: p.tri_range, overlay: false }];
+  return parts.filter(pt => !pt.overlay || overlayPartOn(i, pt.label)).map(pt => pt.tri_range);
 }
 function drawPlayer(i) {
   const p = manifest.players[i];
-  drawMesh(p.tri_range, tSkins[i], lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen');
+  drawMesh(playerRanges(p, i), tSkins[i],
+           lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen');
 }
 function drawLayer(i) {                               // mesh-type -> geometry; sprite-type -> quad
   const L = layers[i];
-  if (L.type === 'mesh') { if (tLayerTex[i] && tLayerAtlas[i]) drawMesh(L.tri_range, tLayerTex[i], tLayerAtlas[i], false); }
+  if (L.type === 'mesh') { if (tLayerTex[i] && tLayerAtlas[i]) drawMesh([L.tri_range], tLayerTex[i], tLayerAtlas[i], false); }
   else if (tLayerSprite[i]) blitQuadBlend(tLayerSprite[i]);
 }
 
@@ -294,6 +304,23 @@ for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_sh', 'ck_fg'])
 }
 
 const nMeshLayers = layers.filter(L => L.type === 'mesh').length;
+// per-overlay-part toggles (hat/jacket/sleeves/pants), one per player part flagged overlay
+{
+  const box = document.getElementById('overlays');
+  manifest.players.forEach((p, i) => {
+    (p.parts || []).filter(pt => pt.overlay).forEach(pt => {
+      const lab = document.createElement('label');
+      lab.style.fontSize = '11px';
+      const inp = document.createElement('input');
+      inp.type = 'checkbox'; inp.id = 'ck_ov_' + i + '_' + pt.label; inp.checked = true;
+      inp.addEventListener('change', draw);
+      lab.appendChild(inp);
+      lab.appendChild(document.createTextNode(' ' + p.label + '·' + pt.label));
+      box.appendChild(lab);
+    });
+  });
+}
+
 document.getElementById('stats').textContent =
   `${uniqueN} unique / ${welded} welded verts, ${ntris} tris, ${manifest.players.length} player(s), ` +
   `${layers.length} layer(s) (${nMeshLayers} mesh), ${W}x${H}, light=${manifest.light_space}`;

@@ -2863,16 +2863,22 @@ def _static_collect(players, W, H, mesh_layers=None):
             return any(k in (_labs.get(o.name) or "").lower() for k in ATLAS_OVERLAY_LABELS)
         base = sorted([o for o in vis if not _is_ov(o)], key=lambda o: o.name)
         ov = sorted([o for o in vis if _is_ov(o)], key=lambda o: o.name)
+        # record each part's own tri range (label + overlay flag) so the browser can toggle each
+        # overlay piece (hat/jacket/sleeve/pant) independently; base parts are always drawn.
+        parts_meta = []
         w0, t0 = len(st["src"]), len(st["tris"]) // 3
-        for o in base:
+        for o in base + ov:
+            pt0 = len(st["tris"]) // 3
             add_part(o)
-        ov_t0 = len(st["tris"]) // 3
-        for o in ov:
-            add_part(o)
+            parts_meta.append({"label": labs.get(o.name, o.name),
+                               "tri_range": [pt0, len(st["tris"]) // 3],
+                               "overlay": o in ov})
+        ov_t0 = parts_meta[len(base)]["tri_range"][0] if ov else len(st["tris"]) // 3
         st["players"].append({"label": p["label"],
                               "welded_range": [w0, len(st["src"])],
                               "tri_range": [t0, len(st["tris"]) // 3],
                               "overlay_tri_start": ov_t0,
+                              "parts": parts_meta,
                               "n_base_parts": len(base), "n_overlay_parts": len(ov),
                               "camera_depth": round(_player_camera_depth(p) or 0.0, 3)})
     # mesh-type layers (retexturable): each group's meshes appended as one entity, its own tri range

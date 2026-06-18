@@ -20,9 +20,10 @@
   <label><input type="checkbox" id="ck_sh" checked> shadows</label>
   <label><input type="checkbox" id="ck_fg" checked> foreground</label>
   <span id="layers"></span>
+  <span id="overlays"></span>
   <span id="skins"></span>
   <span id="stats">loading…</span>
 </div>
-<script type="module" src="static.js"></script>
+<script type="module">import('./static.js?v=' + Date.now());</script>
 </body>
 </html>
