@@ -4215,6 +4215,33 @@ class OBJECT_OT_novaskin_layer_remove(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OBJECT_OT_novaskin_retexture_toggle(bpy.types.Operator):
+    """Toggle 'retexturable' on this optional layer. ON: export it as a MESH + UV light atlas +
+    base texture (swappable like a player skin, depth-tested). OFF (default): a flat beauty sprite
+    that matches the render exactly. Retexture only works if the layer's meshes share ONE texture;
+    otherwise the export falls back to a sprite."""
+    bl_idname = "object.novaskin_retexture_toggle"
+    bl_label = "Toggle Layer Retexture"
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+
+    target: StringProperty()
+    is_collection: BoolProperty(default=False)
+
+    def execute(self, context):
+        coll = bpy.data.collections if self.is_collection else bpy.data.objects
+        db = coll.get(self.target)
+        if db is None:
+            self.report({'WARNING'}, f"NovaSkin: '{self.target}' not found")
+            return {'CANCELLED'}
+        if db.get(RETEX_ID_PROP):
+            del db[RETEX_ID_PROP]
+            self.report({'INFO'}, f"NovaSkin: '{self.target}' -> sprite")
+        else:
+            db[RETEX_ID_PROP] = 1
+            self.report({'INFO'}, f"NovaSkin: '{self.target}' -> retexturable (mesh)")
+        return {'FINISHED'}
+
+
 def _menu_draw(self, context):
     self.layout.operator(RENDER_OT_novaskin.bl_idname, icon='RENDER_STILL').draft = False
     self.layout.operator(RENDER_OT_novaskin.bl_idname, text="Render Draft (NovaSkin preview)",
@@ -4318,12 +4345,21 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                 for g in groups:
                     n = len(g["meshes"])
                     txt = f"{g['object']}  ({n} mesh)" if n > 1 else g["object"]
+                    is_coll = (g["kind"] == "collection")
+                    holder = (bpy.data.collections.get(g["object"]) if is_coll
+                              else context.scene.objects.get(g["object"]))
+                    is_retex = bool(holder and holder.get(RETEX_ID_PROP))
                     row = col.row(align=True)
                     row.label(text=txt, icon=icons.get(g["kind"], 'LAYER_ACTIVE'))
+                    rx = row.operator("object.novaskin_retexture_toggle", text="", icon='TEXTURE',
+                                      depress=is_retex)         # ON = retexturable mesh, off = sprite
+                    rx.target = g["object"]; rx.is_collection = is_coll
                     rm = row.operator("object.novaskin_layer_remove", text="", icon='X',
                                       emboss=False)
                     rm.target = g["object"]
-                    rm.is_collection = (g["kind"] == "collection")
+                    rm.is_collection = is_coll
+                box.label(text="(texture icon on = retexturable mesh; off = sprite)",
+                          icon='TEXTURE')
             else:
                 box.label(text="none marked", icon='LAYER_USED')
 
@@ -4368,7 +4404,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 _classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_animated,
             RENDER_OT_novaskin_static, RENDER_OT_novaskin_cancel,
             OBJECT_OT_novaskin_layer_toggle, OBJECT_OT_novaskin_layer_remove,
-            VIEW3D_PT_novaskin)
+            OBJECT_OT_novaskin_retexture_toggle, VIEW3D_PT_novaskin)
 
 
 def _teardown_active_batch():
