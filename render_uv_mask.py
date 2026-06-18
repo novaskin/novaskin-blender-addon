@@ -3494,6 +3494,8 @@ def _static_export_steps(players, op=None, out_dir=None):
     restored -- so it is always clean."""
     out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
     os.makedirs(out_dir, exist_ok=True)
+    if FIX_2LAYER_POSITION:                         # snap the hat onto the head (persistent +
+        _fix_2layer_positions(players)             # idempotent) -- same as the legacy export
     uv_light = (STATIC_LIGHT_SPACE == "uv")        # else screen-space light (default)
     groups = discover_layers()                     # optional toggleable scenery layers
     mesh_layers, sprite_groups = _static_split_layers(groups)   # retexturable meshes vs flat sprites
