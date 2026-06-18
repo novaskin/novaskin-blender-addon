@@ -2815,24 +2815,43 @@ def _expand_pixel_uvs(parts, skin_px=None):
     return restore
 
 
+def _part_variant(label):
+    """Arm-style variant a part belongs to, from its Minecraft label suffix: 'classic'/'slim', or
+    None for parts shared by both styles (head/body/legs/hat/jacket/pant)."""
+    l = (label or "").lower()
+    return "classic" if "_classic" in l else "slim" if "_slim" in l else None
+
+
 def _static_collect(players, W, H, mesh_layers=None):
-    """Like `_anim_collect_static`, but for the static export: includes BOTH the base parts AND
-    the overlays (2nd layer) -- the base first, then the overlays per player, in painter's order
-    -- so the browser renders the overlay as a shell over the base and samples its own atlas UV
-    region (the whole point of the Option B atlas). Players are back-to-front. Records, per
-    player: welded_range, tri_range, and `overlay_tri_start` (the tri index where the overlay
-    shell begins) so the renderer can draw base then overlay (depth-tested) and alpha-discard the
-    overlay's transparent texels. Returns the dict used by `_anim_frame_positions`/
-    `_anim_write_mesh`."""
+    """Collect the static export geometry into a welded mesh. Includes BOTH the base parts AND the
+    overlays (2nd layer), per player, in painter's order, and -- for the arm style -- BOTH variants
+    (classic + slim) so the wallpaper can switch them: the rig is flipped to each style and the
+    arm/sleeve parts are collected while posed correctly. Screen positions are captured PER PART at
+    collection time (so the non-active arm variant is right even though it would be parked away when
+    re-evaluated at the end). Each player records welded_range, tri_range, overlay_tri_start, and a
+    `parts` list ({label, tri_range, overlay, variant}) for per-part / per-variant toggling.
+    Returns the dict consumed by `_static_write_geometry` (positions in st['pos'])."""
     dg = bpy.context.evaluated_depsgraph_get()
+    cam = bpy.context.scene.camera
+    ce = cam.evaluated_get(dg)
+    P = np.array(ce.calc_matrix_camera(dg, x=W, y=H) @ ce.matrix_world.inverted())
     ordered = sorted(players, key=lambda p: _player_camera_depth(p) or 0.0, reverse=True)
-    st = {"parts": [], "uv": [], "src": [], "tris": [], "players": [], "uniq": []}
+    st = {"parts": [], "uv": [], "src": [], "tris": [], "players": [], "uniq": [], "pos": []}
     weld, uniq_keys = {}, {}
 
     def add_part(o):
         pi = len(st["parts"]); st["parts"].append(o.name)
-        ev = o.evaluated_get(dg); me = ev.to_mesh(); me.calc_loop_triangles()
+        dgl = bpy.context.evaluated_depsgraph_get()      # fresh: the arm-style switch re-evaluates
+        ev = o.evaluated_get(dgl); me = ev.to_mesh(); me.calc_loop_triangles()
         uvl = me.uv_layers.active.data
+        # project this part's vertices in the CURRENT pose/variant -> screen px + camera depth
+        co = np.empty(len(me.vertices) * 3, 'f'); me.vertices.foreach_get('co', co)
+        co = co.reshape(-1, 3)
+        mw = np.array(ev.matrix_world)
+        wp = co @ mw[:3, :3].T + mw[:3, 3]
+        clip = wp @ P[:3, :3].T + P[:3, 3]
+        wcl = wp @ P[3, :3] + P[3, 3]
+        scr = (clip[:, :2] / wcl[:, None] * 0.5 + 0.5) * np.array([W, H], 'f')
         for lt in me.loop_triangles:
             for li, vi in zip(lt.loops, lt.vertices):
                 u, v = uvl[li].uv
@@ -2845,6 +2864,7 @@ def _static_collect(players, W, H, mesh_layers=None):
                     if ui is None:
                         ui = len(st["uniq"]); uniq_keys[uk] = ui
                         st["uniq"].append(uk)
+                        st["pos"].append((float(scr[vi, 0]), float(scr[vi, 1]), float(wcl[vi])))
                     st["uv"] += [min(max(u, 0.0), 1.0), min(max(v, 0.0), 1.0)]
                     st["src"].append(ui)
                 st["tris"].append(j)
@@ -2852,33 +2872,50 @@ def _static_collect(players, W, H, mesh_layers=None):
 
     for p in ordered:
         labs = p.get("uv_labels") or _assign_part_labels(p["uv_parts"], label=p["label"])
-        # Select the geometry actually rendered for THIS player: hidden parts (the unused arm
-        # style -- slim vs classic -- and per-player 2nd-layer toggles) are driven hide_render=
-        # True, so filtering by visibility picks the right arm variant and the overlays the
-        # player uses, without the basic-look duplicates discover_players carries for the UV
-        # export. Base = visible non-overlay (head/body/legs + the visible arm style); overlay =
-        # visible 2nd-layer (hat/jacket/sleeve/pant).
+        # Parts visible in the player's CURRENT arm style: base (head/body/legs + the active arm),
+        # overlay (2nd layer). The other arm variant is collected separately below.
         vis = [o for o in p["uv_parts"] if not o.hide_render]
         def _is_ov(o, _labs=labs):
             return any(k in (_labs.get(o.name) or "").lower() for k in ATLAS_OVERLAY_LABELS)
         base = sorted([o for o in vis if not _is_ov(o)], key=lambda o: o.name)
         ov = sorted([o for o in vis if _is_ov(o)], key=lambda o: o.name)
-        # record each part's own tri range (label + overlay flag) so the browser can toggle each
-        # overlay piece (hat/jacket/sleeve/pant) independently; base parts are always drawn.
         parts_meta = []
         w0, t0 = len(st["src"]), len(st["tris"]) // 3
-        for o in base + ov:
+
+        def _emit(o, overlay):
             pt0 = len(st["tris"]) // 3
             add_part(o)
             parts_meta.append({"label": labs.get(o.name, o.name),
                                "tri_range": [pt0, len(st["tris"]) // 3],
-                               "overlay": o in ov})
-        ov_t0 = parts_meta[len(base)]["tri_range"][0] if ov else len(st["tris"]) // 3
+                               "overlay": overlay, "variant": _part_variant(labs.get(o.name))})
+        for o in base:
+            _emit(o, False)
+        for o in ov:
+            _emit(o, True)
+        # The OTHER arm variant (classic<->slim): flip the rig so its arm/sleeve parts pose at the
+        # arm position, then collect them (positions captured here, while correct). Atlas is baked
+        # from the default variant only -- the two UV regions differ ~1px so the bake margin covers
+        # the other. The browser draws the parts of whichever variant is active.
+        cur_variant = next((pm["variant"] for pm in parts_meta if pm["variant"]), None)
+        if cur_variant:
+            other = "slim" if cur_variant == "classic" else "classic"
+            arm, saved = _set_arm_style(p, dict(MASK_ARM_VARIANTS)[other])
+            try:
+                other_parts = sorted([o for o in p["uv_parts"] if not o.hide_render
+                                      and _part_variant(labs.get(o.name)) == other],
+                                     key=lambda o: o.name)
+                for o in other_parts:
+                    _emit(o, _is_ov(o))
+            finally:
+                _restore_arm_style(arm, p, saved)
+        ov_t0 = next((pm["tri_range"][0] for pm in parts_meta if pm["overlay"]),
+                     len(st["tris"]) // 3)
         st["players"].append({"label": p["label"],
                               "welded_range": [w0, len(st["src"])],
                               "tri_range": [t0, len(st["tris"]) // 3],
                               "overlay_tri_start": ov_t0,
                               "parts": parts_meta,
+                              "default_variant": cur_variant,   # the arm style the atlas baked for
                               "n_base_parts": len(base), "n_overlay_parts": len(ov),
                               "camera_depth": round(_player_camera_depth(p) or 0.0, 3)})
     # mesh-type layers (retexturable): each group's meshes appended as one entity, its own tri range
@@ -2953,7 +2990,7 @@ def _static_write_geometry(players, out_dir=None, mesh_layers=None):
         s.render.use_simplify = False
         bpy.context.view_layer.update()
         st = _static_collect(players, W, H, mesh_layers=mesh_layers)
-        pos = _anim_frame_positions(st, W, H)
+        pos = np.asarray(st["pos"], 'float32')   # captured per part at collect time (variant-correct)
         welded, unique, ntris = _static_write_mesh(os.path.join(out_dir, "mesh.bin"), st)
         K, V = _anim_write_anim(os.path.join(out_dir, "positions.bin"), [pos], ANIM_QUANT, 0.0)
         return {"resolution": [W, H], "welded": welded, "unique": unique, "tris": ntris,

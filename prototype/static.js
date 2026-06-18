@@ -212,9 +212,16 @@ function drawMesh(ranges, skinTex, atlasTex, screenLight) {
 const overlayPartOn = (i, label) => {
   const e = document.getElementById('ck_ov_' + i + '_' + label); return !e || e.checked;
 };
-function playerRanges(p, i) {                         // base parts always; overlay parts if enabled
-  const parts = p.parts || [{ tri_range: p.tri_range, overlay: false }];
-  return parts.filter(pt => !pt.overlay || overlayPartOn(i, pt.label)).map(pt => pt.tri_range);
+const playerVariant = (i) => {                        // active arm style (classic|slim) for player i
+  const el = document.querySelector('input[name="armv_' + i + '"]:checked');
+  return el ? el.value : 'classic';
+};
+function playerRanges(p, i) {                         // base + enabled overlays, for the active variant
+  const parts = p.parts || [{ tri_range: p.tri_range, overlay: false, variant: null }];
+  const av = playerVariant(i);
+  return parts.filter(pt => (!pt.variant || pt.variant === av)
+                            && (!pt.overlay || overlayPartOn(i, pt.label)))
+              .map(pt => pt.tri_range);
 }
 function drawPlayer(i) {
   const p = manifest.players[i];
@@ -318,6 +325,27 @@ const nMeshLayers = layers.filter(L => L.type === 'mesh').length;
       lab.appendChild(document.createTextNode(' ' + p.label + '·' + pt.label));
       box.appendChild(lab);
     });
+  });
+}
+
+// arm-style radio (classic|slim) per player that carries both variants; default = baked variant
+{
+  const box = document.getElementById('armvariants');
+  manifest.players.forEach((p, i) => {
+    const variants = [...new Set((p.parts || []).map(pt => pt.variant).filter(Boolean))];
+    if (variants.length < 2) return;
+    const def = p.default_variant || variants[0];
+    const wrap = document.createElement('span'); wrap.style.fontSize = '11px';
+    wrap.appendChild(document.createTextNode(' ' + p.label + ' arm:'));
+    ['classic', 'slim'].forEach(v => {
+      const lab = document.createElement('label');
+      const inp = document.createElement('input');
+      inp.type = 'radio'; inp.name = 'armv_' + i; inp.value = v; inp.checked = (v === def);
+      inp.addEventListener('change', draw);
+      lab.appendChild(inp); lab.appendChild(document.createTextNode(v));
+      wrap.appendChild(lab);
+    });
+    box.appendChild(wrap);
   });
 }
 
