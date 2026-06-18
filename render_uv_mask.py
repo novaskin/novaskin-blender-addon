@@ -3828,6 +3828,10 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         name="EXR Codec",
         items=[(c, c, "") for c in ('ZIP', 'ZIPS', 'PIZ', 'PXR24', 'RLE', 'NONE', 'DWAA', 'DWAB')],
         default='ZIP')
+    export_mesh: BoolProperty(
+        name="Export Mesh (v2)", default=True,
+        description="ON: export the static MESH wallpaper (welded geometry + UV light atlas + "
+                    "depth-ordered layers, the new format). OFF: the legacy per-part image export")
     export_backface_uv: BoolProperty(name="Back Faces", default=True)
     export_illum: BoolProperty(name="Illum", default=True)
     export_shadow: BoolProperty(name="Shadow", default=True)
@@ -4284,11 +4288,15 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         if tab == 'EXPORT':
             box = layout.box()
             box.label(text="Layer Options", icon='RENDERLAYERS')
-            box.prop(st, "export_backface_uv")
-            box.prop(st, "export_illum")
-            box.prop(st, "export_shadow")
-            box.prop(st, "composite_base_layer")
-            box.prop(st, "export_background")
+            box.prop(st, "export_mesh")           # mesh v2 (new) vs legacy per-part
+            if st.export_mesh:
+                box.prop(st, "atlas_res")         # static (mesh v2) UV light-atlas size
+            else:
+                box.prop(st, "export_backface_uv")
+                box.prop(st, "export_illum")
+                box.prop(st, "export_shadow")
+                box.prop(st, "composite_base_layer")
+                box.prop(st, "export_background")
 
             box = layout.box()
             box.label(text="Quality", icon='SETTINGS')
@@ -4297,7 +4305,6 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             row.prop(st, "lightshadow_format", text="")
             if st.lightshadow_format in {'JPEG', 'WEBP'}:
                 row.prop(st, "jpeg_quality", text="Q")
-            box.prop(st, "atlas_res")             # static (mesh v2) UV light-atlas size
 
             box = layout.box()
             box.label(text="Output", icon='FILE_FOLDER')
@@ -4316,12 +4323,14 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             box.label(text="Render", icon='RENDER_STILL')
             if running:
                 box.label(text="rendering…", icon='SORTTIME')
+            elif st.export_mesh:
+                col = box.column()
+                col.scale_y = 1.4
+                col.operator("render.novaskin_static", text="Render Mesh (v2)", icon='MESH_DATA')
             else:
                 col = box.column()
                 col.scale_y = 1.4
-                col.operator("render.novaskin_static", text="Render Static (mesh v2)",
-                             icon='MESH_DATA')
-                box.operator("render.novaskin", text="Render NovaSkin (per-part)",
+                col.operator("render.novaskin", text="Render NovaSkin (per-part)",
                              icon='RENDER_STILL').draft = False
                 box.operator("render.novaskin", text="Render Draft (fast preview)",
                              icon='MOD_FLUID').draft = True
