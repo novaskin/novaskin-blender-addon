@@ -4350,16 +4350,16 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                               else context.scene.objects.get(g["object"]))
                     is_retex = bool(holder and holder.get(RETEX_ID_PROP))
                     row = col.row(align=True)
-                    rx = row.operator("object.novaskin_retexture_toggle", text="retex",
+                    row.label(text=txt, icon=icons.get(g["kind"], 'LAYER_ACTIVE'))
+                    rx = row.operator("object.novaskin_retexture_toggle", text="",
                                       icon=('CHECKBOX_HLT' if is_retex else 'CHECKBOX_DEHLT'),
                                       emboss=False)             # checkbox: on = mesh, off = sprite
                     rx.target = g["object"]; rx.is_collection = is_coll
-                    row.label(text=txt, icon=icons.get(g["kind"], 'LAYER_ACTIVE'))
                     rm = row.operator("object.novaskin_layer_remove", text="", icon='X',
                                       emboss=False)
                     rm.target = g["object"]
                     rm.is_collection = is_coll
-                box.label(text="(retex checked = retexturable mesh; else sprite)", icon='INFO')
+                box.label(text="(checkbox = retexturable mesh; else sprite)", icon='INFO')
             else:
                 box.label(text="none marked", icon='LAYER_USED')
 
