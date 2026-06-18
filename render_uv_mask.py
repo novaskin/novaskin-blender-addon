@@ -413,6 +413,8 @@ STATIC_SPRITE_KNEE = 0.03
 # (mobs are small, so 256 is plenty for the low-frequency light).
 STATIC_LAYERS_AS_MESH = True
 LAYER_ATLAS_RES = 256
+LAYER_PLACEHOLDER_PX = 16   # size of the blank base texture for a bare-UV retexturable layer
+                            # (no image in Blender -> textured entirely in the wallpaper tool)
 # How a marked optional layer is exported (a per-layer enum on the object/collection, registered in
 # register()). SPRITE (default) = a flat baked beauty image; TEXTURE/PLAYER = a re-skinnable mesh
 # (geometry + UV light atlas + base texture). PLAYER additionally tags it as a character in the
@@ -3266,39 +3268,53 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None):
 
 def _static_layer_mesh_info(group):
     """Decide whether an optional-layer GROUP can be exported as a retexturable MESH (like a player)
-    instead of a flat sprite. It qualifies when every mesh has an active UV and ALL the group's
-    materials share exactly ONE image texture (one UV/texture space) -- then the browser can
-    resample a swapped texture as tex(uv) * atlas(uv) * 2. Returns (image, True) for a mesh-type
-    layer, else (None, False) (e.g. the fish, whose eye meshes carry no texture)."""
+    instead of a flat sprite, and what its base texture is. Qualifies when every mesh has an active
+    UV and the group's materials reference AT MOST one image texture (one UV/texture space):
+      * exactly one shared image      -> that image is the base texture;
+      * NO image at all (a bare UV surface, e.g. a plane you texture entirely in the wallpaper tool)
+                                       -> a blank PLACEHOLDER base is generated (image = None).
+    Two+ distinct images, a MIX of textured + untextured materials, or a missing UV -> not a mesh
+    layer. Returns (image_or_None, qualifies)."""
     meshes = [o for o in group["meshes"] if o.type == 'MESH']
     if not meshes:
         return None, False
-    images = set()
+    images, any_untextured = set(), False
     for o in meshes:
-        if o.data.uv_layers.active is None or not o.material_slots:
+        if o.data.uv_layers.active is None:
             return None, False
+        if not o.material_slots:
+            any_untextured = True
         for ms in o.material_slots:
             mat = ms.material
             imgs = ([n.image for n in mat.node_tree.nodes
                      if n.type == 'TEX_IMAGE' and n.image is not None]
                     if (mat and mat.use_nodes) else [])
-            if not imgs:
-                return None, False        # an untextured material -> keep the whole layer a sprite
             images.update(imgs)
-    if len(images) != 1:
-        return None, False
-    return next(iter(images)), True
+            if not imgs:
+                any_untextured = True
+    if len(images) >= 2:
+        return None, False                   # conflicting textures -> no single UV/texture space
+    if len(images) == 1 and not any_untextured:
+        return next(iter(images)), True       # one shared texture -> the base
+    if len(images) == 0:
+        return None, True                     # bare UV surface -> blank placeholder base
+    return None, False                        # mixed (one texture + untextured) -> ambiguous
 
 
 def _static_export_layer_texture(image, out_dir, stem):
-    """Save a mesh-type layer's shared base texture (the swappable 'skin') as `<stem>_tex.png`
-    (lossless, sampled NEAREST as pixel art). Linear image pixels -> sRGB bytes (it is an sRGB
-    color map); same save path as the atlas so the two stay UV-aligned. Returns the bare name."""
-    w, h = image.size
-    buf = np.empty(w * h * 4, 'float32')
-    image.pixels.foreach_get(buf)
-    rgba = buf.reshape(-1, 4).copy()
-    rgba[:, :3] = _lin_to_srgb(rgba[:, :3])      # sRGB color map (alpha stays linear 0/1)
+    """Save a mesh-type layer's base texture (the swappable 'skin') as `<stem>_tex.png`. With an
+    image: its sRGB color map (linear pixels -> sRGB bytes). Without one (a bare UV surface): a small
+    neutral PLACEHOLDER, so the layer is re-textured entirely in the wallpaper tool. Sampled NEAREST.
+    Returns the bare name."""
+    if image is None:
+        w = h = LAYER_PLACEHOLDER_PX
+        rgba = np.full((w * h, 4), 0.5, 'float32'); rgba[:, 3] = 1.0   # mid-gray, opaque placeholder
+    else:
+        w, h = image.size
+        buf = np.empty(w * h * 4, 'float32')
+        image.pixels.foreach_get(buf)
+        rgba = buf.reshape(-1, 4).copy()
+        rgba[:, :3] = _lin_to_srgb(rgba[:, :3])      # sRGB color map (alpha stays linear 0/1)
     fn = stem + "_tex.png"
     _save_image(rgba.reshape(-1), w, h, os.path.join(out_dir, fn), file_format='PNG')
     return fn
