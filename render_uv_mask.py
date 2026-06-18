@@ -341,10 +341,10 @@ ANIM_CROP_PAD = 24
 # work. (With the expand off, keep ATLAS_RES low (~64) so the gaps average away.)
 STATIC_EXPAND_PIXEL_UVS = True   # expand the rig's inset per-pixel UVs to fill their skin-pixel cells
 STATIC_SKIN_PX = 64              # Minecraft skin resolution -> UV cell pitch = 1/64
-# Atlas resolution (panel: 64/128/256/512/1024). With the UV-expand on, higher = more sub-pixel light
-# detail and headroom for high-res player renders, with NO grid. Default 1024 (better too much than
-# too little). _apply_settings overrides it from the panel.
-ATLAS_RES = 1024
+# Atlas resolution (panel: 64/128/256/512/1024). With the UV-expand on, higher = sharper baked light
+# and shadows on the characters, with NO grid. Default 512 (a good balance). _apply_settings overrides
+# it from the panel.
+ATLAS_RES = 512
 ATLAS_BAKE_SAMPLES = None   # Cycles samples for the bake (denoised). None = follow the panel
                             # "Illum samples" (ILLUM_SAMPLES, live); set a fixed int to override.
 ATLAS_BAKE_MARGIN = 4      # UV island edge bleed (px)
@@ -3830,8 +3830,8 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         default='ZIP')
     export_mesh: BoolProperty(
         name="Export Mesh (v2)", default=True,
-        description="ON: export the static MESH wallpaper (welded geometry + UV light atlas + "
-                    "depth-ordered layers, the new format). OFF: the legacy per-part image export")
+        description="Export the interactive 3D wallpaper: the characters as meshes you can re-skin "
+                    "live, with toggleable scenery layers. Turn off for the older flat-image export")
     export_backface_uv: BoolProperty(name="Back Faces", default=True)
     export_illum: BoolProperty(name="Illum", default=True)
     export_shadow: BoolProperty(name="Shadow", default=True)
@@ -3841,22 +3841,23 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         name="Fix Hat Position and Scale", default=True,
         description="Snap the hat (2_Layer_Extrusion) onto the head and scale it to the "
                     "Minecraft hat size (a bit bigger than the head)")
-    illum_samples: IntProperty(name="Illum samples", default=48, min=1, max=4096)
-    lightshadow_format: EnumProperty(
+    illum_samples: IntProperty(
+        name="Samples", default=48, min=1, max=4096,
+        description="How clean the lighting and shadows look (on the characters, their shadows and "
+                    "the scenery). Higher is cleaner but slower to render; lower for quick tests")
+    lightshadow_format: EnumProperty(   # legacy file format; not shown in the UI (kept PNG)
         name="Illum/Shadow",
-        items=[('JPEG', "JPEG", ""),
-               ('WEBP', "WebP", "Smaller than JPEG at the same quality; browser-friendly"),
-               ('PNG', "PNG", "")],
-        default='JPEG')
+        items=[('JPEG', "JPEG", ""), ('WEBP', "WebP", ""), ('PNG', "PNG", "")],
+        default='PNG')
     jpeg_quality: IntProperty(name="Quality", default=90, min=1, max=100,
                               description="JPEG/WebP quality")
     atlas_res: EnumProperty(
         name="Atlas res",
-        description="Light-atlas texture size for the static (v2) export. Higher keeps finer "
-                    "sub-pixel shadows; 1024 is generous (\"better too much than too little\")",
+        description="How crisp the baked light and shadows look on the characters. Higher is "
+                    "sharper but a bit heavier; 512 is a good balance",
         items=[('64', "64", ""), ('128', "128", ""), ('256', "256", ""),
                ('512', "512", ""), ('1024', "1024", "")],
-        default='1024')
+        default='512')
     ui_tab: EnumProperty(
         name="Section",
         items=[('EXPORT', "Export", "Layer options, quality, output and the render buttons",
@@ -4301,10 +4302,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             box = layout.box()
             box.label(text="Quality", icon='SETTINGS')
             box.prop(st, "illum_samples")
-            row = box.row(align=True)
-            row.prop(st, "lightshadow_format", text="")
-            if st.lightshadow_format in {'JPEG', 'WEBP'}:
-                row.prop(st, "jpeg_quality", text="Q")
+            box.label(text="light + shadows on characters & scenery", icon='LIGHT')
 
             box = layout.box()
             box.label(text="Output", icon='FILE_FOLDER')
@@ -4312,12 +4310,6 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             if os.path.isdir(_abs(st.out_dir)):
                 box.operator("wm.path_open", text="Open Output Folder",
                              icon='FOLDER_REDIRECT').filepath = _abs(st.out_dir)
-            box.prop(st, "uv_format")
-            if st.uv_format == 'OPEN_EXR':
-                row = box.row(align=True)
-                row.prop(st, "exr_half", toggle=True)
-                row.prop(st, "exr_codec", text="")
-                box.label(text="+ light layer (when illum on)", icon='LIGHT')
 
             if not running:               # while running, the top progress bar is the indicator
                 box = layout.box()
@@ -4325,12 +4317,11 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                 col = box.column()
                 col.scale_y = 1.4
                 if st.export_mesh:
-                    col.operator("render.novaskin_static", text="Render Mesh (v2)",
-                                 icon='MESH_DATA')
+                    col.operator("render.novaskin_static", text="Render", icon='MESH_DATA')
                 else:
-                    col.operator("render.novaskin", text="Render NovaSkin (per-part)",
+                    col.operator("render.novaskin", text="Render",
                                  icon='RENDER_STILL').draft = False
-                    box.operator("render.novaskin", text="Render Draft (fast preview)",
+                    box.operator("render.novaskin", text="Render Draft (test only)",
                                  icon='MOD_FLUID').draft = True
 
             if WALLPAPER_TOOL_URL:
@@ -4383,7 +4374,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                     is_retex = bool(holder and holder.get(RETEX_ID_PROP))
                     row = col.row(align=True)
                     row.label(text=txt, icon=icons.get(g["kind"], 'LAYER_ACTIVE'))
-                    rx = row.operator("object.novaskin_retexture_toggle", text="",
+                    rx = row.operator("object.novaskin_retexture_toggle", text="retex",
                                       icon=('CHECKBOX_HLT' if is_retex else 'CHECKBOX_DEHLT'),
                                       emboss=False)             # checkbox: on = mesh, off = sprite
                     rx.target = g["object"]; rx.is_collection = is_coll
