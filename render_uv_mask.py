@@ -3855,13 +3855,12 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         default='1024')
     ui_tab: EnumProperty(
         name="Section",
-        items=[('EXPORT', "Export", "Output, layers and quality for the static export",
+        items=[('EXPORT', "Export", "Layer options, quality, output and the render buttons",
                 'FILE_FOLDER', 0),
-               ('OPTIONAL', "Optional", "Optional toggleable scenery layers",
-                'OUTLINER_OB_MESH', 1),
-               ('ANIM', "Mesh", "Mesh-based wallpaper exports: static (v2) and animated (beta)",
-                'MESH_DATA', 2),
-               ('RIG', "Rig", "Rig fixes and detected players", 'ARMATURE_DATA', 3)],
+               ('LAYERS', "Layers", "Detected rig + optional toggleable layers",
+                'RENDERLAYERS', 1),
+               ('ANIM', "Animation", "Animated wallpaper export (beta)",
+                'RENDER_ANIMATION', 2)],
         default='EXPORT')
 
 
@@ -4259,8 +4258,10 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         st = context.scene.novaskin
+        running = _PROGRESS["running"]
 
-        if _PROGRESS["running"]:
+        # Live progress + cancel stay visible on every tab while a render runs.
+        if running:
             col = layout.column()
             pct = _PROGRESS["frac"] * 100.0
             try:
@@ -4272,24 +4273,32 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             row.scale_y = 1.3
             row.operator("render.novaskin_cancel", text="Cancel", icon='CANCEL')
             col.label(text="(or Esc in the viewport)")
-        else:
-            col = layout.column()
-            col.scale_y = 1.5
-            col.operator("render.novaskin", icon='RENDER_STILL').draft = False
-            row = layout.row()
-            row.operator("render.novaskin", text="Render Draft (fast preview)",
-                         icon='MOD_FLUID').draft = True
 
-        # No-rig warning stays visible on every tab (the detail + link live in the Rig tab).
+        # No-rig warning stays visible on every tab (the detail + link live in the Layers tab).
         if not _player_armatures():
-            layout.label(text="No Thomas rig found — see the Rig tab", icon='ERROR')
+            layout.label(text="No Thomas rig found — see the Layers tab", icon='ERROR')
 
-        # Tab row: only the selected section's settings are drawn below (keeps the panel
-        # compact; the render buttons above stay visible on every tab).
         layout.row().prop(st, "ui_tab", expand=True)
         tab = st.ui_tab
 
         if tab == 'EXPORT':
+            box = layout.box()
+            box.label(text="Layer Options", icon='RENDERLAYERS')
+            box.prop(st, "export_backface_uv")
+            box.prop(st, "export_illum")
+            box.prop(st, "export_shadow")
+            box.prop(st, "composite_base_layer")
+            box.prop(st, "export_background")
+
+            box = layout.box()
+            box.label(text="Quality", icon='SETTINGS')
+            box.prop(st, "illum_samples")
+            row = box.row(align=True)
+            row.prop(st, "lightshadow_format", text="")
+            if st.lightshadow_format in {'JPEG', 'WEBP'}:
+                row.prop(st, "jpeg_quality", text="Q")
+            box.prop(st, "atlas_res")             # static (mesh v2) UV light-atlas size
+
             box = layout.box()
             box.label(text="Output", icon='FILE_FOLDER')
             box.prop(st, "out_dir")
@@ -4304,20 +4313,18 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                 box.label(text="+ light layer (when illum on)", icon='LIGHT')
 
             box = layout.box()
-            box.label(text="Layers", icon='RENDERLAYERS')
-            box.prop(st, "export_backface_uv")
-            box.prop(st, "export_illum")
-            box.prop(st, "export_shadow")
-            box.prop(st, "composite_base_layer")
-            box.prop(st, "export_background")
-
-            box = layout.box()
-            box.label(text="Quality", icon='SETTINGS')
-            box.prop(st, "illum_samples")
-            row = box.row(align=True)
-            row.prop(st, "lightshadow_format", text="")
-            if st.lightshadow_format in {'JPEG', 'WEBP'}:
-                row.prop(st, "jpeg_quality", text="Q")
+            box.label(text="Render", icon='RENDER_STILL')
+            if running:
+                box.label(text="rendering…", icon='SORTTIME')
+            else:
+                col = box.column()
+                col.scale_y = 1.4
+                col.operator("render.novaskin_static", text="Render Static (mesh v2)",
+                             icon='MESH_DATA')
+                box.operator("render.novaskin", text="Render NovaSkin (per-part)",
+                             icon='RENDER_STILL').draft = False
+                box.operator("render.novaskin", text="Render Draft (fast preview)",
+                             icon='MOD_FLUID').draft = True
 
             if WALLPAPER_TOOL_URL:
                 # web links honor the "Allow Online Access" preference (extension guideline)
@@ -4329,7 +4336,25 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                     layout.label(text="(enable Allow Online Access for web links)",
                                  icon='INFO')
 
-        elif tab == 'OPTIONAL':
+        elif tab == 'LAYERS':
+            box = layout.box()
+            box.label(text="Rig", icon='ARMATURE_DATA')
+            box.prop(st, "fix_2layer_position")
+            arms = _player_armatures()
+            if arms:
+                box.label(text=f"{len(arms)} player(s) detected:",
+                          icon='OUTLINER_OB_ARMATURE')
+                col = box.column(align=True)
+                for a in arms:
+                    col.label(text=a.name, icon='DOT')
+            else:
+                box.label(text=f"no '{RIG_ID_VALUE or RIG_ID_PROP}' rig found", icon='ERROR')
+                box.label(text="This exporter needs the Thomas Rig Legacy.")
+                row = box.row()
+                row.enabled = bpy.app.online_access
+                row.operator("wm.url_open", text="Get the rig (extensions.blender.org)",
+                             icon='URL').url = RIG_SOURCE_URL
+
             box = layout.box()
             box.label(text="Optional Layers", icon='OUTLINER_OB_MESH')
             box.operator("object.novaskin_layer_toggle", icon='PINNED')
@@ -4365,40 +4390,18 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 
         elif tab == 'ANIM':
             box = layout.box()
-            box.label(text="Static (mesh v2, beta)", icon='MESH_DATA')
-            box.operator("render.novaskin_static", icon='RENDER_STILL')
-            box.prop(st, "atlas_res")
-            box.label(text="vertices + UV light atlas, current frame", icon='INFO')
-
-            box = layout.box()
             box.label(text="Animated (beta)", icon='RENDER_ANIMATION')
-            box.operator("render.novaskin_animated", icon='RENDER_ANIMATION').draft = False
-            box.operator("render.novaskin_animated",
-                         text=f"Export Animation Draft (~{ANIM_DRAFT_SECONDS}s)",
-                         icon='MOD_FLUID').draft = True
+            if running:
+                box.label(text="rendering…", icon='SORTTIME')
+            else:
+                box.operator("render.novaskin_animated", icon='RENDER_ANIMATION').draft = False
+                box.operator("render.novaskin_animated",
+                             text=f"Export Animation Draft (~{ANIM_DRAFT_SECONDS}s)",
+                             icon='MOD_FLUID').draft = True
             box.label(text=f"frames {context.scene.frame_start}-{context.scene.frame_end}"
                            f" @ {context.scene.render.fps} fps, base layer only")
             box.label(text=f"(draft renders only the first ~{ANIM_DRAFT_SECONDS}s)",
                       icon='INFO')
-
-        elif tab == 'RIG':
-            box = layout.box()
-            box.label(text="Rig", icon='ARMATURE_DATA')
-            box.prop(st, "fix_2layer_position")
-            arms = _player_armatures()
-            if arms:
-                box.label(text=f"{len(arms)} player(s) detected:",
-                          icon='OUTLINER_OB_ARMATURE')
-                col = box.column(align=True)
-                for a in arms:
-                    col.label(text=a.name, icon='DOT')
-            else:
-                box.label(text=f"no '{RIG_ID_VALUE or RIG_ID_PROP}' rig found", icon='ERROR')
-                box.label(text="This exporter needs the Thomas Rig Legacy.")
-                row = box.row()
-                row.enabled = bpy.app.online_access
-                row.operator("wm.url_open", text="Get the rig (extensions.blender.org)",
-                             icon='URL').url = RIG_SOURCE_URL
 
 
 _classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_animated,
