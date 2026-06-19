@@ -3515,6 +3515,12 @@ def _static_export_steps(players, op=None, out_dir=None):
     if STATIC_EXPAND_PIXEL_UVS:
         restore_uv = _expand_pixel_uvs([o for p in players for o in (p.get("uv_parts") or [])])
         bpy.context.view_layer.update()
+    # Force the "Second layer" toggle ON for the WHOLE export (before the _Session snapshots) so the
+    # overlay parts (jacket / sleeves / pants) are visible in the collected mesh AND in the rendered
+    # silhouette / shadow / atlas -- otherwise a rig left with the toggle OFF exports only the hat
+    # (which _fix_2layer_positions unhides explicitly) and the other overlays are driver-hidden out.
+    # The browser toggles each overlay part per player; restored to the artist's value at the end.
+    forced_props = _force_selection_props_on(players)
     try:
         # 1) per-player UV light atlases (only for light_space="uv"; the screen-space light is
         #    rendered in step 3 instead). Baked in the normal look so it sees the real lighting.
@@ -3588,6 +3594,7 @@ def _static_export_steps(players, op=None, out_dir=None):
               f"light={STATIC_LIGHT_SPACE})")
         return manifest
     finally:
+        _restore_selection_props(forced_props)         # restore the artist's Second-layer toggle
         if restore_uv is not None:
             restore_uv()
             bpy.context.view_layer.update()
