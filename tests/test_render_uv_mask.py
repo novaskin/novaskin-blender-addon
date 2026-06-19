@@ -165,29 +165,83 @@ class TestAssignPartLabels(unittest.TestCase):
         self.assertEqual(a, b)
 
 
-class _Slot:
-    def __init__(self, mat_name):
-        self.material = None if mat_name is None else type("_Mat", (), {"name": mat_name})()
+class _Inp:
+    def __init__(self, default=0.0, linked=False):
+        self.default_value = default
+        self.is_linked = linked
 
 
-class _WObj:
-    def __init__(self, name, mats=()):
-        self.name = name
-        self.material_slots = [_Slot(mn) for mn in mats]
+class _Node:
+    def __init__(self, ntype, inputs=None, node_tree=None):
+        self.type = ntype
+        self.inputs = inputs if inputs is not None else {}
+        self.node_tree = node_tree
 
 
-class TestIsWaterObj(unittest.TestCase):
-    def test_by_material_name(self):
-        self.assertTrue(m._is_water_obj(_WObj("wateroceanmodifier", ["water2"])))
-        self.assertTrue(m._is_water_obj(_WObj("Pond", ["Ocean_surface"])))
+class _NodeTree:
+    def __init__(self, nodes):
+        self.nodes = nodes
 
-    def test_lava_object_named_water_is_not_water(self):
-        # the real 'water.001' object whose material is 'lava.001' must NOT count as water
-        self.assertFalse(m._is_water_obj(_WObj("water.001", ["lava.001"])))
 
-    def test_falls_back_to_object_name_when_no_materials(self):
-        self.assertTrue(m._is_water_obj(_WObj("Water", [])))
-        self.assertFalse(m._is_water_obj(_WObj("Rock", [])))
+class _Mat:
+    def __init__(self, nodes=None, use_nodes=True, diffuse_color=(0, 0, 0, 1)):
+        self.use_nodes = use_nodes
+        self.node_tree = _NodeTree(nodes or [])
+        self.diffuse_color = diffuse_color
+
+
+class _MSlot:
+    def __init__(self, mat):
+        self.material = mat
+
+
+class _TObj:
+    def __init__(self, mats, override=None):
+        self.material_slots = [_MSlot(m) for m in mats]
+        self._ov = override
+
+    def get(self, key, default=None):
+        return self._ov if (key == "nsk_transmissive" and self._ov is not None) else default
+
+
+def _principled(transmission=0.0, alpha=1.0, tr_linked=False, al_linked=False):
+    return _Node('BSDF_PRINCIPLED', inputs={
+        'Transmission Weight': _Inp(transmission, tr_linked),
+        'Alpha': _Inp(alpha, al_linked),
+    })
+
+
+class TestTransmissive(unittest.TestCase):
+    """`_material_is_transmissive` / `_obj_is_transmissive`: decide tint-vs-cut by the actual material
+    transmission (general), NOT by an object/material name (which only fit one scene)."""
+
+    def test_glass_and_transparent_bsdf(self):
+        self.assertTrue(m._material_is_transmissive(_Mat(nodes=[_Node('BSDF_GLASS')])))
+        self.assertTrue(m._material_is_transmissive(_Mat(nodes=[_Node('BSDF_TRANSPARENT')])))
+
+    def test_principled_transmission_or_low_alpha(self):
+        self.assertTrue(m._material_is_transmissive(_Mat(nodes=[_principled(transmission=1.0)])))
+        self.assertTrue(m._material_is_transmissive(_Mat(nodes=[_principled(alpha=0.4)])))
+
+    def test_opaque_principled_is_not(self):
+        self.assertFalse(m._material_is_transmissive(_Mat(nodes=[_principled()])))
+
+    def test_linked_alpha_cutout_stays_opaque(self):
+        # a leaf cutout (Alpha driven by a texture) must NOT count as a see-through tint
+        self.assertFalse(m._material_is_transmissive(_Mat(nodes=[_principled(al_linked=True)])))
+
+    def test_non_node_material_uses_alpha(self):
+        self.assertTrue(m._material_is_transmissive(_Mat(use_nodes=False, diffuse_color=(1, 1, 1, 0.3))))
+        self.assertFalse(m._material_is_transmissive(_Mat(use_nodes=False, diffuse_color=(1, 1, 1, 1))))
+
+    def test_transmissive_inside_node_group(self):
+        grp = _Node('GROUP', node_tree=_NodeTree([_Node('BSDF_TRANSPARENT')]))
+        self.assertTrue(m._material_is_transmissive(_Mat(nodes=[grp])))
+
+    def test_override_property_wins_either_way(self):
+        self.assertFalse(m._obj_is_transmissive(_TObj([_Mat(nodes=[_principled()])])))
+        self.assertTrue(m._obj_is_transmissive(_TObj([_Mat(nodes=[_principled()])], override=True)))
+        self.assertFalse(m._obj_is_transmissive(_TObj([_Mat(nodes=[_Node('BSDF_GLASS')])], override=False)))
 
 
 class TestCloseMask(unittest.TestCase):

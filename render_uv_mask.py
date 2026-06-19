@@ -3415,16 +3415,47 @@ def _static_split_layers(groups):
     return mesh_layers, sprite_groups
 
 
-def _is_water_obj(o):
-    """Heuristic: is this scenery object the WATER surface (so a half-submerged sprite should render
-    WITH it tinting the submerged part, instead of the water cutting the sprite like opaque scenery)?
-    Matches by MATERIAL name first (so the 'water.001' lava object -- material 'lava.001' -- is NOT
-    treated as water); falls back to the object name only when it has no materials to check."""
-    mats = [sl.material.name.lower() for sl in o.material_slots if sl.material]
-    if mats:
-        return any(("water" in m or "ocean" in m) for m in mats)
-    n = o.name.lower()
-    return "water" in n or "ocean" in n
+def _material_is_transmissive(mat):
+    """True if the material lets what is behind it show through (glass / water / ice / any alpha-blend
+    or transmission), by scanning its shader nodes -- recursing up to a few levels into node groups.
+    This is the physical property that decides tint-vs-cut, so it generalizes to ANY scene (no name
+    matching). Conservative on a LINKED Alpha (that is usually a CUTOUT mask -- a leaf shape -- not a
+    see-through tint), which stays opaque so it holds out cleanly."""
+    if mat is None:
+        return False
+    if not mat.use_nodes:
+        dc = getattr(mat, "diffuse_color", None)
+        return bool(dc is not None and len(dc) > 3 and dc[3] < 0.999)
+
+    def scan(nodes, depth):
+        for n in nodes:
+            t = n.type
+            if t in ('BSDF_TRANSPARENT', 'BSDF_GLASS', 'BSDF_REFRACTION', 'BSDF_TRANSLUCENT'):
+                return True
+            if t == 'BSDF_PRINCIPLED':
+                tr = n.inputs.get('Transmission Weight') or n.inputs.get('Transmission')
+                if tr is not None and (tr.is_linked or tr.default_value > 1e-3):
+                    return True
+                al = n.inputs.get('Alpha')
+                if al is not None and not al.is_linked and al.default_value < 0.999:
+                    return True
+            if t == 'GROUP' and n.node_tree is not None and depth < 3:
+                if scan(n.node_tree.nodes, depth + 1):
+                    return True
+        return False
+
+    return scan(mat.node_tree.nodes, 0)
+
+
+def _obj_is_transmissive(o):
+    """Should a submerged sprite/player be TINTED by this object (it is see-through) rather than CUT
+    by it as an opaque holdout? Decided from the MATERIAL transmission/transparency (not by name, so
+    it works in any scene). A per-object override `o["nsk_transmissive"]` (bool) wins when set, for a
+    material the node scan cannot read (e.g. a custom transparency node group)."""
+    ov = o.get("nsk_transmissive")
+    if ov is not None:
+        return bool(ov)
+    return any(_material_is_transmissive(sl.material) for sl in o.material_slots)
 
 
 def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zmax, out_dir=None):
@@ -3458,10 +3489,11 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
             safe = g["name"]
             group_names = {m.name for m in meshes}
             # isolate: this group visible, players + every other layer hidden. Opaque FOLIAGE/terrain
-            # in front is a holdout (it CUTS the sprite, so a spear sits behind a leaf); but the WATER
-            # is left to RENDER, so a half-submerged mob (axolotl / turtle / boat) shows the water
-            # tinting its submerged part -- it sits IN the scene, not as a flat decal on top. The
-            # surrounding water (where there is no mob) is masked back out with the mob's silhouette.
+            # in front is a holdout (it CUTS the sprite, so a spear sits behind a leaf); but a
+            # TRANSMISSIVE surface (water / glass -- by material, not name) is left to RENDER, so a
+            # half-submerged mob (axolotl / turtle / boat) shows it tinting the submerged part -- it
+            # sits IN the scene, not as a flat decal. The surrounding tint (where there is no mob) is
+            # masked back out with the mob's silhouette.
             sess.restore_visibility()
             sess.mute_drivers(True)
             for o in s.objects:
@@ -3477,24 +3509,24 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
                     o.hide_render = True
             scenery = [o for o in s.objects if o.type == 'MESH'
                        and o.name not in group_names and o.name not in entity_names]
-            water_sc = [o for o in scenery if _is_water_obj(o)]
+            trans_sc = [o for o in scenery if _obj_is_transmissive(o)]
             sc_ho = {o: o.is_holdout for o in scenery}
             for o in scenery:
-                o.is_holdout = o not in water_sc      # foliage cuts; water renders over the mob
+                o.is_holdout = o not in trans_sc  # opaque cuts; transmissive renders over the mob
             bpy.context.view_layer.update()
             try:
-                # C: the mob in its environment -- water renders over the submerged part, foliage cuts
+                # C: the mob in its environment -- transmissive surfaces tint the submerged part, opaque cuts
                 comb, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
-                # D: the mob ALONE (water hidden too) -> full silhouette + clean camera depth. The
-                # silhouette masks the surrounding water out of C; the depth is the mob's own (C's
-                # depth over the submerged part would read the water surface, not the mob).
-                water_shown = [o for o in water_sc if not o.hide_render]
-                for o in water_shown:
+                # D: the mob ALONE (transmissive hidden too) -> full silhouette + clean camera depth.
+                # The silhouette masks the surrounding tint out of C; the depth is the mob's own (C's
+                # depth over the submerged part would read the water/glass surface, not the mob).
+                trans_shown = [o for o in trans_sc if not o.hide_render]
+                for o in trans_shown:
                     o.hide_render = True
                 bpy.context.view_layer.update()
                 sil, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
                 dep, _, _ = sess.render_pass('Depth', 'CYCLES', 1, ILLUM_RES_PCT)   # mob camera depth
-                for o in water_shown:
+                for o in trans_shown:
                     o.hide_render = False
             finally:
                 for o, v in sc_ho.items():
@@ -3503,7 +3535,7 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
 
             ca = np.clip(comb[:, 3], 0.0, 1.0)
             mob_gate = np.clip(sil[:, 3], 0.0, 1.0) > 0.01     # where the mob is (incl. submerged)
-            alpha = ca * mob_gate                              # tight to the mob; surrounding water gone
+            alpha = ca * mob_gate                              # tight to the mob; surrounding tint gone
             straight = np.where(ca[:, None] > 1e-4,
                                 comb[:, :3] / np.maximum(ca[:, None], 1e-4), 0.0)
             vis = alpha > 1e-4

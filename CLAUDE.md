@@ -74,13 +74,16 @@ The panel (3D Viewport sidebar → "NovaSkin" tab) has Export / Layers / Animati
 - **Sprites = tight silhouette + separate shadow**, NOT a LOOSE beauty-overlay of the full scene.
   Folding the whole scene-with-mob in with a loose alpha double-images the water against the
   background. The sprite is the mob masked to its OWN silhouette: opaque foliage/terrain is a
-  holdout (it cuts the sprite so it sits behind a leaf), but the WATER is left to RENDER over a
-  submerged part — a half-submerged axolotl/turtle shows the water tinting it, not a flat decal.
-  The surrounding water (no mob) is masked back out with the mob's silhouette (`_static_render_layers`
-  takes a second water-hidden render for the mask + the mob's clean depth), so it stays tight and
-  does NOT double-image. Water is identified by `_is_water_obj` (material name). Its cast shadow /
-  water darkening is a SEPARATE multiply ratio composited before the players. Sprites order by
-  `camera_depth` (painter order) + a per-sprite depth map for the players/mesh-layers.
+  holdout (it cuts the sprite so it sits behind a leaf), but a TRANSMISSIVE surface (water/glass) is
+  left to RENDER over a submerged part — a half-submerged axolotl/turtle shows it tinting them, not a
+  flat decal. The surrounding tint (no mob) is masked back out with the mob's silhouette
+  (`_static_render_layers` takes a second transmissive-hidden render for the mask + the mob's clean
+  depth), so it stays tight and does NOT double-image. Transmissive vs opaque is decided by
+  `_obj_is_transmissive` — it scans the MATERIAL for glass/transparency/transmission (NOT by name, so
+  it generalizes to any scene; a LINKED Alpha is treated as a cutout = opaque; a per-object
+  `nsk_transmissive` bool overrides). Its cast shadow / water darkening is a SEPARATE multiply ratio
+  composited before the players. Sprites order by `camera_depth` (painter order) + a per-sprite depth
+  map for the players/mesh-layers.
 - **Overlay parts** (hat / jacket / sleeves / pants 2nd layer) must ALWAYS export, even if the
   rig's "Second layer" toggle is OFF. `_static_export_steps` forces it ON via
   `_force_selection_props_on` (restored at the end), like the legacy/animated renders. The browser
