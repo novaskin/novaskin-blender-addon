@@ -3610,7 +3610,7 @@ def _box_blur_rgb(rgb2d, iterations=2):
     return out
 
 
-def _static_render_water_tint(players, out_dir=None):
+def _static_render_water_tint(players, all_layer_mesh_names=None, out_dir=None):
     """Per player, a screen-space WATER-TINT map so a SUBMERGED player stays re-skinnable but is
     tinted by the transmissive surface in front of it (water/glass), instead of looking like a flat
     decal on top of it. The PURE transmission is extracted by two-background matting -- the player as
@@ -3626,7 +3626,8 @@ def _static_render_water_tint(players, out_dir=None):
     out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
     os.makedirs(out_dir, exist_ok=True)
     char_names = {o.name for p in players for o in p["char_all"]}
-    scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in char_names]
+    entity_names = char_names | set(all_layer_mesh_names or [])   # players AND layers are composited
+    scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in entity_names]
     transmissive = [o for o in scenery if _obj_is_transmissive(o)]
     if not transmissive:
         return {}                                  # no water/glass anywhere -> no tint to bake
@@ -3662,9 +3663,9 @@ def _static_render_water_tint(players, out_dir=None):
 
             sess.restore_visibility()
             sess.mute_drivers(True)
-            for o in s.objects:                    # isolate: other entities + OPAQUE scenery hidden,
-                if o.name in char_names and o.name not in own:   # so only the player + the water remain
-                    o.hide_render = True
+            for o in s.objects:                    # isolate: other entities (players AND layers, e.g.
+                if o.name in entity_names and o.name not in own:  # leg armor) + OPAQUE scenery hidden,
+                    o.hide_render = True                          # so only THIS player + the water remain
             op_hr = {o: o.hide_render for o in opaque}
             for o in opaque:
                 o.hide_render = True
@@ -4010,7 +4011,7 @@ def _static_export_steps(players, op=None, out_dir=None):
         yield prog(f"masks ({len(masks)})")
         # 4b) per-player WATER TINT: a submerged player stays re-skinnable but is tinted by the water
         #     in front of it (a colored multiply over the relit skin), instead of a flat decal on top.
-        water_tints = _static_render_water_tint(players, out_dir=out_dir)
+        water_tints = _static_render_water_tint(players, all_layer_mesh_names, out_dir=out_dir)
         yield prog(f"water tint ({len(water_tints)})")
         # 4c) OVERLAY layers (rain / glare): rendered alone -> foreground.webp, composited on top
         if overlay_groups:
