@@ -191,6 +191,7 @@ const drawOrder = [
   ...layers.map((L, i) => ({ kind: 'layer', i, depth: L.camera_depth ?? Infinity })),
 ].sort((a, b) => b.depth - a.depth);
 const layerOn = (i) => { const e = document.getElementById('ck_layer_' + i); return !e || e.checked; };
+const playerOn = (i) => { const e = document.getElementById('ck_player_' + i); return !e || e.checked; };
 
 // shared mesh draw (players + mesh-type layers): relit skin/tex * light * 2, depth-tested.
 // `ranges` = the tri ranges to draw (per part, so disabled overlay parts are simply omitted).
@@ -248,14 +249,14 @@ function draw() {
   if (ck('ck_sh')) {
     gl.enable(gl.BLEND); gl.blendFunc(gl.ZERO, gl.SRC_COLOR);
     if (showPlayers) for (let i = 0; i < tPlayerShadow.length; i++)
-      if (tPlayerShadow[i]) blitQuad(tPlayerShadow[i]);
+      if (tPlayerShadow[i] && playerOn(i)) blitQuad(tPlayerShadow[i]);
     for (let i = 0; i < tLayerShadow.length; i++)
       if (tLayerShadow[i] && layerOn(i)) blitQuad(tLayerShadow[i]);
     gl.disable(gl.BLEND);
   }
 
   for (const it of drawOrder) {                      // walk the merged list, back -> front
-    if (it.kind === 'player') { if (showPlayers) drawPlayer(it.i); }
+    if (it.kind === 'player') { if (showPlayers && playerOn(it.i)) drawPlayer(it.i); }
     else if (layerOn(it.i)) drawLayer(it.i);         // mesh (geometry) or sprite (quad)
   }
 
@@ -269,7 +270,11 @@ function setLayerTex(i, source) { if (tLayerTex[i]) { upload(tLayerTex[i], sourc
   const box = document.getElementById('skins');
   manifest.players.forEach((p, i) => {
     const lab = document.createElement('label');
-    lab.textContent = ` ${p.label}: `;
+    const tog = document.createElement('input');         // per-player toggle (independent)
+    tog.type = 'checkbox'; tog.id = 'ck_player_' + i; tog.checked = true;
+    tog.addEventListener('change', draw);
+    lab.appendChild(tog);
+    lab.appendChild(document.createTextNode(` ${p.label}: `));
     const inp = document.createElement('input');
     inp.type = 'file'; inp.accept = 'image/png,image/webp,image/jpeg';
     inp.style.width = '110px';
