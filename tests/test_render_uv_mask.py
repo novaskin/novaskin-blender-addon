@@ -165,6 +165,31 @@ class TestAssignPartLabels(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class _Slot:
+    def __init__(self, mat_name):
+        self.material = None if mat_name is None else type("_Mat", (), {"name": mat_name})()
+
+
+class _WObj:
+    def __init__(self, name, mats=()):
+        self.name = name
+        self.material_slots = [_Slot(mn) for mn in mats]
+
+
+class TestIsWaterObj(unittest.TestCase):
+    def test_by_material_name(self):
+        self.assertTrue(m._is_water_obj(_WObj("wateroceanmodifier", ["water2"])))
+        self.assertTrue(m._is_water_obj(_WObj("Pond", ["Ocean_surface"])))
+
+    def test_lava_object_named_water_is_not_water(self):
+        # the real 'water.001' object whose material is 'lava.001' must NOT count as water
+        self.assertFalse(m._is_water_obj(_WObj("water.001", ["lava.001"])))
+
+    def test_falls_back_to_object_name_when_no_materials(self):
+        self.assertTrue(m._is_water_obj(_WObj("Water", [])))
+        self.assertFalse(m._is_water_obj(_WObj("Rock", [])))
+
+
 class TestCloseMask(unittest.TestCase):
     """Morphological close that fills the thin interior index-0 cracks in the occlusion mask."""
 

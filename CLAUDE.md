@@ -71,10 +71,16 @@ The panel (3D Viewport sidebar → "NovaSkin" tab) has Export / Layers / Animati
   never remove it). Scenery stays visible.
 - **One sample count for the whole export** — the background, per-entity shadow, and sprite
   renders all use the panel "Samples"; differing counts cause a composite quality seam.
-- **Sprites = tight silhouette + separate shadow**, NOT a beauty-overlay of the full scene.
-  Folding the whole scene-with-mob into the sprite double-images the water against the background.
-  The sprite is the mob alone (scenery as a holdout); its darkening is a separate multiply ratio
-  composited before the players. Sprites order by `camera_depth` (painter order), no per-pixel depth.
+- **Sprites = tight silhouette + separate shadow**, NOT a LOOSE beauty-overlay of the full scene.
+  Folding the whole scene-with-mob in with a loose alpha double-images the water against the
+  background. The sprite is the mob masked to its OWN silhouette: opaque foliage/terrain is a
+  holdout (it cuts the sprite so it sits behind a leaf), but the WATER is left to RENDER over a
+  submerged part — a half-submerged axolotl/turtle shows the water tinting it, not a flat decal.
+  The surrounding water (no mob) is masked back out with the mob's silhouette (`_static_render_layers`
+  takes a second water-hidden render for the mask + the mob's clean depth), so it stays tight and
+  does NOT double-image. Water is identified by `_is_water_obj` (material name). Its cast shadow /
+  water darkening is a SEPARATE multiply ratio composited before the players. Sprites order by
+  `camera_depth` (painter order) + a per-sprite depth map for the players/mesh-layers.
 - **Overlay parts** (hat / jacket / sleeves / pants 2nd layer) must ALWAYS export, even if the
   rig's "Second layer" toggle is OFF. `_static_export_steps` forces it ON via
   `_force_selection_props_on` (restored at the end), like the legacy/animated renders. The browser
