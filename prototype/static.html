@@ -4,27 +4,80 @@
 <meta charset="utf-8">
 <title>NovaSkin static wallpaper — mesh v2 prototype</title>
 <style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
   body { margin: 0; background: #111; color: #ddd; font: 13px/1.4 system-ui, sans-serif; }
-  #wrap { width: 960px; margin: 16px auto; }
-  canvas { display: block; width: 960px; }
-  #hud { width: 960px; margin: 8px auto; display: flex; gap: 16px; align-items: center;
-         flex-wrap: wrap; }
+
+  /* full-screen split: controls left, preview right (desktop only) */
+  #app { display: flex; height: 100vh; }
+
+  /* left column — toggles */
+  #sidebar {
+    flex: 0 0 300px; overflow-y: auto; padding: 16px;
+    background: #181818; border-right: 1px solid #2a2a2a;
+    display: flex; flex-direction: column; gap: 18px;
+  }
+  #sidebar h2 {
+    margin: 0 0 6px; font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .06em; color: #888;
+  }
+  .group { display: flex; flex-direction: column; gap: 6px; }
+  /* JS appends inline <label>/<span> into these — stack them vertically */
+  #layers, #skins, #overlays, #armvariants { display: flex; flex-direction: column; gap: 6px; }
+  .group label, #layers label, #skins label, #overlays label {
+    display: flex; align-items: center; gap: 6px; cursor: pointer;
+  }
+  .group input { margin: 0; }
+  #stats {
+    margin-top: auto; padding-top: 12px; border-top: 1px solid #2a2a2a;
+    font-size: 11px; color: #777;
+  }
+
+  /* right column — preview fills the rest, image scaled to fit */
+  #preview { flex: 1; min-width: 0; padding: 16px; background: #0d0d0d; }
+  #preview canvas { display: block; width: 100%; height: 100%; object-fit: contain; }
 </style>
 </head>
 <body>
-<div id="wrap"><canvas id="gl"></canvas></div>
-<div id="hud">
-  <label><input type="checkbox" id="ck_bg" checked> background</label>
-  <label><input type="checkbox" id="ck_pl" checked> players</label>
-  <label><input type="checkbox" id="ck_li" checked> light (atlas)</label>
-  <label><input type="checkbox" id="ck_sh" checked> shadows</label>
-  <label><input type="checkbox" id="ck_mask" checked> mask (occlusion)</label>
-  <label><input type="checkbox" id="ck_fg"> foreground</label>
-  <span id="layers"></span>
-  <span id="overlays"></span>
-  <span id="armvariants"></span>
-  <span id="skins"></span>
-  <span id="stats">loading…</span>
+<div id="app">
+  <aside id="sidebar">
+    <div class="group">
+      <h2>Scene</h2>
+      <label><input type="checkbox" id="ck_bg" checked> background</label>
+      <label><input type="checkbox" id="ck_pl" checked> players</label>
+      <label><input type="checkbox" id="ck_li" checked> light (atlas)</label>
+      <label><input type="checkbox" id="ck_sh" checked> shadows</label>
+      <label><input type="checkbox" id="ck_mask" checked> mask (occlusion)</label>
+      <label><input type="checkbox" id="ck_fg"> foreground</label>
+    </div>
+
+    <div class="group">
+      <h2>Layers</h2>
+      <span id="layers"></span>
+    </div>
+
+    <div class="group">
+      <h2>Skins</h2>
+      <span id="skins"></span>
+    </div>
+
+    <div class="group">
+      <h2>Overlays</h2>
+      <span id="overlays"></span>
+    </div>
+
+    <div class="group">
+      <h2>Arm variants</h2>
+      <span id="armvariants"></span>
+    </div>
+
+    <div id="stats">loading…</div>
+  </aside>
+
+  <main id="preview">
+    <canvas id="gl"></canvas>
+  </main>
 </div>
 <script type="module">import('./static.js?v=' + Date.now());</script>
 </body>

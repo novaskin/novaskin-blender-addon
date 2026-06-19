@@ -98,8 +98,8 @@ const layerMaskImgs = await Promise.all(
 
 // --- GL setup ---
 const canvas = document.getElementById('gl');
-canvas.width = W; canvas.height = H;
-canvas.style.height = (960 * H / W) + 'px';
+const SS = 2;                          // supersample: render at SSx, CSS downscales -> anti-aliases
+canvas.width = W * SS; canvas.height = H * SS;   // the silhouette + the dense-mesh T-junction cracks
 const gl = canvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true });
 function sh(t, s) { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o);
   if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(o); return o; }
@@ -121,20 +121,21 @@ const quadP = prog(
 const meshP = prog(
   `#version 300 es
    layout(location=0) in vec3 aPx; layout(location=1) in vec2 aUv;
-   uniform vec2 uRes; out vec2 vUv;
-   void main(){ vUv=aUv; gl_Position=vec4(aPx.xy/uRes*2.-1., aPx.z*2.-1., 1.); }`,
+   uniform vec2 uRes; out vec2 vUv; out vec2 vScr;
+   void main(){ vUv=aUv; vScr=aPx.xy/uRes;       // [0,1] screen pos (resolution-independent samples)
+     gl_Position=vec4(vScr*2.-1., aPx.z*2.-1., 1.); }`,
   `#version 300 es
    precision highp float;
-   uniform sampler2D uSkin; uniform sampler2D uLight; uniform sampler2D uMask; uniform vec2 uRes;
+   uniform sampler2D uSkin; uniform sampler2D uLight; uniform sampler2D uMask;
    uniform bool uUseLight; uniform bool uScreenLight; uniform bool uUseMask; uniform int uPass;
-   in vec2 vUv; out vec4 frag;
+   in vec2 vUv; in vec2 vScr; out vec4 frag;
    void main(){
-     if(uUseMask && texture(uMask, gl_FragCoord.xy/uRes).r < 0.5) discard;   // scenery occludes here
+     if(uUseMask && texture(uMask, vScr).r < 0.5) discard;   // scenery occludes here
      vec4 s=texture(uSkin,vUv);
      if(s.a<0.004) discard;                     // fully transparent texels reveal the base/bg
      if(uPass==0 && s.a<0.996) discard;         // opaque pass: only solid texels (write depth)
      if(uPass==1 && s.a>=0.996) discard;        // transparent pass: only semi-transparent texels
-     vec2 luv = uScreenLight ? gl_FragCoord.xy/uRes : vUv;
+     vec2 luv = uScreenLight ? vScr : vUv;
      vec3 l = uUseLight ? texture(uLight, luv).rgb*2.0 : vec3(1.0);
      frag=vec4(s.rgb*l, s.a);                    // straight alpha (SRC_ALPHA blend on the semi pass)
    }`);
@@ -304,7 +305,7 @@ function drawLayer(i) {                               // mesh -> geometry; sprit
 }
 
 function draw() {
-  gl.viewport(0, 0, W, H);
+  gl.viewport(0, 0, W * SS, H * SS);
   gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   gl.clearColor(0.13, 0.13, 0.13, 1);
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
