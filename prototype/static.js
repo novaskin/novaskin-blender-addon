@@ -76,6 +76,9 @@ const layerAtlasImgs = await Promise.all(layers.map(
   L => (L.type === 'mesh' && L.atlas) ? loadImage(DIR + L.atlas + _cb) : null));
 const layerSpriteImgs = await Promise.all(layers.map(
   L => (L.type !== 'mesh' && L.image) ? loadImage(DIR + L.image + _cb) : null));
+// per-sprite depth map (8-bit window depth over L.depth_range) -> per-pixel depth-test vs meshes
+const layerDepthImgs = await Promise.all(layers.map(
+  L => (L.type !== 'mesh' && L.depth) ? loadImage(DIR + L.depth + _cb) : null));
 // per-entity shadow ratios (display-space multiply, 1 = untouched), keyed to player i / layer i
 const playerShadowImgs = await Promise.all(
   manifest.players.map(p => p.shadow ? loadImage(DIR + p.shadow + _cb) : null));
@@ -124,6 +127,25 @@ const meshP = prog(
      frag=vec4(s.rgb*l, s.a);                    // straight alpha (SRC_ALPHA blend on the semi pass)
    }`);
 
+// depth-aware sprite: a straight-alpha quad that writes per-pixel gl_FragDepth (decoded from its
+// 8-bit depth map over [uWmin,uWmax], the SAME window scale as the meshes) so it depth-tests
+// per-pixel against players / mesh-layers instead of compositing whole-object by painter's order.
+const spriteDepthP = prog(
+  `#version 300 es
+   layout(location=0) in vec2 aPos; out vec2 vUv;
+   void main(){ vUv=aPos; gl_Position=vec4(aPos*2.-1., 0., 1.); }`,
+  `#version 300 es
+   precision highp float;
+   uniform sampler2D uTex; uniform sampler2D uDepth; uniform float uWmin, uWmax;
+   in vec2 vUv; out vec4 frag;
+   void main(){
+     vec4 c=texture(uTex,vUv);
+     if(c.a<0.02) discard;                        // outside the sprite
+     float b=texture(uDepth,vUv).r;
+     gl_FragDepth=clamp(uWmin + b*(uWmax-uWmin), 0.0, 1.0);   // window depth, comparable to meshes
+     frag=c;                                      // straight alpha (SRC_ALPHA blend)
+   }`);
+
 function tex(nearest) {
   const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
   const f = nearest ? gl.NEAREST : gl.LINEAR;
@@ -146,6 +168,7 @@ const mkTex = (nearest) => (img) => { if (!img) return null; const t = tex(neare
 const tLayerTex = layerTexImgs.map(mkTex(true));        // NEAREST swappable base texture
 const tLayerAtlas = layerAtlasImgs.map(mkTex(false));   // LINEAR UV light atlas
 const tLayerSprite = layerSpriteImgs.map(mkTex(false)); // LINEAR flat sprite
+const tLayerDepth = layerDepthImgs.map(mkTex(true));    // NEAREST per-sprite depth map
 const mkShadow = (img) => { if (!img) return null; const t = tex(false); upload(t, img); return t; };
 const tPlayerShadow = playerShadowImgs.map(mkShadow);   // multiply ratio, LINEAR
 const tLayerShadow = layerShadowImgs.map(mkShadow);
@@ -239,10 +262,26 @@ function drawPlayer(i) {
   drawMesh(playerRanges(p, i), tSkins[i],
            lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen');
 }
-function drawLayer(i) {                               // mesh -> geometry; sprite -> flat painter quad
+function drawDepthSprite(i) {                         // straight-alpha quad, per-pixel gl_FragDepth
+  const L = layers[i];
+  const r = L.depth_range || [0, 1];
+  gl.useProgram(spriteDepthP); gl.bindVertexArray(quadVao);
+  gl.uniform1i(gl.getUniformLocation(spriteDepthP, 'uTex'), 0);
+  gl.uniform1i(gl.getUniformLocation(spriteDepthP, 'uDepth'), 1);
+  gl.uniform1f(gl.getUniformLocation(spriteDepthP, 'uWmin'), r[0]);
+  gl.uniform1f(gl.getUniformLocation(spriteDepthP, 'uWmax'), r[1]);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLayerDepth[i]);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tLayerSprite[i]);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);   // per-pixel occlusion vs players / mesh-layers
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST);
+}
+function drawLayer(i) {                               // mesh -> geometry; sprite -> depth quad / flat
   const L = layers[i];
   if (L.type === 'mesh') { if (tLayerTex[i] && tLayerAtlas[i]) drawMesh([L.tri_range], tLayerTex[i], tLayerAtlas[i], false); }
-  else if (tLayerSprite[i]) blitQuadBlend(tLayerSprite[i]);   // tight silhouette, camera-depth order
+  else if (tLayerDepth[i]) drawDepthSprite(i);       // per-pixel depth-tested against the meshes
+  else if (tLayerSprite[i]) blitQuadBlend(tLayerSprite[i]);   // fallback: whole-object painter order
 }
 
 function draw() {

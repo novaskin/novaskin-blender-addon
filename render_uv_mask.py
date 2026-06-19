@@ -3101,9 +3101,13 @@ def _static_write_geometry(players, out_dir=None, mesh_layers=None):
         pos = np.asarray(st["pos"], 'float32')   # captured per part at collect time (variant-correct)
         welded, unique, ntris = _static_write_mesh(os.path.join(out_dir, "mesh.bin"), st)
         K, V = _anim_write_anim(os.path.join(out_dir, "positions.bin"), [pos], ANIM_QUANT, 0.0)
+        # global camera-depth range (== the positions.bin z scale) so the per-sprite depth maps
+        # normalize to the SAME window depth as the mesh, for a GPU depth test in the browser
+        zmin = float(pos[:, 2].min()) if len(pos) else 0.0
+        zmax = float(pos[:, 2].max()) if len(pos) else 1.0
         return {"resolution": [W, H], "welded": welded, "unique": unique, "tris": ntris,
                 "keys": K, "verts": V, "players": st["players"],
-                "layers": st.get("layers", []),
+                "layers": st.get("layers", []), "zmin": zmin, "zmax": zmax,
                 "mesh_bytes": os.path.getsize(os.path.join(out_dir, "mesh.bin")),
                 "pos_bytes": os.path.getsize(os.path.join(out_dir, "positions.bin")),
                 "mesh_file": STATIC_OUT_SUBDIR + "/mesh.bin",
@@ -3403,17 +3407,18 @@ def _static_split_layers(groups):
     return mesh_layers, sprite_groups
 
 
-def _static_render_layers(players, sprite_groups, all_layer_mesh_names, out_dir=None):
+def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zmax, out_dir=None):
     """Render each SPRITE-type layer as a straight-alpha beauty TIGHT to the group's silhouette: the
     group alone over a transparent film, OCCLUDED by the real scenery as a holdout (front scenery
     cuts its alpha so it sits correctly behind foliage/water lips). Display-encoded like the
     background, edge-dilated. Its cast shadow / water darkening is NOT folded in here -- it is a
-    SEPARATE multiply ratio rendered in _static_render_images (exactly like the mesh entities),
-    composited on the background BEFORE the players. That keeps the sprite from painting scenery over
-    a player and avoids the double-water that folding the full scene into the sprite caused. Sprites
-    composite by camera_depth (painter order); no per-pixel depth. Returns
-    [{name, object, kind, image, camera_depth}], back -> front. Self-contained. `all_layer_mesh_names`
-    = every layer mesh (sprite + mesh-type), hidden while this group renders."""
+    SEPARATE multiply ratio rendered in _static_render_images (exactly like the mesh entities).
+    Also writes a per-sprite DEPTH map `<name>_depth.webp`: the group's camera depth normalized to the
+    GLOBAL `[zmin, zmax]` (the SAME window scale as the mesh / positions.bin), re-encoded 8-bit over
+    the sprite's OWN `[wmin, wmax]` for precision, so the browser can `gl_FragDepth` it and depth-test
+    the sprite per-pixel against the players / mesh-layers (so a spear/bucket in front occludes -- and
+    is occluded by -- the arms correctly). Returns
+    [{name, object, kind, image, depth, depth_range, camera_depth}], back -> front. Self-contained."""
     if not sprite_groups:
         return []
     s = bpy.context.scene
@@ -3421,9 +3426,11 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, out_dir=
     os.makedirs(out_dir, exist_ok=True)
     char_names = {o.name for p in players for o in p["char_all"]}
     entity_names = char_names | set(all_layer_mesh_names)
+    zspan = max(zmax - zmin, 1e-6)
     sess = _Session()
     infos = []
     try:
+        sess.vl.use_pass_z = True                  # for the per-sprite depth map
         for g in sprite_groups:
             meshes = g["meshes"]
             safe = g["name"]
@@ -3443,6 +3450,7 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, out_dir=
             bpy.context.view_layer.update()
             try:
                 comb, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+                dep, _, _ = sess.render_pass('Depth', 'CYCLES', 1, ILLUM_RES_PCT)   # camera depth
             finally:
                 for o, v in sc_ho.items():
                     o.is_holdout = v
@@ -3457,11 +3465,28 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, out_dir=
             spr[:, 3] = alpha
             _save_image(spr.reshape(-1), rW, rH, os.path.join(out_dir, safe + ".webp"),
                         file_format='WEBP', lossless=STATIC_FG_LOSSLESS, quality=STATIC_FG_QUALITY)
+
+            # DEPTH map: window depth (same scale as the mesh) re-encoded over the sprite's own range.
+            # Tight sprite -> the range is the mob's own depth (no broad reflection to clamp it).
+            depth_fn = depth_range = None
+            if dep is not None:
+                wd = (dep[:, 0] - zmin) / zspan        # window depth; may be <0 (nearer than players)
+                sel = alpha > 0.5
+                if sel.any():
+                    wmin, wmax = float(wd[sel].min()), float(wd[sel].max())
+                    if wmax - wmin < 1e-4:
+                        wmax = wmin + 1e-4
+                    b = np.clip((wd - wmin) / (wmax - wmin), 0.0, 1.0)   # 8-bit over [wmin, wmax]
+                    dbuf = np.ones((b.shape[0], 4), 'float32'); dbuf[:, :3] = b[:, None]
+                    depth_fn = safe + "_depth.webp"
+                    _save_image(dbuf.reshape(-1), rW, rH, os.path.join(out_dir, depth_fn),
+                                file_format='WEBP', lossless=True)
+                    depth_range = [round(wmin, 6), round(wmax, 6)]
             cd = _group_camera_depth(meshes)
             infos.append({"name": safe, "object": g["object"], "kind": g["kind"],
-                          "image": safe + ".webp",
+                          "image": safe + ".webp", "depth": depth_fn, "depth_range": depth_range,
                           "camera_depth": round(cd, 4) if cd is not None else None})
-            print(f"[STATIC sprite] {safe} -> camera_depth={cd}")
+            print(f"[STATIC sprite] {safe} -> camera_depth={cd}, depth_range={depth_range}")
         infos.sort(key=lambda i: (i["camera_depth"] is None, -(i["camera_depth"] or 0.0)))
         return infos
     finally:
@@ -3619,7 +3644,7 @@ def _static_export_steps(players, op=None, out_dir=None):
         if sprite_groups:
             all_layer_mesh_names = {m.name for g in groups for m in g["meshes"]}
             sprite_infos = _static_render_layers(players, sprite_groups, all_layer_mesh_names,
-                                                 out_dir=out_dir)
+                                                 geo["zmin"], geo["zmax"], out_dir=out_dir)
             yield prog(f"sprites ({len(sprite_infos)})")
         # unify layer manifest entries: mesh-type (geometry range + atlas + tex) + sprite-type
         layer_entries = []
