@@ -594,6 +594,44 @@ def _restore_selection_props(saved):
         bpy.context.view_layer.update()
 
 
+# Collections holding the rig's bone custom-shape widgets (so they can be force-hidden for the
+# render even if the rig ships them with hide_render OFF). Matched case-insensitively by prefix.
+BONE_SHAPE_COLLECTION_PREFIXES = ("BoneShapes", "WGTS", "Widgets")
+
+
+def _hide_bone_shapes(scene):
+    """Bone custom-shape WIDGETS (e.g. the rig's BoneShapes collections) sometimes ship with
+    hide_render OFF. They then render as small dark curve/disc shapes at the bones (the wrist
+    circles, etc.) in EVERY isolated pass -- visible as 'dirt' in the sprites and the per-entity
+    shadows, at a fixed screen spot regardless of the mob. They are never part of the welded mesh,
+    so hide them for the whole export. Collects every pose-bone custom_shape AND any renderable
+    object that lives ONLY in a bone-shape collection. Returns the objects to un-hide afterwards."""
+    widgets = set()
+    for o in scene.objects:
+        if o.type == 'ARMATURE' and o.pose:
+            for pb in o.pose.bones:
+                if pb.custom_shape is not None:
+                    widgets.add(pb.custom_shape)
+    pref = tuple(p.lower() for p in BONE_SHAPE_COLLECTION_PREFIXES)
+    for o in scene.objects:
+        colls = o.users_collection
+        if colls and all(c.name.lower().startswith(pref) for c in colls):
+            widgets.add(o)
+    hidden = [o for o in widgets if not o.hide_render]
+    for o in hidden:
+        o.hide_render = True
+    if hidden:
+        bpy.context.view_layer.update()
+    return hidden
+
+
+def _restore_bone_shapes(hidden):
+    for o in hidden:
+        o.hide_render = False
+    if hidden:
+        bpy.context.view_layer.update()
+
+
 def _node(node_type):
     ng = getattr(bpy.context.scene, "compositing_node_group", None)
     if not ng:
@@ -3521,6 +3559,7 @@ def _static_export_steps(players, op=None, out_dir=None):
     # (which _fix_2layer_positions unhides explicitly) and the other overlays are driver-hidden out.
     # The browser toggles each overlay part per player; restored to the artist's value at the end.
     forced_props = _force_selection_props_on(players)
+    hidden_widgets = _hide_bone_shapes(bpy.context.scene)   # kill the bone-widget 'dirt' in every pass
     try:
         # 1) per-player UV light atlases (only for light_space="uv"; the screen-space light is
         #    rendered in step 3 instead). Baked in the normal look so it sees the real lighting.
@@ -3594,6 +3633,7 @@ def _static_export_steps(players, op=None, out_dir=None):
               f"light={STATIC_LIGHT_SPACE})")
         return manifest
     finally:
+        _restore_bone_shapes(hidden_widgets)
         _restore_selection_props(forced_props)         # restore the artist's Second-layer toggle
         if restore_uv is not None:
             restore_uv()
