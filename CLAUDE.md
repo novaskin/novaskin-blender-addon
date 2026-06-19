@@ -142,9 +142,25 @@ tests/run_tests.sh            # finds Blender's python (or a numpy-capable pytho
 BLENDER_PYTHON=/path tests/run_tests.sh   # override the interpreter
 ```
 
-Anything that genuinely needs `bpy` (geometry collection, rendering, the atlas bake) is NOT unit
-tested — validate those by running an export and checking the manifest / browser, per the workflow
-above. When adding a pure helper, prefer testing it here.
+Helpers that need a **real mesh / `bpy`** (e.g. `_expand_pixel_uvs`, `_mesh_uv_handedness`) are
+tested **inside Blender, headless** — the standard practice for add-ons:
+
+```
+tests/run_blender_tests.sh    # finds the Blender binary, runs tests/blender/*.py headless
+BLENDER=/path tests/run_blender_tests.sh
+```
+
+`tests/blender/test_geometry_blender.py` runs under `blender --background --factory-startup
+--python ...` in a **separate process** (it does NOT touch a running GUI session), builds a tiny
+throwaway mesh, and checks the pixel-UV cell snapping and the degenerate-face (collapsed-axis)
+reconstruction exactly — the upright-not-mirrored behaviour that otherwise could only be eyeballed
+in the browser. It writes PASS/FAIL to `$NSK_TEST_STATUS` (Blender swallows a script exit code in
+`--background`).
+
+Anything that needs a full rig + the compositor Viewer node (rendering, the atlas bake, the full
+`_static_export_steps`) is NOT automated — validate those by running an export and checking the
+manifest / browser, per the workflow above. When adding a helper, prefer the pure unittest; if it
+needs a mesh, add an in-Blender check.
 
 ## Conventions
 
