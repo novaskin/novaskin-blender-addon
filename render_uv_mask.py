@@ -3442,6 +3442,14 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
             for o in s.objects:
                 if o.name in entity_names and o.name not in group_names:
                     o.hide_render = True
+            # Geometry-nodes scenery: is_holdout does NOT cut their generated geometry, so a holdout
+            # leaves them rendering opaque into the transparent film (the fixed dark 'dirt'). Hide
+            # them instead -- they only OCCLUDE the sprite (rarely, they are background terrain), and
+            # a missing occlusion is far less visible than the dirt they otherwise paint everywhere.
+            for o in s.objects:
+                if (o.name not in entity_names and o.name not in group_names
+                        and not o.hide_render and any(m.type == 'NODES' for m in o.modifiers)):
+                    o.hide_render = True
             scenery = [o for o in s.objects if o.type == 'MESH'
                        and o.name not in group_names and o.name not in entity_names]
             sc_ho = {o: o.is_holdout for o in scenery}
