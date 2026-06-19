@@ -165,6 +165,26 @@ class TestAssignPartLabels(unittest.TestCase):
         self.assertEqual(a, b)
 
 
+class TestCloseMask(unittest.TestCase):
+    """Morphological close that fills the thin interior index-0 cracks in the occlusion mask."""
+
+    def test_fills_thin_interior_cracks_keeps_silhouette(self):
+        a = np.ones((20, 20), "float32")
+        for i in range(3, 15):
+            a[i, i] = 0.0                      # 1px diagonal crack
+        a[5, 5:9] = 0.0                        # 1px horizontal crack
+        out = m._close_mask(a.copy(), iterations=2)
+        self.assertEqual(int((out[2:-2, 2:-2] < 0.5).sum()), 0)   # interior cracks gone
+        self.assertEqual(float(out[0, 0]), 1.0)                   # silhouette preserved
+        self.assertEqual(float(out[-1, -1]), 1.0)
+
+    def test_does_not_fill_a_real_hole(self):
+        a = np.ones((30, 30), "float32")
+        a[10:20, 10:20] = 0.0                 # a big 10x10 hole -> must NOT be closed over
+        out = m._close_mask(a.copy(), iterations=2)
+        self.assertGreater(int((out < 0.5).sum()), 50)            # most of the hole survives
+
+
 class TestLayerSafeName(unittest.TestCase):
     def test_sanitizes(self):
         self.assertEqual(m._layer_safe_name("boat.rig"), "boat_rig")
