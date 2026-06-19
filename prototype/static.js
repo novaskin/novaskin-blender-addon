@@ -358,6 +358,8 @@ function setLayerTex(i, source) { if (tLayerTex[i]) { upload(tLayerTex[i], sourc
     lab.appendChild(inp); box.appendChild(lab);
   });
 }
+// foreground is an OVERLAY (rain/glare in front) -> on by default; else the legacy opaque fg -> off
+document.getElementById('ck_fg').checked = !!manifest.foreground_overlay;
 for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_sh', 'ck_mask', 'ck_fg'])
   document.getElementById(id).addEventListener('change', draw);
 

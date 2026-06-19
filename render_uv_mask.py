@@ -419,6 +419,9 @@ LAYER_MODE_ITEMS = [
     ('SPRITE', "Sprite", "Flat baked image -- matches the render exactly. For background props"),
     ('TEXTURE', "Texture", "Re-skinnable 3D mesh: its own swappable texture + baked light"),
     ('PLAYER', "Player", "Like Texture, but shown as a player/character in the wallpaper tool"),
+    ('OVERLAY', "Overlay", "Semi-transparent element IN FRONT of everything (rain, glare, smoke): "
+                           "rendered alone over transparent and composited on top. Hidden from the "
+                           "mask/geometry so it never occludes the players/layers"),
 ]
 
 # Web wallpaper tool (the panel has a button that opens this URL in the browser).
@@ -3580,6 +3583,47 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
         bpy.context.view_layer.update()
 
 
+def _static_render_overlay(overlay_names, out_dir=None):
+    """Render the OVERLAY-mode layers (rain / glare / smoke) ALONE over a transparent film -> the
+    static `foreground.webp` (straight alpha, display-encoded, edge-dilated). These sit IN FRONT of
+    everything and are additive/emissive, so rendering them isolated is faithful (unlike a refractive
+    surface, which needs its backdrop). Composited over the final image in the browser. They are
+    hidden from every other pass (bg / mask / geometry / sprites / shadows), so they never occlude
+    the players/layers nor break the Object-Index mask. Returns the file name, or None. Self-contained
+    -- shows ONLY the overlay renderables, keeps the lights/world for the lit ones."""
+    if not overlay_names:
+        return None
+    s = bpy.context.scene
+    out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
+    os.makedirs(out_dir, exist_ok=True)
+    sess = _Session()
+    try:
+        sess.restore_visibility()
+        sess.mute_drivers(True)
+        for o in s.objects:        # show ONLY the overlay meshes; keep lights/camera/world
+            if o.type in ('MESH', 'CURVE', 'SURFACE', 'META', 'VOLUME', 'FONT', 'GPENCIL'):
+                o.hide_render = (o.name not in overlay_names)
+        bpy.context.view_layer.update()
+        comb, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+        alpha = np.clip(comb[:, 3], 0.0, 1.0)
+        straight = np.where(alpha[:, None] > 1e-4,
+                            comb[:, :3] / np.maximum(alpha[:, None], 1e-4), 0.0)
+        vis = alpha > 1e-4
+        fg = np.zeros((comb.shape[0], 4), 'float32')
+        if vis.any():
+            fg[vis, :3] = _to_display(straight[vis])
+        fg[:, :3] = _anim_dilate_light(fg[:, :3], vis, rW, rH)
+        fg[:, 3] = alpha
+        _save_image(fg.reshape(-1), rW, rH, os.path.join(out_dir, "foreground.webp"),
+                    file_format='WEBP', lossless=STATIC_FG_LOSSLESS, quality=STATIC_FG_QUALITY)
+        print(f"[STATIC overlay] {len(overlay_names)} mesh(es) -> foreground.webp "
+              f"(coverage {float(vis.mean()):.3f})")
+        return "foreground.webp"
+    finally:
+        sess.restore()
+        bpy.context.view_layer.update()
+
+
 def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, masks=None):
     """Write `static/manifest.json` tying the static-v2 pieces together (paths are bare file names,
     relative to the manifest's own dir). `light_space` selects how the renderer samples the light:
@@ -3609,6 +3653,9 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, mask
         "background": os.path.basename(imgs["background"]),
         "foreground": os.path.basename(imgs["foreground"]),   # WebP with alpha -- no matte
         "foreground_alpha": "straight",                       # out = fg.rgb*fg.a + behind*(1-fg.a)
+        # True when the foreground is an OVERLAY (rain/glare in front of everything) -> the renderer
+        # composites it on top by default. False/absent = the legacy opaque foreground (off by default).
+        "foreground_overlay": bool(imgs.get("foreground_overlay")),
         "mesh": {"file": "mesh.bin", "format": "NSKM2",
                  "welded": geo["welded"], "unique": geo["unique"], "tris": geo["tris"],
                  "layout": ("NSKM v2: u32x4 header (magic, ver=2, welded, unique, ntris) + "
@@ -3654,11 +3701,16 @@ def _static_export_steps(players, op=None, out_dir=None):
     if FIX_2LAYER_POSITION:                         # snap the hat onto the head (persistent +
         _fix_2layer_positions(players)             # idempotent) -- same as the legacy export
     uv_light = (STATIC_LIGHT_SPACE == "uv")        # else screen-space light (default)
-    groups = discover_layers()                     # optional toggleable scenery layers
+    all_groups = discover_layers()                 # optional toggleable scenery layers
+    # OVERLAY layers (rain/glare/smoke) are pulled out: they are composited on TOP via the foreground
+    # and must be hidden from every other pass (so they don't occlude or break the mask).
+    overlay_groups = [g for g in all_groups if _layer_mode(g) == "OVERLAY"]
+    overlay_names = {m.name for g in overlay_groups for m in g["meshes"]}
+    groups = [g for g in all_groups if _layer_mode(g) != "OVERLAY"]
     mesh_layers, sprite_groups = _static_split_layers(groups)   # retexturable meshes vs flat sprites
     n_atlas = (len(players) if uv_light else 0) + len(mesh_layers)
-    # atlases/textures + geometry + images + (sprites) + masks + manifest
-    total = n_atlas + 2 + (1 if sprite_groups else 0) + 1 + 1
+    # atlases/textures + geometry + images + (sprites) + masks + (overlay) + manifest
+    total = n_atlas + 2 + (1 if sprite_groups else 0) + 1 + (1 if overlay_groups else 0) + 1
     state = {"done": 0}
     def prog(msg):
         state["done"] += 1
@@ -3678,6 +3730,15 @@ def _static_export_steps(players, op=None, out_dir=None):
     # The browser toggles each overlay part per player; restored to the artist's value at the end.
     forced_props = _force_selection_props_on(players)
     hidden_widgets = _hide_bone_shapes(bpy.context.scene)   # kill the bone-widget 'dirt' in every pass
+    # hide OVERLAY layers for every pass below (so the per-pass _Session snapshots capture them
+    # hidden); the dedicated overlay render un-hides them itself. Restored at the end.
+    hidden_overlays = []
+    for _o in bpy.context.scene.objects:
+        if _o.name in overlay_names and not _o.hide_render:
+            _o.hide_render = True
+            hidden_overlays.append(_o)
+    if hidden_overlays:
+        bpy.context.view_layer.update()
     try:
         # 1) per-player UV light atlases (only for light_space="uv"; the screen-space light is
         #    rendered in step 3 instead). Baked in the normal look so it sees the real lighting.
@@ -3740,6 +3801,13 @@ def _static_export_steps(players, op=None, out_dir=None):
         all_layer_mesh_names = {m.name for g in groups for m in g["meshes"]}
         masks = _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=out_dir)
         yield prog(f"masks ({len(masks)})")
+        # 4c) OVERLAY layers (rain / glare): rendered alone -> foreground.webp, composited on top
+        if overlay_groups:
+            ov_fg = _static_render_overlay(overlay_names, out_dir=out_dir)
+            if ov_fg:
+                imgs["foreground"] = STATIC_OUT_SUBDIR + "/" + ov_fg
+                imgs["foreground_overlay"] = True
+            yield prog(f"overlay ({len(overlay_groups)})")
         # unify layer manifest entries: mesh-type (geometry range + atlas + tex) + sprite-type
         layer_entries = []
         for lr in geo.get("layers", []):
@@ -3757,6 +3825,8 @@ def _static_export_steps(players, op=None, out_dir=None):
               f"light={STATIC_LIGHT_SPACE})")
         return manifest
     finally:
+        for _o in hidden_overlays:
+            _o.hide_render = False
         _restore_bone_shapes(hidden_widgets)
         _restore_selection_props(forced_props)         # restore the artist's Second-layer toggle
         if restore_uv is not None:
