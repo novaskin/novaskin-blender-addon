@@ -3262,9 +3262,13 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None):
 
         # 4) per-entity TOGGLEABLE shadow: each entity camera-invisible (still casting / reflecting)
         #    over the same clean baseline, every OTHER entity hidden -> display-space multiply ratio.
-        shadows = {}        # players + EVERY layer (mesh + sprite): each gets its own multiply ratio
+        #    Players + SPRITE layers only. MESH-type layers are flat retexturable billboards (e.g. a
+        #    sign/poster with no material) -- letting them cast would dim the whole scene; skip them.
+        mesh_layer_group_names = {ml["name"] for ml in mesh_layers}
+        shadow_groups = [g for g in groups if g["name"] not in mesh_layer_group_names]
+        shadows = {}        # players + sprite layers: each gets its own multiply ratio
         entities = ([("player", p["label"], list(p["char_all"])) for p in players]
-                    + [("layer", g["name"], list(g["meshes"])) for g in groups])
+                    + [("layer", g["name"], list(g["meshes"])) for g in shadow_groups])
         for kind, name, objs in entities:
             obj_names = {o.name for o in objs}
             sess.restore_visibility()                       # active entity keeps its real visibility
