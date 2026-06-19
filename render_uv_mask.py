@@ -3504,7 +3504,83 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
         bpy.context.view_layer.update()
 
 
-def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None):
+def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=None):
+    """Per-entity SCENERY-occlusion mask via the Object Index pass: the entity's meshes get
+    pass_index=1, every OTHER entity (the optional players/layers) is hidden, the real scenery stays.
+    `mask = (front-most object index == 1)`: 1 where the entity is visible, 0 where the FIXED scenery
+    (including geometry-nodes objects, which a holdout cannot cut) is in front of it. Players get one
+    mask PER ARM VARIANT (classic/slim -- the arm width differs); mesh-type layers get a single mask.
+    The browser clips each drawn entity to its mask, so the scenery occludes it WITHOUT a foreground
+    painting over the (toggleable) optional layers. Because the clean background already contains that
+    front scenery, revealing it through the clip is identical to a foreground for opaque scenery.
+    Returns {player_label: {variant: file}, layer_name: file}. Self-contained."""
+    s = bpy.context.scene
+    out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
+    os.makedirs(out_dir, exist_ok=True)
+    char_names = {o.name for p in players for o in p["char_all"]}
+    entity_names = char_names | set(all_layer_mesh_names)
+    sess = _Session()
+    masks = {}
+    saved_idx = {o.name: o.pass_index for o in s.objects}
+    try:
+        sess.vl.use_pass_object_index = True
+
+        def _render_mask(active_objs, fn):
+            for o in s.objects:
+                o.pass_index = 0
+            for o in active_objs:
+                o.pass_index = 1
+            bpy.context.view_layer.update()
+            oid, W, H = sess.render_pass('Object Index', 'CYCLES', MASK_SAMPLES, MASK_RES_PCT)
+            if oid is None:
+                return None
+            m = (np.round(oid[:, 0]).astype(np.int32) == 1).astype('float32')
+            buf = np.empty((m.shape[0], 4), 'float32')
+            buf[:, 0] = buf[:, 1] = buf[:, 2] = m
+            buf[:, 3] = 1.0
+            _save_image(buf.reshape(-1), W, H, os.path.join(out_dir, fn),
+                        file_format='WEBP', lossless=True)
+            return fn
+
+        for p in players:
+            active = {o.name for o in p["char_all"]}
+            variants = {}
+            for vname, vval in MASK_ARM_VARIANTS:
+                sess.restore_visibility()
+                arm, saved = _set_arm_style(p, vval)
+                muted = _hide_others_for_bake(s, active, entity_names)
+                try:
+                    fn = _render_mask(list(p["char_all"]), f"{p['label']}_mask_{vname}.webp")
+                finally:
+                    for d in muted:
+                        d.mute = False
+                    _restore_arm_style(arm, p, saved)
+                if fn:
+                    variants[vname] = fn
+                print(f"[STATIC mask] {p['label']} {vname} -> {fn}")
+            masks[p["label"]] = variants
+
+        for ml in mesh_layers:
+            active = {m.name for m in ml["meshes"]}
+            sess.restore_visibility()
+            muted = _hide_others_for_bake(s, active, entity_names)
+            try:
+                fn = _render_mask(list(ml["meshes"]), f"{ml['name']}_mask.webp")
+            finally:
+                for d in muted:
+                    d.mute = False
+            if fn:
+                masks[ml["name"]] = fn
+            print(f"[STATIC mask] layer {ml['name']} -> {fn}")
+        return masks
+    finally:
+        for o in s.objects:
+            o.pass_index = saved_idx.get(o.name, 0)
+        sess.restore()
+        bpy.context.view_layer.update()
+
+
+def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, masks=None):
     """Write `static/manifest.json` tying the static-v2 pieces together (paths are bare file names,
     relative to the manifest's own dir). `light_space` selects how the renderer samples the light:
     "screen" -> one `light` image sampled by screen position (viewport-quality, default); "uv" ->
@@ -3512,15 +3588,18 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None):
     are independent scenery sprites, each with a `camera_depth` for depth-ordered compositing."""
     light_space = STATIC_LIGHT_SPACE
     shadows = imgs.get("shadows") or {}
+    masks = masks or {}
     players_meta = []
     for pm in geo["players"]:
         e = dict(pm)
         if light_space == "uv":
             e["atlas"] = atlas_by_label.get(pm["label"])
         e["shadow"] = shadows.get(pm["label"])    # display-space multiply ratio, toggleable
+        e["mask"] = masks.get(pm["label"])        # {variant: file} scenery-occlusion clip
         players_meta.append(e)
     if layers:
-        layers = [dict(l, shadow=shadows.get(l["name"])) for l in layers]
+        layers = [dict(l, shadow=shadows.get(l["name"]), mask=masks.get(l["name"]))
+                  for l in layers]
     light_term = ("atlas(uv)" if light_space == "uv" else "light(screenUv)")
     manifest = {
         "static_version": 1,
@@ -3578,8 +3657,8 @@ def _static_export_steps(players, op=None, out_dir=None):
     groups = discover_layers()                     # optional toggleable scenery layers
     mesh_layers, sprite_groups = _static_split_layers(groups)   # retexturable meshes vs flat sprites
     n_atlas = (len(players) if uv_light else 0) + len(mesh_layers)
-    # atlases/textures + geometry + images + (sprites) + manifest
-    total = n_atlas + 2 + (1 if sprite_groups else 0) + 1
+    # atlases/textures + geometry + images + (sprites) + masks + manifest
+    total = n_atlas + 2 + (1 if sprite_groups else 0) + 1 + 1
     state = {"done": 0}
     def prog(msg):
         state["done"] += 1
@@ -3656,6 +3735,11 @@ def _static_export_steps(players, op=None, out_dir=None):
             sprite_infos = _static_render_layers(players, sprite_groups, all_layer_mesh_names,
                                                  geo["zmin"], geo["zmax"], out_dir=out_dir)
             yield prog(f"sprites ({len(sprite_infos)})")
+        # 4b) per-entity scenery-occlusion masks (players per variant + mesh-layers) -- the static
+        #     replacement for the foreground (occludes by the fixed scenery, leaves layers alone)
+        all_layer_mesh_names = {m.name for g in groups for m in g["meshes"]}
+        masks = _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=out_dir)
+        yield prog(f"masks ({len(masks)})")
         # unify layer manifest entries: mesh-type (geometry range + atlas + tex) + sprite-type
         layer_entries = []
         for lr in geo.get("layers", []):
@@ -3666,7 +3750,8 @@ def _static_export_steps(players, op=None, out_dir=None):
         layer_entries.sort(key=lambda e: (e.get("camera_depth") is None,
                                           -(e.get("camera_depth") or 0.0)))   # back -> front
         # 5) manifest
-        manifest = _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=layer_entries)
+        manifest = _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=layer_entries,
+                                          masks=masks)
         yield prog("manifest.json")
         print(f"[STATIC] export complete -> {out_dir} ({geo['tris']} tris, "
               f"light={STATIC_LIGHT_SPACE})")

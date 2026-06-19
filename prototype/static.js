@@ -84,6 +84,17 @@ const playerShadowImgs = await Promise.all(
   manifest.players.map(p => p.shadow ? loadImage(DIR + p.shadow + _cb) : null));
 const layerShadowImgs = await Promise.all(
   layers.map(L => L.shadow ? loadImage(DIR + L.shadow + _cb) : null));
+// scenery-occlusion masks (screen-space, r=1 where the entity is visible past the fixed scenery).
+// Players have one per arm variant ({classic,slim}); mesh-layers have one. Replaces the foreground.
+const loadMaskVariants = async (m) => {
+  if (!m) return null;
+  const out = {};
+  for (const v of Object.keys(m)) out[v] = await loadImage(DIR + m[v] + _cb);
+  return out;
+};
+const playerMaskImgs = await Promise.all(manifest.players.map(p => loadMaskVariants(p.mask)));
+const layerMaskImgs = await Promise.all(
+  layers.map(L => (L.type === 'mesh' && L.mask) ? loadImage(DIR + L.mask + _cb) : null));
 
 // --- GL setup ---
 const canvas = document.getElementById('gl');
@@ -114,10 +125,11 @@ const meshP = prog(
    void main(){ vUv=aUv; gl_Position=vec4(aPx.xy/uRes*2.-1., aPx.z*2.-1., 1.); }`,
   `#version 300 es
    precision highp float;
-   uniform sampler2D uSkin; uniform sampler2D uLight; uniform vec2 uRes;
-   uniform bool uUseLight; uniform bool uScreenLight; uniform int uPass;
+   uniform sampler2D uSkin; uniform sampler2D uLight; uniform sampler2D uMask; uniform vec2 uRes;
+   uniform bool uUseLight; uniform bool uScreenLight; uniform bool uUseMask; uniform int uPass;
    in vec2 vUv; out vec4 frag;
    void main(){
+     if(uUseMask && texture(uMask, gl_FragCoord.xy/uRes).r < 0.5) discard;   // scenery occludes here
      vec4 s=texture(uSkin,vUv);
      if(s.a<0.004) discard;                     // fully transparent texels reveal the base/bg
      if(uPass==0 && s.a<0.996) discard;         // opaque pass: only solid texels (write depth)
@@ -172,6 +184,9 @@ const tLayerDepth = layerDepthImgs.map(mkTex(true));    // NEAREST per-sprite de
 const mkShadow = (img) => { if (!img) return null; const t = tex(false); upload(t, img); return t; };
 const tPlayerShadow = playerShadowImgs.map(mkShadow);   // multiply ratio, LINEAR
 const tLayerShadow = layerShadowImgs.map(mkShadow);
+const tPlayerMask = playerMaskImgs.map(m => m   // {variant: tex} screen-space scenery-occlusion clip
+  ? Object.fromEntries(Object.entries(m).map(([v, img]) => [v, mkTex(false)(img)])) : null);
+const tLayerMask = layerMaskImgs.map(mkTex(false));
 upload(tBg, imgBg); upload(tFg, imgFg);
 if (imgLight) upload(tLight, imgLight);
 
@@ -220,14 +235,17 @@ const playerOn = (i) => { const e = document.getElementById('ck_player_' + i); r
 
 // shared mesh draw (players + mesh-type layers): relit skin/tex * light * 2, depth-tested.
 // `ranges` = the tri ranges to draw (per part, so disabled overlay parts are simply omitted).
-function drawMesh(ranges, skinTex, atlasTex, screenLight) {
+function drawMesh(ranges, skinTex, atlasTex, screenLight, maskTex) {
   if (!ranges.length) return;
   gl.useProgram(meshP); gl.bindVertexArray(meshVao);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uMask'), 2);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), ck('ck_li') ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uScreenLight'), screenLight ? 1 : 0);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseMask'), (maskTex && ck('ck_mask')) ? 1 : 0);
+  if (maskTex) { gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, maskTex); }
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, screenLight ? tLight : atlasTex);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, skinTex);
   const uPass = gl.getUniformLocation(meshP, 'uPass');
@@ -259,8 +277,9 @@ function playerRanges(p, i) {                         // base + enabled overlays
 }
 function drawPlayer(i) {
   const p = manifest.players[i];
+  const mask = tPlayerMask[i] ? tPlayerMask[i][playerVariant(i)] : null;
   drawMesh(playerRanges(p, i), tSkins[i],
-           lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen');
+           lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen', mask);
 }
 function drawDepthSprite(i) {                         // straight-alpha quad, per-pixel gl_FragDepth
   const L = layers[i];
@@ -279,7 +298,7 @@ function drawDepthSprite(i) {                         // straight-alpha quad, pe
 }
 function drawLayer(i) {                               // mesh -> geometry; sprite -> depth quad / flat
   const L = layers[i];
-  if (L.type === 'mesh') { if (tLayerTex[i] && tLayerAtlas[i]) drawMesh([L.tri_range], tLayerTex[i], tLayerAtlas[i], false); }
+  if (L.type === 'mesh') { if (tLayerTex[i] && tLayerAtlas[i]) drawMesh([L.tri_range], tLayerTex[i], tLayerAtlas[i], false, tLayerMask[i]); }
   else if (tLayerDepth[i]) drawDepthSprite(i);       // per-pixel depth-tested against the meshes
   else if (tLayerSprite[i]) blitQuadBlend(tLayerSprite[i]);   // fallback: whole-object painter order
 }
@@ -309,7 +328,10 @@ function draw() {
     else if (layerOn(it.i)) drawLayer(it.i);         // mesh (geometry) or sprite (quad)
   }
 
-  if (ck('ck_fg')) blitQuadBlend(tFg);               // real scenery in front of everything
+  // foreground OFF by default in static: the per-entity scenery mask already occludes each entity
+  // (revealing the bg, which contains that front scenery). Kept as an opt-in for a future
+  // semi-transparent-front layer (e.g. flames over an optional object).
+  if (ck('ck_fg')) blitQuadBlend(tFg);
 }
 
 // swap a player's skin / a mesh-layer's texture at runtime (file input, or __dbg.setSkin)
@@ -336,7 +358,7 @@ function setLayerTex(i, source) { if (tLayerTex[i]) { upload(tLayerTex[i], sourc
     lab.appendChild(inp); box.appendChild(lab);
   });
 }
-for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_sh', 'ck_fg'])
+for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_sh', 'ck_mask', 'ck_fg'])
   document.getElementById(id).addEventListener('change', draw);
 
 // per-layer toggles (one checkbox each, default on), labelled by the layer's object name
