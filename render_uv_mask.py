@@ -3577,9 +3577,11 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
 
 
 def _close_mask(m2d, iterations=2):
-    """Morphological CLOSE (dilate then erode, 3x3) on a 0/1 mask: fills thin interior holes (the
-    sub-pixel index-0 cracks the dense lattice-deformed meshes leave in the Object-Index pass) while
-    keeping the silhouette roughly intact. `iterations` ~ the max crack width filled (px)."""
+    """Morphological CLOSE of radius `iterations` on a 0/1 mask: dilate N times THEN erode N times
+    (NOT N separate dilate-erode passes -- that only ever fills 1-2px). This fills interior holes up
+    to ~2*N px wide (the sub-pixel index-0 cracks the dense lattice-deformed meshes leave in the
+    Object-Index pass) while keeping the outer silhouette intact (the dilation is undone by the
+    matching erosion). Real holes / concavities wider than 2*N px survive."""
     def _dil(a):
         r = a
         for dy in (-1, 0, 1):
@@ -3593,7 +3595,9 @@ def _close_mask(m2d, iterations=2):
                 r = np.minimum(r, np.roll(np.roll(a, dy, 0), dx, 1))
         return r
     for _ in range(iterations):
-        m2d = _ero(_dil(m2d))
+        m2d = _dil(m2d)
+    for _ in range(iterations):
+        m2d = _ero(m2d)
     return m2d
 
 
@@ -3742,7 +3746,7 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
             if oid is None:
                 return None
             m = (np.round(oid[:, 0]).astype(np.int32) == 1).astype('float32')   # 1 = entity visible
-            m = _close_mask(m.reshape(H, W), iterations=2).reshape(-1)           # fill thin cracks
+            m = _close_mask(m.reshape(H, W), iterations=3).reshape(-1)           # fill cracks <= ~6px
             buf = np.empty((m.shape[0], 4), 'float32')
             buf[:, 0] = buf[:, 1] = buf[:, 2] = m
             buf[:, 3] = 1.0
