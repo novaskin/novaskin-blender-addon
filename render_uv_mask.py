@@ -3471,7 +3471,9 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
             depth_fn = depth_range = None
             if dep is not None:
                 wd = (dep[:, 0] - zmin) / zspan        # window depth; may be <0 (nearer than players)
-                sel = alpha > 0.5
+                # the Depth pass is a huge sentinel where a ray misses (sky / through a holdout); a
+                # few such texels on the silhouette edge would otherwise blow up wmax. Keep finite.
+                sel = (alpha > 0.5) & np.isfinite(dep[:, 0]) & (dep[:, 0] < 1e6)
                 if sel.any():
                     wmin, wmax = float(wd[sel].min()), float(wd[sel].max())
                     if wmax - wmin < 1e-4:
