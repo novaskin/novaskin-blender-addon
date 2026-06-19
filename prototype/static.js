@@ -95,6 +95,9 @@ const loadMaskVariants = async (m) => {
 const playerMaskImgs = await Promise.all(manifest.players.map(p => loadMaskVariants(p.mask)));
 const layerMaskImgs = await Promise.all(
   layers.map(L => (L.type === 'mesh' && L.mask) ? loadImage(DIR + L.mask + _cb) : null));
+// per-player screen-space WATER TINT (colored multiply over the submerged part; absent = dry player)
+const playerWaterTintImgs = await Promise.all(
+  manifest.players.map(p => p.water_tint ? loadImage(DIR + p.water_tint + _cb) : null));
 
 // --- GL setup ---
 const canvas = document.getElementById('gl');
@@ -126,8 +129,8 @@ const meshP = prog(
      gl_Position=vec4(vScr*2.-1., aPx.z*2.-1., 1.); }`,
   `#version 300 es
    precision highp float;
-   uniform sampler2D uSkin; uniform sampler2D uLight; uniform sampler2D uMask;
-   uniform bool uUseLight; uniform bool uScreenLight; uniform bool uUseMask; uniform int uPass;
+   uniform sampler2D uSkin; uniform sampler2D uLight; uniform sampler2D uMask; uniform sampler2D uWaterTint;
+   uniform bool uUseLight; uniform bool uScreenLight; uniform bool uUseMask; uniform bool uUseWaterTint; uniform int uPass;
    in vec2 vUv; in vec2 vScr; out vec4 frag;
    void main(){
      float m = uUseMask ? texture(uMask, vScr).r : 1.0;   // scenery-occlusion coverage (0..1)
@@ -138,7 +141,10 @@ const meshP = prog(
      if(uPass==1 && a>=0.996) discard;          // transparent pass: mask edge + semi-transparent skin
      vec2 luv = uScreenLight ? vScr : vUv;
      vec3 l = uUseLight ? texture(uLight, luv).rgb*2.0 : vec3(1.0);
-     frag=vec4(s.rgb*l, a);                      // straight alpha (SRC_ALPHA blend on the semi pass)
+     // water tint: a colored multiply over the SUBMERGED part (1 above the waterline), so the relit
+     // skin shows tinted through the water instead of as a decal on top. Screen-space, skin-independent.
+     vec3 wt = uUseWaterTint ? texture(uWaterTint, vScr).rgb : vec3(1.0);
+     frag=vec4(s.rgb*l*wt, a);                   // straight alpha (SRC_ALPHA blend on the semi pass)
    }`);
 
 // depth-aware sprite: a straight-alpha quad that writes per-pixel gl_FragDepth (decoded from its
@@ -189,6 +195,7 @@ const tLayerShadow = layerShadowImgs.map(mkShadow);
 const tPlayerMask = playerMaskImgs.map(m => m   // {variant: tex} screen-space scenery-occlusion clip
   ? Object.fromEntries(Object.entries(m).map(([v, img]) => [v, mkTex(false)(img)])) : null);
 const tLayerMask = layerMaskImgs.map(mkTex(false));
+const tPlayerWaterTint = playerWaterTintImgs.map(mkTex(false));   // LINEAR colored multiply (submerged)
 upload(tBg, imgBg); upload(tFg, imgFg);
 if (imgLight) upload(tLight, imgLight);
 
@@ -237,17 +244,20 @@ const playerOn = (i) => { const e = document.getElementById('ck_player_' + i); r
 
 // shared mesh draw (players + mesh-type layers): relit skin/tex * light * 2, depth-tested.
 // `ranges` = the tri ranges to draw (per part, so disabled overlay parts are simply omitted).
-function drawMesh(ranges, skinTex, atlasTex, screenLight, maskTex) {
+function drawMesh(ranges, skinTex, atlasTex, screenLight, maskTex, waterTintTex) {
   if (!ranges.length) return;
   gl.useProgram(meshP); gl.bindVertexArray(meshVao);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uMask'), 2);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uWaterTint'), 3);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), ck('ck_li') ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uScreenLight'), screenLight ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uUseMask'), (maskTex && ck('ck_mask')) ? 1 : 0);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseWaterTint'), (waterTintTex && ck('ck_water')) ? 1 : 0);
   if (maskTex) { gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, maskTex); }
+  if (waterTintTex) { gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, waterTintTex); }
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, screenLight ? tLight : atlasTex);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, skinTex);
   const uPass = gl.getUniformLocation(meshP, 'uPass');
@@ -281,7 +291,8 @@ function drawPlayer(i) {
   const p = manifest.players[i];
   const mask = tPlayerMask[i] ? tPlayerMask[i][playerVariant(i)] : null;
   drawMesh(playerRanges(p, i), tSkins[i],
-           lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen', mask);
+           lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen', mask,
+           tPlayerWaterTint[i]);
 }
 function drawDepthSprite(i) {                         // straight-alpha quad, per-pixel gl_FragDepth
   const L = layers[i];
@@ -362,7 +373,7 @@ function setLayerTex(i, source) { if (tLayerTex[i]) { upload(tLayerTex[i], sourc
 }
 // foreground is an OVERLAY (rain/glare in front) -> on by default; else the legacy opaque fg -> off
 document.getElementById('ck_fg').checked = !!manifest.foreground_overlay;
-for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_sh', 'ck_mask', 'ck_fg'])
+for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_sh', 'ck_mask', 'ck_water', 'ck_fg'])
   document.getElementById(id).addEventListener('change', draw);
 
 // per-layer toggles (one checkbox each, default on), labelled by the layer's object name

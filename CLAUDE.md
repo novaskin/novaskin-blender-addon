@@ -193,6 +193,14 @@ needs a mesh, add an in-Blender check.
   both arm variants (`_set_arm_style`), `parts` meta (label / tri_range / overlay / variant).
 - `_static_render_images()` — background, foreground, screen light, per-entity shadow ratios.
 - `_static_render_layers()` — tight sprite beauty per sprite-type layer.
+- `_static_render_water_tint()` — per-player screen-space WATER TINT (a colored multiply over the
+  submerged part). Two-background matting (player as white/black emission behind the lit water) gives
+  the pure transmission `T = white - black` (the reflection cancels); blurred + clamped to `[lo,1]`.
+  The browser does `skin * atlas * 2 * T`, so a submerged player stays re-skinnable but tinted (NOT
+  the reflection, which would hide the skin). Note: the atlas already bakes most of the underwater
+  DIMMING (it's a multiply too), so the tint's visible job is mainly the COLOR; subtle in a scene
+  whose water is reflective (the clamp shows where T-only can't see through a glint).
+- `_obj_is_transmissive()` — water/glass vs opaque, by material transmission (general, not by name).
 - `_bake_player_light_atlas()` / `_hide_others_for_bake()` / `_force_bake_visible()` — atlas baking.
 - `_expand_pixel_uvs()` / `_mesh_uv_handedness()` — pixel-UV cell expansion + degenerate-face fix.
 - `_force_selection_props_on()` / `_restore_selection_props()` — force "Second layer" ON for export.

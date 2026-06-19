@@ -34,9 +34,19 @@
     font-size: 11px; color: #777;
   }
 
-  /* right column — preview fills the rest, image scaled to fit */
-  #preview { flex: 1; min-width: 0; padding: 16px; background: #0d0d0d; }
-  #preview canvas { display: block; width: 100%; height: 100%; object-fit: contain; }
+  /* right column — preview fills the rest; canvas is pan/zoomed via transform */
+  #preview {
+    flex: 1; min-width: 0; background: #0d0d0d;
+    position: relative; overflow: hidden;   /* clip the transformed canvas */
+    touch-action: none; cursor: grab;       /* own the wheel/touchpad gestures */
+  }
+  #preview.dragging { cursor: grabbing; }
+  #preview canvas {
+    position: absolute; inset: 16px;        /* fit box; transform layers on top */
+    width: calc(100% - 32px); height: calc(100% - 32px); object-fit: contain;
+    transform-origin: 0 0; will-change: transform;
+    image-rendering: pixelated;
+  }
 </style>
 </head>
 <body>
@@ -49,6 +59,7 @@
       <label><input type="checkbox" id="ck_li" checked> light (atlas)</label>
       <label><input type="checkbox" id="ck_sh" checked> shadows</label>
       <label><input type="checkbox" id="ck_mask" checked> mask (occlusion)</label>
+      <label><input type="checkbox" id="ck_water" checked> water tint (submerged)</label>
       <label><input type="checkbox" id="ck_fg"> foreground</label>
     </div>
 
@@ -80,5 +91,51 @@
   </main>
 </div>
 <script type="module">import('./static.js?v=' + Date.now());</script>
+<script>
+// Pan + zoom the preview canvas only (sidebar untouched). Works with mouse,
+// trackpad two-finger scroll (pan) and pinch (zoom), and drag-to-pan.
+(() => {
+  const preview = document.getElementById('preview');
+  const canvas = document.getElementById('gl');
+  const MIN = 0.1, MAX = 40;
+  let scale = 1, tx = 0, ty = 0;
+  const apply = () => { canvas.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`; };
+
+  // zoom toward (cx,cy) — point under the cursor stays put
+  function zoomAt(cx, cy, factor) {
+    const ns = Math.min(MAX, Math.max(MIN, scale * factor));
+    const k = ns / scale;
+    tx = cx - k * (cx - tx);
+    ty = cy - k * (cy - ty);
+    scale = ns; apply();
+  }
+
+  preview.addEventListener('wheel', (e) => {
+    e.preventDefault();                          // never scroll the page
+    const r = preview.getBoundingClientRect();
+    if (e.ctrlKey) {                             // pinch (trackpad) or ctrl+wheel -> zoom
+      zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.01));
+    } else {                                     // two-finger scroll / wheel -> pan
+      tx -= e.deltaX; ty -= e.deltaY; apply();
+    }
+  }, { passive: false });
+
+  let lx = 0, ly = 0, drag = false;
+  preview.addEventListener('pointerdown', (e) => {
+    drag = true; lx = e.clientX; ly = e.clientY;
+    preview.setPointerCapture(e.pointerId); preview.classList.add('dragging');
+  });
+  preview.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    tx += e.clientX - lx; ty += e.clientY - ly;
+    lx = e.clientX; ly = e.clientY; apply();
+  });
+  const end = () => { drag = false; preview.classList.remove('dragging'); };
+  preview.addEventListener('pointerup', end);
+  preview.addEventListener('pointercancel', end);
+
+  preview.addEventListener('dblclick', () => { scale = 1; tx = 0; ty = 0; apply(); });  // reset to fit
+})();
+</script>
 </body>
 </html>

@@ -3597,6 +3597,119 @@ def _close_mask(m2d, iterations=2):
     return m2d
 
 
+def _box_blur_rgb(rgb2d, iterations=2):
+    """Cheap 3x3 box blur of an (H,W,3) array (np.roll, edge-wrapping is fine for an interior map).
+    Used to denoise the water-tint ratio so the glass surface's render noise does not speckle it."""
+    out = rgb2d
+    for _ in range(iterations):
+        acc = np.zeros_like(out)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                acc += np.roll(np.roll(out, dy, 0), dx, 1)
+        out = acc / 9.0
+    return out
+
+
+def _static_render_water_tint(players, out_dir=None):
+    """Per player, a screen-space WATER-TINT map so a SUBMERGED player stays re-skinnable but is
+    tinted by the transmissive surface in front of it (water/glass), instead of looking like a flat
+    decal on top of it. The PURE transmission is extracted by two-background matting -- the player as
+    flat WHITE then BLACK emission behind the (lit) water; `T = white - black` CANCELS the surface's
+    own reflection, leaving only the colored attenuation (the deliberate T-only choice: we do NOT add
+    the reflection, which would hide the skin). A third water-hidden silhouette gives a clean coverage
+    so only the SOLID submerged interior is tinted, not the anti-aliased rim; the result is box-blurred
+    (the glass render is noisy / refraction-patterned) and clamped to `[lo, 1]` (the deepest / most
+    reflective water never goes to black). 1 = no change (dry / above the waterline); the browser
+    multiplies the relit skin by it, and it is skin-independent. Returns {label: file}; a dry player
+    is skipped, and if the scene has no transmissive scenery nothing is written. Self-contained."""
+    s = bpy.context.scene
+    out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
+    os.makedirs(out_dir, exist_ok=True)
+    char_names = {o.name for p in players for o in p["char_all"]}
+    scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in char_names]
+    transmissive = [o for o in scenery if _obj_is_transmissive(o)]
+    if not transmissive:
+        return {}                                  # no water/glass anywhere -> no tint to bake
+    opaque = [o for o in scenery if o not in transmissive]
+    TINT_LO = 0.25                                  # darkest the deep/reflective water tints (no black
+    #                                                 blobs where the surface is fully reflective)
+
+    def _emit(name, v):
+        mat = bpy.data.materials.new(name)
+        mat.use_nodes = True
+        nt = mat.node_tree
+        nt.nodes.clear()
+        em = nt.nodes.new("ShaderNodeEmission")
+        em.inputs[0].default_value = (v, v, v, 1.0)
+        op = nt.nodes.new("ShaderNodeOutputMaterial")
+        nt.links.new(em.outputs[0], op.inputs[0])
+        return mat
+
+    white = _emit("NSK_wt_white", 1.0)
+    black = _emit("NSK_wt_black", 0.0)
+    sess = _Session()
+    out = {}
+    try:
+        for p in players:
+            meshes = [o for o in p["char_all"] if o.type == 'MESH']
+            own = {m.name for m in p["char_all"]}
+            saved = {o: [sl.material for sl in o.material_slots] for o in meshes}
+
+            def _set(mat):
+                for o in meshes:
+                    for sl in o.material_slots:
+                        sl.material = mat
+
+            sess.restore_visibility()
+            sess.mute_drivers(True)
+            for o in s.objects:                    # isolate: other entities + OPAQUE scenery hidden,
+                if o.name in char_names and o.name not in own:   # so only the player + the water remain
+                    o.hide_render = True
+            op_hr = {o: o.hide_render for o in opaque}
+            for o in opaque:
+                o.hide_render = True
+            tr_hr = {o: o.hide_render for o in transmissive}
+            try:
+                _set(white)
+                bpy.context.view_layer.update()
+                Aw, W, H = _render_combined_array(sess, MASK_RES_PCT)    # white emission, water in front
+                _set(black)
+                bpy.context.view_layer.update()
+                Ab, _, _ = _render_combined_array(sess, MASK_RES_PCT)    # black emission, water in front
+                for o in transmissive:
+                    o.hide_render = True                                  # silhouette: the player alone
+                bpy.context.view_layer.update()
+                cov_arr, _, _ = _render_combined_array(sess, MASK_RES_PCT, transparent=True)
+            finally:
+                for o, v in tr_hr.items():
+                    o.hide_render = v
+                for o, v in op_hr.items():
+                    o.hide_render = v
+                for o, mats in saved.items():
+                    for i, sl in enumerate(o.material_slots):
+                        sl.material = mats[i]
+
+            T = np.clip(_box_blur_rgb((Aw[:, :3] - Ab[:, :3]).reshape(H, W, 3), 2).reshape(-1, 3),
+                        0.0, 1.0)                                         # blurred pure transmission
+            cov = np.clip(cov_arr[:, 3], 0.0, 1.0)
+            tinted = (cov > 0.85) & (T.mean(1) < 0.8)                    # solid interior the water dims
+            if int(tinted.sum()) < 16:
+                continue                                                # essentially dry -> no map
+            tint = np.ones((T.shape[0], 4), 'float32')
+            tint[tinted, :3] = np.clip(T[tinted], TINT_LO, 1.0)
+            fn = f"{p['label']}_watertint.webp"
+            _save_image(tint.reshape(-1), W, H, os.path.join(out_dir, fn),
+                        file_format='WEBP', lossless=True)
+            out[p["label"]] = fn
+            print(f"[STATIC watertint] {p['label']} -> {fn} ({int(tinted.sum())} px tinted)")
+    finally:
+        sess.restore()
+        bpy.context.view_layer.update()
+        for mat in (white, black):
+            bpy.data.materials.remove(mat)
+    return out
+
+
 def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=None):
     """Per-entity SCENERY-occlusion mask via the Object Index pass: the entity's meshes get
     pass_index=1, every OTHER entity (the optional players/layers) is hidden, the real scenery stays.
@@ -3715,7 +3828,8 @@ def _static_render_overlay(overlay_names, out_dir=None):
         bpy.context.view_layer.update()
 
 
-def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, masks=None):
+def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, masks=None,
+                           water_tints=None):
     """Write `static/manifest.json` tying the static-v2 pieces together (paths are bare file names,
     relative to the manifest's own dir). `light_space` selects how the renderer samples the light:
     "screen" -> one `light` image sampled by screen position (viewport-quality, default); "uv" ->
@@ -3724,6 +3838,7 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, mask
     light_space = STATIC_LIGHT_SPACE
     shadows = imgs.get("shadows") or {}
     masks = masks or {}
+    water_tints = water_tints or {}
     players_meta = []
     for pm in geo["players"]:
         e = dict(pm)
@@ -3731,6 +3846,7 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, mask
             e["atlas"] = atlas_by_label.get(pm["label"])
         e["shadow"] = shadows.get(pm["label"])    # display-space multiply ratio, toggleable
         e["mask"] = masks.get(pm["label"])        # {variant: file} scenery-occlusion clip
+        e["water_tint"] = water_tints.get(pm["label"])   # screen-space colored multiply (submerged)
         players_meta.append(e)
     if layers:
         layers = [dict(l, shadow=shadows.get(l["name"]), mask=masks.get(l["name"]))
@@ -3800,8 +3916,8 @@ def _static_export_steps(players, op=None, out_dir=None):
     groups = [g for g in all_groups if _layer_mode(g) != "OVERLAY"]
     mesh_layers, sprite_groups = _static_split_layers(groups)   # retexturable meshes vs flat sprites
     n_atlas = (len(players) if uv_light else 0) + len(mesh_layers)
-    # atlases/textures + geometry + images + (sprites) + masks + (overlay) + manifest
-    total = n_atlas + 2 + (1 if sprite_groups else 0) + 1 + (1 if overlay_groups else 0) + 1
+    # atlases/textures + geometry + images + (sprites) + masks + water tint + (overlay) + manifest
+    total = n_atlas + 2 + (1 if sprite_groups else 0) + 1 + 1 + (1 if overlay_groups else 0) + 1
     state = {"done": 0}
     def prog(msg):
         state["done"] += 1
@@ -3892,6 +4008,10 @@ def _static_export_steps(players, op=None, out_dir=None):
         all_layer_mesh_names = {m.name for g in groups for m in g["meshes"]}
         masks = _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=out_dir)
         yield prog(f"masks ({len(masks)})")
+        # 4b) per-player WATER TINT: a submerged player stays re-skinnable but is tinted by the water
+        #     in front of it (a colored multiply over the relit skin), instead of a flat decal on top.
+        water_tints = _static_render_water_tint(players, out_dir=out_dir)
+        yield prog(f"water tint ({len(water_tints)})")
         # 4c) OVERLAY layers (rain / glare): rendered alone -> foreground.webp, composited on top
         if overlay_groups:
             ov_fg = _static_render_overlay(overlay_names, out_dir=out_dir)
@@ -3910,7 +4030,7 @@ def _static_export_steps(players, op=None, out_dir=None):
                                           -(e.get("camera_depth") or 0.0)))   # back -> front
         # 5) manifest
         manifest = _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=layer_entries,
-                                          masks=masks)
+                                          masks=masks, water_tints=water_tints)
         yield prog("manifest.json")
         print(f"[STATIC] export complete -> {out_dir} ({geo['tris']} tris, "
               f"light={STATIC_LIGHT_SPACE})")

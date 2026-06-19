@@ -264,6 +264,21 @@ class TestCloseMask(unittest.TestCase):
         self.assertGreater(int((out < 0.5).sum()), 50)            # most of the hole survives
 
 
+class TestBoxBlurRgb(unittest.TestCase):
+    def test_smooths_a_spike_conserves_mean(self):
+        a = np.zeros((9, 9, 3), "float32")
+        a[4, 4] = 1.0                                  # a single bright spike
+        out = m._box_blur_rgb(a, 1)
+        self.assertLess(float(out[4, 4, 0]), 0.5)      # spike spread out
+        self.assertGreater(float(out[3, 4, 0]), 0.0)   # bled into neighbours
+        self.assertAlmostEqual(float(out.sum()), float(a.sum()), places=4)   # box blur conserves total
+
+    def test_flat_field_unchanged(self):
+        a = np.full((6, 6, 3), 0.4, "float32")
+        out = m._box_blur_rgb(a, 3)
+        self.assertTrue(np.allclose(out, 0.4, atol=1e-5))
+
+
 class TestLayerSafeName(unittest.TestCase):
     def test_sanitizes(self):
         self.assertEqual(m._layer_safe_name("boat.rig"), "boat_rig")
