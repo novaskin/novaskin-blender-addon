@@ -130,14 +130,15 @@ const meshP = prog(
    uniform bool uUseLight; uniform bool uScreenLight; uniform bool uUseMask; uniform int uPass;
    in vec2 vUv; in vec2 vScr; out vec4 frag;
    void main(){
-     if(uUseMask && texture(uMask, vScr).r < 0.5) discard;   // scenery occludes here
+     float m = uUseMask ? texture(uMask, vScr).r : 1.0;   // scenery-occlusion coverage (0..1)
      vec4 s=texture(uSkin,vUv);
-     if(s.a<0.004) discard;                     // fully transparent texels reveal the base/bg
-     if(uPass==0 && s.a<0.996) discard;         // opaque pass: only solid texels (write depth)
-     if(uPass==1 && s.a>=0.996) discard;        // transparent pass: only semi-transparent texels
+     float a = s.a * m;                         // fold the mask into alpha: soft occlusion edge,
+     if(a<0.004) discard;                       // and a thin sub-0.5 mask sliver fades, not cracks
+     if(uPass==0 && a<0.996) discard;           // opaque pass: only solid texels (write depth)
+     if(uPass==1 && a>=0.996) discard;          // transparent pass: mask edge + semi-transparent skin
      vec2 luv = uScreenLight ? vScr : vUv;
      vec3 l = uUseLight ? texture(uLight, luv).rgb*2.0 : vec3(1.0);
-     frag=vec4(s.rgb*l, s.a);                    // straight alpha (SRC_ALPHA blend on the semi pass)
+     frag=vec4(s.rgb*l, a);                      // straight alpha (SRC_ALPHA blend on the semi pass)
    }`);
 
 // depth-aware sprite: a straight-alpha quad that writes per-pixel gl_FragDepth (decoded from its

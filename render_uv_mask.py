@@ -95,6 +95,11 @@ PLAYER_FOLDER_PREFIX = 'player'
 
 UV_SAMPLES = 1
 MASK_SAMPLES = 1
+# The Object Index pass is NOT averaged over samples (it stays the integer index), so the static-v2
+# occlusion mask is binary. The dense lattice-deformed meshes leave thin sub-pixel index-0 slivers
+# inside the silhouette (visible as cracks when the player draws over the bg); a morphological CLOSE
+# on the mask fills them. The browser folds the (linear-sampled) mask into alpha for a soft edge.
+STATIC_MASK_SAMPLES = 1
 MASK_RES_PCT = 100
 PLAYER_INDEX = 1
 
@@ -3507,6 +3512,27 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
         bpy.context.view_layer.update()
 
 
+def _close_mask(m2d, iterations=2):
+    """Morphological CLOSE (dilate then erode, 3x3) on a 0/1 mask: fills thin interior holes (the
+    sub-pixel index-0 cracks the dense lattice-deformed meshes leave in the Object-Index pass) while
+    keeping the silhouette roughly intact. `iterations` ~ the max crack width filled (px)."""
+    def _dil(a):
+        r = a
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                r = np.maximum(r, np.roll(np.roll(a, dy, 0), dx, 1))
+        return r
+    def _ero(a):
+        r = a
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                r = np.minimum(r, np.roll(np.roll(a, dy, 0), dx, 1))
+        return r
+    for _ in range(iterations):
+        m2d = _ero(_dil(m2d))
+    return m2d
+
+
 def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=None):
     """Per-entity SCENERY-occlusion mask via the Object Index pass: the entity's meshes get
     pass_index=1, every OTHER entity (the optional players/layers) is hidden, the real scenery stays.
@@ -3534,10 +3560,11 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
             for o in active_objs:
                 o.pass_index = 1
             bpy.context.view_layer.update()
-            oid, W, H = sess.render_pass('Object Index', 'CYCLES', MASK_SAMPLES, MASK_RES_PCT)
+            oid, W, H = sess.render_pass('Object Index', 'CYCLES', STATIC_MASK_SAMPLES, MASK_RES_PCT)
             if oid is None:
                 return None
-            m = (np.round(oid[:, 0]).astype(np.int32) == 1).astype('float32')
+            m = (np.round(oid[:, 0]).astype(np.int32) == 1).astype('float32')   # 1 = entity visible
+            m = _close_mask(m.reshape(H, W), iterations=2).reshape(-1)           # fill thin cracks
             buf = np.empty((m.shape[0], 4), 'float32')
             buf[:, 0] = buf[:, 1] = buf[:, 2] = m
             buf[:, 3] = 1.0
