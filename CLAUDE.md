@@ -126,6 +126,26 @@ To inspect the export without a full render, you can `exec` the file in a throwa
 (`__name__` ≠ `"__main__"` so `register()` doesn't fire) and call `discover_players()` +
 `_static_write_geometry(...)` (fast, no render) to check collected parts.
 
+## Tests
+
+`tests/` holds unit tests for the **pure** (no live-Blender) helpers — the binary-format writers
+(`_anim_write_anim` round-trip), colour math (`_lin_to_srgb`), label mapping (`_mc_part_label` /
+`_assign_part_labels`, incl. the duplicate-mesh collision case), filename sanitation, and the light
+dilation. They use `unittest` (stdlib, no pytest) and import `render_uv_mask.py` via
+`tests/_loader.py`, which installs a **minimal fake `bpy`** so the module imports outside Blender
+(the bpy-touching functions just aren't called).
+
+They need **numpy**, which the system `python3` usually lacks — run with Blender's bundled Python:
+
+```
+tests/run_tests.sh            # finds Blender's python (or a numpy-capable python3) and runs them
+BLENDER_PYTHON=/path tests/run_tests.sh   # override the interpreter
+```
+
+Anything that genuinely needs `bpy` (geometry collection, rendering, the atlas bake) is NOT unit
+tested — validate those by running an export and checking the manifest / browser, per the workflow
+above. When adding a pure helper, prefer testing it here.
+
 ## Conventions
 
 - **Code, comments, docs, and commit messages: English. Chat with the user: Portuguese.**

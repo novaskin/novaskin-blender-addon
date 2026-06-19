@@ -1,0 +1,210 @@
+"""Unit tests for the PURE (no live-Blender) helpers in render_uv_mask.py.
+
+Run with Blender's bundled Python (has numpy):  tests/run_tests.sh
+or:  <blender-python> -m unittest discover -s tests
+"""
+import os
+import struct
+import sys
+import tempfile
+import unittest
+import zlib
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import numpy as np
+from _loader import load_module
+
+m = load_module()
+
+
+class TestAnimWriteAnim(unittest.TestCase):
+    """positions.bin / anim.bin = 'NSKA' v3 header + zlib(int16 xyz). Round-trip the encoder."""
+
+    HEADER = "<4sIIIfffff"   # magic, ver, V, K, quant, keys_fps, zmin, zmax, zq
+
+    def _read(self, path):
+        with open(path, "rb") as f:
+            raw = f.read()
+        hsize = struct.calcsize(self.HEADER)
+        magic, ver, V, K, quant, fps, zmin, zmax, zq = struct.unpack(self.HEADER, raw[:hsize])
+        flat = np.frombuffer(zlib.decompress(raw[hsize:]), dtype="<i2")
+        keys_q = flat.reshape(K, V, 3).astype(np.int64)
+        return dict(magic=magic, ver=ver, V=V, K=K, quant=quant, fps=fps,
+                    zmin=zmin, zmax=zmax, zq=zq), keys_q
+
+    def test_header_and_single_key_roundtrip(self):
+        quant, fps = m.ANIM_QUANT, 0.0
+        key = np.array([[10.0, 20.0, -1.0],
+                        [12.5, 7.25, -2.0],
+                        [0.0, 0.0, -0.5]], dtype="float32")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "positions.bin")
+            K, V = m._anim_write_anim(path, [key], quant, fps)
+            self.assertEqual((K, V), (1, 3))
+            hdr, keys_q = self._read(path)
+
+        self.assertEqual(hdr["magic"], b"NSKA")
+        self.assertEqual(hdr["ver"], 3)
+        self.assertEqual((hdr["V"], hdr["K"]), (3, 1))
+        self.assertAlmostEqual(hdr["quant"], float(quant), places=5)
+        self.assertAlmostEqual(hdr["zmin"], float(key[:, 2].min()), places=5)
+        self.assertAlmostEqual(hdr["zmax"], float(key[:, 2].max()), places=5)
+        self.assertAlmostEqual(hdr["zq"], float((1 << m.ANIM_Z_BITS) - 1), places=3)
+
+        # x/y are px*quant rounded; z is normalized to [zmin,zmax]*zq rounded
+        exp_xy = np.round(key[:, :2] * quant).astype(np.int64)
+        np.testing.assert_array_equal(keys_q[0, :, :2], exp_xy)
+        zmin, zmax, zq = hdr["zmin"], hdr["zmax"], hdr["zq"]
+        exp_z = np.round((key[:, 2] - zmin) / (zmax - zmin) * zq).astype(np.int64)
+        np.testing.assert_array_equal(keys_q[0, :, 2], exp_z)
+
+        # decode back to world-ish values within one quant/level
+        dec_xy = keys_q[0, :, :2] / quant
+        np.testing.assert_allclose(dec_xy, key[:, :2], atol=1.0 / quant)
+        dec_z = zmin + keys_q[0, :, 2] / zq * (zmax - zmin)
+        np.testing.assert_allclose(dec_z, key[:, 2], atol=(zmax - zmin) / zq + 1e-6)
+
+    def test_degenerate_z_range_does_not_divide_by_zero(self):
+        # all-equal z -> the writer widens zmax by 1e-6 instead of dividing by zero
+        key = np.array([[1.0, 1.0, -3.0], [2.0, 2.0, -3.0]], dtype="float32")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.bin")
+            m._anim_write_anim(path, [key], m.ANIM_QUANT, 0.0)
+            hdr, keys_q = self._read(path)
+        self.assertGreater(hdr["zmax"], hdr["zmin"])
+        self.assertTrue(np.isfinite(keys_q).all())
+
+    def test_multikey_delta_of_delta_roundtrip(self):
+        # key0 absolute, key1 delta, key2+ delta-of-delta -- reconstruct and compare
+        quant = m.ANIM_QUANT
+        k0 = np.array([[0.0, 0.0, -1.0], [4.0, 0.0, -1.5]], dtype="float32")
+        k1 = np.array([[1.0, 1.0, -1.1], [5.0, 1.0, -1.4]], dtype="float32")
+        k2 = np.array([[2.0, 2.0, -1.2], [6.0, 2.5, -1.3]], dtype="float32")
+        keys = [k0, k1, k2]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "p.bin")
+            K, V = m._anim_write_anim(path, keys, quant, 24.0)
+            self.assertEqual((K, V), (3, 2))
+            hdr, dec = self._read(path)   # dec holds [abs, delta, delta-of-delta]
+
+        # quantize each key the same way the writer does (shared zmin/zmax/zq)
+        zmin, zmax, zq = hdr["zmin"], hdr["zmax"], hdr["zq"]
+        exp_q = []
+        for k in keys:
+            q = np.empty((V, 3), np.int64)
+            q[:, :2] = np.round(k[:, :2] * quant)
+            q[:, 2] = np.round((k[:, 2] - zmin) / (zmax - zmin) * zq)
+            exp_q.append(q)
+        # reconstruct absolute keys from the abs/delta/delta-of-delta stream
+        abs0, d0, dd0 = dec[0], dec[1], dec[2]
+        rec0 = abs0
+        rec1 = rec0 + d0
+        rec2 = rec1 + (d0 + dd0)
+        np.testing.assert_array_equal(rec0, exp_q[0])
+        np.testing.assert_array_equal(rec1, exp_q[1])
+        np.testing.assert_array_equal(rec2, exp_q[2])
+
+
+class TestLinToSrgb(unittest.TestCase):
+    def test_known_values_and_clamping(self):
+        out = m._lin_to_srgb(np.array([0.0, 0.0031308, 0.5, 1.0, 2.0, -1.0]))
+        self.assertAlmostEqual(out[0], 0.0, places=6)
+        self.assertAlmostEqual(out[1], 0.0031308 * 12.92, places=6)        # linear toe
+        self.assertAlmostEqual(out[2], 1.055 * 0.5 ** (1 / 2.4) - 0.055, places=6)
+        self.assertAlmostEqual(out[3], 1.0, places=6)
+        self.assertAlmostEqual(out[4], 1.0, places=6)                      # clamp high
+        self.assertAlmostEqual(out[5], 0.0, places=6)                      # clamp low
+
+    def test_monotonic(self):
+        x = np.linspace(0, 1, 50)
+        y = m._lin_to_srgb(x)
+        self.assertTrue(np.all(np.diff(y) >= -1e-9))
+
+
+class TestMcPartLabel(unittest.TestCase):
+    def test_known_mappings(self):
+        self.assertEqual(m._mc_part_label("Body_secondlayer"), "jacket")
+        self.assertEqual(m._mc_part_label("2_Layer_Extrusion"), "hat")
+        self.assertEqual(m._mc_part_label("R.leg_2ndLayer"), "pant_right")
+        self.assertEqual(m._mc_part_label("L.Steve_arm"), "arm_left_classic")
+        self.assertEqual(m._mc_part_label("R.alex_arm_2ndLayer"), "sleeve_right_slim")
+
+    def test_strips_duplicate_suffix(self):
+        self.assertEqual(m._mc_part_label("Body_secondlayer.001"), "jacket")
+        self.assertEqual(m._mc_part_label("L.Steve_arm.042"), "arm_left_classic")
+
+    def test_unmapped_falls_back_to_sanitized(self):
+        self.assertEqual(m._mc_part_label("Some Random Mesh!"), "some_random_mesh")
+        self.assertEqual(m._mc_part_label("boat.rig.003"), "boat_rig")
+
+
+class _Obj:
+    def __init__(self, name):
+        self.name = name
+
+
+class TestAssignPartLabels(unittest.TestCase):
+    def test_no_collision(self):
+        parts = [_Obj("NoFace_Head"), _Obj("Body"), _Obj("L.Steve_arm")]
+        out = m._assign_part_labels(parts)
+        self.assertEqual(out["NoFace_Head"], "head")
+        self.assertEqual(out["Body"], "body")
+        self.assertEqual(out["L.Steve_arm"], "arm_left_classic")
+
+    def test_collision_disambiguated_deterministically(self):
+        # the real sleeve_left_classic / _2 duplicate-mesh case
+        parts = [_Obj("L.Steve_arm_2ndLayer.002"), _Obj("L.Steve_arm_2ndLayer")]
+        out = m._assign_part_labels(parts)
+        # sorted by name: ".002" sorts AFTER bare, so bare gets the base label
+        self.assertEqual(out["L.Steve_arm_2ndLayer"], "sleeve_left_classic")
+        self.assertEqual(out["L.Steve_arm_2ndLayer.002"], "sleeve_left_classic_2")
+
+    def test_collision_is_stable_regardless_of_input_order(self):
+        a = m._assign_part_labels([_Obj("L.Steve_arm_2ndLayer"), _Obj("L.Steve_arm_2ndLayer.002")])
+        b = m._assign_part_labels([_Obj("L.Steve_arm_2ndLayer.002"), _Obj("L.Steve_arm_2ndLayer")])
+        self.assertEqual(a, b)
+
+
+class TestLayerSafeName(unittest.TestCase):
+    def test_sanitizes(self):
+        self.assertEqual(m._layer_safe_name("boat.rig"), "boat_rig")
+        self.assertEqual(m._layer_safe_name("Leg Armor"), "Leg_Armor")
+        self.assertEqual(m._layer_safe_name("__a..b__"), "a_b")
+
+    def test_empty_falls_back(self):
+        self.assertEqual(m._layer_safe_name(""), "layer")
+        self.assertEqual(m._layer_safe_name("!!!"), "layer")
+
+
+class TestAnimDilateLight(unittest.TestCase):
+    def test_passes_zero_is_identity(self):
+        rgb = np.random.RandomState(0).rand(9, 3).astype("float32")
+        cov = np.zeros(9, bool)
+        cov[4] = True
+        out = m._anim_dilate_light(rgb, cov, 3, 3, passes=0)
+        np.testing.assert_array_equal(out, rgb)
+
+    def test_single_color_fills_whole_grid(self):
+        # one covered pixel, one colour -> enough passes fill every pixel with that colour
+        c = np.array([0.2, 0.4, 0.6], "float32")
+        rgb = np.zeros((9, 3), "float32")
+        cov = np.zeros(9, bool)
+        rgb[4] = c
+        cov[4] = True
+        out = m._anim_dilate_light(rgb, cov, 3, 3, passes=5)
+        for i in range(9):
+            np.testing.assert_allclose(out[i], c, atol=1e-7, err_msg=f"pixel {i}")
+
+    def test_covered_pixels_are_preserved(self):
+        rgb = np.zeros((9, 3), "float32")
+        cov = np.zeros(9, bool)
+        rgb[0] = [1.0, 0.0, 0.0]
+        rgb[8] = [0.0, 0.0, 1.0]
+        cov[0] = cov[8] = True
+        out = m._anim_dilate_light(rgb.copy(), cov, 3, 3, passes=3)
+        np.testing.assert_array_equal(out[0], [1.0, 0.0, 0.0])
+        np.testing.assert_array_equal(out[8], [0.0, 0.0, 1.0])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
