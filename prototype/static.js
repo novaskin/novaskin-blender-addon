@@ -112,14 +112,16 @@ const meshP = prog(
   `#version 300 es
    precision highp float;
    uniform sampler2D uSkin; uniform sampler2D uLight; uniform vec2 uRes;
-   uniform bool uUseLight; uniform bool uScreenLight;
+   uniform bool uUseLight; uniform bool uScreenLight; uniform int uPass;
    in vec2 vUv; out vec4 frag;
    void main(){
      vec4 s=texture(uSkin,vUv);
-     if(s.a<0.5) discard;                       // overlay's transparent texels reveal the base
+     if(s.a<0.004) discard;                     // fully transparent texels reveal the base/bg
+     if(uPass==0 && s.a<0.996) discard;         // opaque pass: only solid texels (write depth)
+     if(uPass==1 && s.a>=0.996) discard;        // transparent pass: only semi-transparent texels
      vec2 luv = uScreenLight ? gl_FragCoord.xy/uRes : vUv;
      vec3 l = uUseLight ? texture(uLight, luv).rgb*2.0 : vec3(1.0);
-     frag=vec4(s.rgb*l, 1.0);
+     frag=vec4(s.rgb*l, s.a);                    // straight alpha (SRC_ALPHA blend on the semi pass)
    }`);
 
 function tex(nearest) {
@@ -205,10 +207,18 @@ function drawMesh(ranges, skinTex, atlasTex, screenLight) {
   gl.uniform1i(gl.getUniformLocation(meshP, 'uScreenLight'), screenLight ? 1 : 0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, screenLight ? tLight : atlasTex);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, skinTex);
+  const uPass = gl.getUniformLocation(meshP, 'uPass');
+  const drawAll = () => { for (const [t0, t1] of ranges)
+    gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, idxType, t0 * 3 * idxSize); };
   gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);   // per-vertex depth: self + inter-entity
-  for (const [t0, t1] of ranges)
-    gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, idxType, t0 * 3 * idxSize);
-  gl.disable(gl.DEPTH_TEST);
+  // pass 0: solid texels -> write depth, no blend
+  gl.uniform1i(uPass, 0); gl.disable(gl.BLEND); gl.depthMask(true);
+  drawAll();
+  // pass 1: semi-transparent texels -> blend over what's behind, NO depth write (don't occlude)
+  gl.uniform1i(uPass, 1);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+  drawAll();
+  gl.depthMask(true); gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST);
 }
 const overlayPartOn = (i, label) => {
   const e = document.getElementById('ck_ov_' + i + '_' + label); return !e || e.checked;
