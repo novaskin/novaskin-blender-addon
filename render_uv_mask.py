@@ -3416,11 +3416,12 @@ def _static_split_layers(groups):
 
 
 def _material_is_transmissive(mat):
-    """True if the material lets what is behind it show through (glass / water / ice / any alpha-blend
-    or transmission), by scanning its shader nodes -- recursing up to a few levels into node groups.
-    This is the physical property that decides tint-vs-cut, so it generalizes to ANY scene (no name
-    matching). Conservative on a LINKED Alpha (that is usually a CUTOUT mask -- a leaf shape -- not a
-    see-through tint), which stays opaque so it holds out cleanly."""
+    """True if the material is a SEE-THROUGH surface you look INTO (glass / water / ice), by scanning
+    its shader nodes (recursing a few levels into node groups). Detected from REFRACTIVE/transmission
+    signals: a Glass/Refraction BSDF, a Principled with Transmission > 0, or a Principled with a
+    constant Alpha < 1 (uniform alpha-blend). Deliberately NOT a bare Transparent BSDF nor a LINKED
+    Alpha -- those are the Minecraft CUTOUT idiom (texture-keyed transparency on a SOLID prop: a leaf,
+    a held spear/bucket, a particle), which must stay opaque so it occludes/holds out normally."""
     if mat is None:
         return False
     if not mat.use_nodes:
@@ -3430,7 +3431,7 @@ def _material_is_transmissive(mat):
     def scan(nodes, depth):
         for n in nodes:
             t = n.type
-            if t in ('BSDF_TRANSPARENT', 'BSDF_GLASS', 'BSDF_REFRACTION', 'BSDF_TRANSLUCENT'):
+            if t in ('BSDF_GLASS', 'BSDF_REFRACTION'):     # refractive surface you look into
                 return True
             if t == 'BSDF_PRINCIPLED':
                 tr = n.inputs.get('Transmission Weight') or n.inputs.get('Transmission')
@@ -3448,14 +3449,17 @@ def _material_is_transmissive(mat):
 
 
 def _obj_is_transmissive(o):
-    """Should a submerged sprite/player be TINTED by this object (it is see-through) rather than CUT
-    by it as an opaque holdout? Decided from the MATERIAL transmission/transparency (not by name, so
-    it works in any scene). A per-object override `o["nsk_transmissive"]` (bool) wins when set, for a
-    material the node scan cannot read (e.g. a custom transparency node group)."""
+    """Does this object contain a see-through SURFACE (water / glass / ice) -- so a submerged entity
+    behind it shows THROUGH it (and gets the water tint) rather than being occluded/clipped? True if
+    ANY material is transmissive: the water is often part of a MULTI-material object (a voxel terrain
+    whose water blocks share the mesh with grass/dirt/stone, an ocean plane), so requiring EVERY
+    material would miss it. False positives are avoided in `_material_is_transmissive`, which does NOT
+    count a bare Transparent-BSDF cutout (a leaf, a held spear/bucket, a particle) as see-through.
+    Override with `o["nsk_transmissive"]` (bool) for a material the node scan cannot read."""
     ov = o.get("nsk_transmissive")
     if ov is not None:
         return bool(ov)
-    return any(_material_is_transmissive(sl.material) for sl in o.material_slots)
+    return any(_material_is_transmissive(sl.material) for sl in o.material_slots if sl.material)
 
 
 def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zmax, out_dir=None):
@@ -3717,6 +3721,12 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
     os.makedirs(out_dir, exist_ok=True)
     char_names = {o.name for p in players for o in p["char_all"]}
     entity_names = char_names | set(all_layer_mesh_names)
+    # A TRANSMISSIVE surface (water/glass) must NOT clip a submerged entity: it is see-through, so the
+    # entity shows THROUGH it (and then gets the water tint on top), not hidden behind it. Hide the
+    # transmissive scenery for the Object-Index render so only OPAQUE scenery occludes -- otherwise the
+    # glass water is the front-most index and the submerged part falls out of the mask (vanishes).
+    transmissive_scenery = [o for o in s.objects if o.type == 'MESH'
+                            and o.name not in entity_names and _obj_is_transmissive(o)]
     sess = _Session()
     masks = {}
     saved_idx = {o.name: o.pass_index for o in s.objects}
@@ -3728,8 +3738,13 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
                 o.pass_index = 0
             for o in active_objs:
                 o.pass_index = 1
+            tr_hidden = [o for o in transmissive_scenery if not o.hide_render]
+            for o in tr_hidden:
+                o.hide_render = True                  # water does not occlude the submerged entity
             bpy.context.view_layer.update()
             oid, W, H = sess.render_pass('Object Index', 'CYCLES', STATIC_MASK_SAMPLES, MASK_RES_PCT)
+            for o in tr_hidden:
+                o.hide_render = False
             if oid is None:
                 return None
             m = (np.round(oid[:, 0]).astype(np.int32) == 1).astype('float32')   # 1 = entity visible

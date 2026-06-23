@@ -215,9 +215,14 @@ class TestTransmissive(unittest.TestCase):
     """`_material_is_transmissive` / `_obj_is_transmissive`: decide tint-vs-cut by the actual material
     transmission (general), NOT by an object/material name (which only fit one scene)."""
 
-    def test_glass_and_transparent_bsdf(self):
+    def test_glass_and_refraction_bsdf(self):
         self.assertTrue(m._material_is_transmissive(_Mat(nodes=[_Node('BSDF_GLASS')])))
-        self.assertTrue(m._material_is_transmissive(_Mat(nodes=[_Node('BSDF_TRANSPARENT')])))
+        self.assertTrue(m._material_is_transmissive(_Mat(nodes=[_Node('BSDF_REFRACTION')])))
+
+    def test_bare_transparent_bsdf_is_a_cutout_not_seethrough(self):
+        # the Minecraft cutout idiom: a SOLID prop keyed by texture alpha (leaf, held spear/bucket,
+        # particle) -- must stay opaque so it occludes/holds out, not be treated as water/glass
+        self.assertFalse(m._material_is_transmissive(_Mat(nodes=[_Node('BSDF_TRANSPARENT')])))
 
     def test_principled_transmission_or_low_alpha(self):
         self.assertTrue(m._material_is_transmissive(_Mat(nodes=[_principled(transmission=1.0)])))
@@ -235,13 +240,22 @@ class TestTransmissive(unittest.TestCase):
         self.assertFalse(m._material_is_transmissive(_Mat(use_nodes=False, diffuse_color=(1, 1, 1, 1))))
 
     def test_transmissive_inside_node_group(self):
-        grp = _Node('GROUP', node_tree=_NodeTree([_Node('BSDF_TRANSPARENT')]))
+        grp = _Node('GROUP', node_tree=_NodeTree([_Node('BSDF_GLASS')]))
         self.assertTrue(m._material_is_transmissive(_Mat(nodes=[grp])))
 
     def test_override_property_wins_either_way(self):
         self.assertFalse(m._obj_is_transmissive(_TObj([_Mat(nodes=[_principled()])])))
         self.assertTrue(m._obj_is_transmissive(_TObj([_Mat(nodes=[_principled()])], override=True)))
         self.assertFalse(m._obj_is_transmissive(_TObj([_Mat(nodes=[_Node('BSDF_GLASS')])], override=False)))
+
+    def test_obj_is_transmissive_if_ANY_material_seethrough(self):
+        glass = _Mat(nodes=[_Node('BSDF_GLASS')])
+        opaque = _Mat(nodes=[_principled()])
+        self.assertTrue(m._obj_is_transmissive(_TObj([glass])))
+        # a VOXEL TERRAIN shares one mesh between water blocks and dirt/grass -> any -> transmissive
+        self.assertTrue(m._obj_is_transmissive(_TObj([opaque, glass, opaque])))
+        self.assertFalse(m._obj_is_transmissive(_TObj([opaque, opaque])))
+        self.assertFalse(m._obj_is_transmissive(_TObj([])))                 # no materials -> opaque
 
 
 class TestCloseMask(unittest.TestCase):
