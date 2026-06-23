@@ -3459,13 +3459,18 @@ def _obj_is_transmissive(o):
 
 
 def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zmax, out_dir=None):
-    """Render each SPRITE-type layer as a straight-alpha beauty TIGHT to the group's silhouette: the
-    group over a transparent film, with opaque FOLIAGE/terrain as a holdout (front scenery cuts its
-    alpha so it sits correctly behind a leaf) but the WATER left to RENDER, so a half-submerged mob
-    shows the water tinting its submerged part instead of a flat decal; the surrounding water is then
-    masked out with the mob's own silhouette (a second water-hidden render). Display-encoded like the
-    background, edge-dilated. Its cast shadow / water darkening is NOT folded in here -- it is a
-    SEPARATE multiply ratio rendered in _static_render_images (exactly like the mesh entities).
+    """Render each SPRITE-type layer EXACTLY as the full Blender scene shows it, then CUT it to the
+    group's own silhouette: render the mob with ALL scenery visible and normal (every OTHER entity
+    hidden) -> `S` has the real water/glass surface, with its real reflections, OVER the mob's
+    submerged part (not a flat decal); a second render with all scenery hidden gives the mob's tight
+    silhouette `D`, and the sprite = S masked to D. (An earlier holdout approach made the water reflect
+    emptiness and transmit the film, so a half-submerged mob looked like it sat ON the water.)
+    Display-encoded like the background, edge-dilated. Its cast shadow / water darkening is NOT folded
+    in here -- it is a SEPARATE multiply ratio rendered in _static_render_images (like mesh entities).
+    Also writes a per-sprite DEPTH map `<name>_depth.webp`: the group's camera depth normalized to the
+    GLOBAL `[zmin, zmax]` (the SAME window scale as the mesh / positions.bin), re-encoded 8-bit over
+    the sprite's OWN `[wmin, wmax]` for precision, so the browser can `gl_FragDepth` it and depth-test
+    the sprite per-pixel against the players / mesh-layers (so a spear/bucket in front occludes -- and
     Also writes a per-sprite DEPTH map `<name>_depth.webp`: the group's camera depth normalized to the
     GLOBAL `[zmin, zmax]` (the SAME window scale as the mesh / positions.bin), re-encoded 8-bit over
     the sprite's OWN `[wmin, wmax]` for precision, so the browser can `gl_FragDepth` it and depth-test
@@ -3488,59 +3493,41 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
             meshes = g["meshes"]
             safe = g["name"]
             group_names = {m.name for m in meshes}
-            # isolate: this group visible, players + every other layer hidden. Opaque FOLIAGE/terrain
-            # in front is a holdout (it CUTS the sprite, so a spear sits behind a leaf); but a
-            # TRANSMISSIVE surface (water / glass -- by material, not name) is left to RENDER, so a
-            # half-submerged mob (axolotl / turtle / boat) shows it tinting the submerged part -- it
-            # sits IN the scene, not as a flat decal. The surrounding tint (where there is no mob) is
-            # masked back out with the mob's silhouette.
+            # isolate: THIS group visible, every OTHER entity (players + other layers) hidden, but ALL
+            # scenery kept VISIBLE and rendered NORMALLY. So `S` is EXACTLY what Blender renders for
+            # this mob in its environment -- the water/glass surface (with its real reflections) OVER
+            # its submerged part, opaque scenery occluding it. We then just CUT S to the mob's own
+            # silhouette. NO holdout: a holdout makes the water reflect emptiness and transmit the
+            # film instead of the terrain, which is exactly the "flat decal on top of the water" look.
             sess.restore_visibility()
             sess.mute_drivers(True)
             for o in s.objects:
                 if o.name in entity_names and o.name not in group_names:
                     o.hide_render = True
-            # Geometry-nodes scenery: is_holdout does NOT cut their generated geometry, so a holdout
-            # leaves them rendering opaque into the transparent film (the fixed dark 'dirt'). Hide
-            # them instead -- they only OCCLUDE the sprite (rarely, they are background terrain), and
-            # a missing occlusion is far less visible than the dirt they otherwise paint everywhere.
-            for o in s.objects:
-                if (o.name not in entity_names and o.name not in group_names
-                        and not o.hide_render and any(m.type == 'NODES' for m in o.modifiers)):
-                    o.hide_render = True
             scenery = [o for o in s.objects if o.type == 'MESH'
                        and o.name not in group_names and o.name not in entity_names]
-            trans_sc = [o for o in scenery if _obj_is_transmissive(o)]
-            sc_ho = {o: o.is_holdout for o in scenery}
-            for o in scenery:
-                o.is_holdout = o not in trans_sc  # opaque cuts; transmissive renders over the mob
             bpy.context.view_layer.update()
             try:
-                # C: the mob in its environment -- transmissive surfaces tint the submerged part, opaque cuts
-                comb, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
-                # D: the mob ALONE (transmissive hidden too) -> full silhouette + clean camera depth.
-                # The silhouette masks the surrounding tint out of C; the depth is the mob's own (C's
-                # depth over the submerged part would read the water/glass surface, not the mob).
-                trans_shown = [o for o in trans_sc if not o.hide_render]
-                for o in trans_shown:
+                # S: the mob in the FULL (opaque) scene -- the exact Blender look, water over submerged
+                comb, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT)
+                # D: the mob ALONE (all scenery hidden) -> tight silhouette (incl. the submerged part
+                # the water hides in S) + the mob's own clean camera depth (S's depth over the
+                # submerged part would read the water surface, not the mob).
+                sc_hr = {o: o.hide_render for o in scenery}
+                for o in scenery:
                     o.hide_render = True
                 bpy.context.view_layer.update()
                 sil, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
                 dep, _, _ = sess.render_pass('Depth', 'CYCLES', 1, ILLUM_RES_PCT)   # mob camera depth
-                for o in trans_shown:
-                    o.hide_render = False
+                for o in scenery:
+                    o.hide_render = sc_hr[o]
             finally:
-                for o, v in sc_ho.items():
-                    o.is_holdout = v
                 bpy.context.view_layer.update()
 
-            ca = np.clip(comb[:, 3], 0.0, 1.0)
-            mob_gate = np.clip(sil[:, 3], 0.0, 1.0) > 0.01     # where the mob is (incl. submerged)
-            alpha = ca * mob_gate                              # tight to the mob; surrounding tint gone
-            straight = np.where(ca[:, None] > 1e-4,
-                                comb[:, :3] / np.maximum(ca[:, None], 1e-4), 0.0)
-            vis = alpha > 1e-4
+            alpha = np.clip(sil[:, 3], 0.0, 1.0)               # the mob's own silhouette (soft AA edge)
+            vis = alpha > 1e-3
             spr = np.zeros((comb.shape[0], 4), 'float32')
-            spr[vis, :3] = _to_display(straight[vis])
+            spr[vis, :3] = _to_display(comb[vis, :3])          # S is opaque -> rgb is the straight color
             spr[:, :3] = _anim_dilate_light(spr[:, :3], vis, rW, rH)
             spr[:, 3] = alpha
             _save_image(spr.reshape(-1), rW, rH, os.path.join(out_dir, safe + ".webp"),

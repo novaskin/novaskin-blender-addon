@@ -71,19 +71,18 @@ The panel (3D Viewport sidebar → "NovaSkin" tab) has Export / Layers / Animati
   never remove it). Scenery stays visible.
 - **One sample count for the whole export** — the background, per-entity shadow, and sprite
   renders all use the panel "Samples"; differing counts cause a composite quality seam.
-- **Sprites = tight silhouette + separate shadow**, NOT a LOOSE beauty-overlay of the full scene.
-  Folding the whole scene-with-mob in with a loose alpha double-images the water against the
-  background. The sprite is the mob masked to its OWN silhouette: opaque foliage/terrain is a
-  holdout (it cuts the sprite so it sits behind a leaf), but a TRANSMISSIVE surface (water/glass) is
-  left to RENDER over a submerged part — a half-submerged axolotl/turtle shows it tinting them, not a
-  flat decal. The surrounding tint (no mob) is masked back out with the mob's silhouette
-  (`_static_render_layers` takes a second transmissive-hidden render for the mask + the mob's clean
-  depth), so it stays tight and does NOT double-image. Transmissive vs opaque is decided by
-  `_obj_is_transmissive` — it scans the MATERIAL for glass/transparency/transmission (NOT by name, so
-  it generalizes to any scene; a LINKED Alpha is treated as a cutout = opaque; a per-object
-  `nsk_transmissive` bool overrides). Its cast shadow / water darkening is a SEPARATE multiply ratio
-  composited before the players. Sprites order by `camera_depth` (painter order) + a per-sprite depth
-  map for the players/mesh-layers.
+- **Sprites = the exact full-scene render, CUT to the silhouette + separate shadow.** A sprite must
+  look EXACTLY as Blender renders that mob in place — including the real water surface (with its real
+  reflections) OVER its submerged part — so `_static_render_layers` renders the mob with ALL scenery
+  visible and normal (only the OTHER entities hidden) into `S`, takes a second all-scenery-hidden
+  render for the mob's tight silhouette `D`, and writes `sprite = S masked to D`. Do NOT use a holdout
+  for the scenery: a holdout makes the water reflect emptiness and transmit the transparent film
+  instead of the terrain, which is exactly the "flat decal sitting ON the water" bug. (Folding the
+  whole scene with a LOOSE alpha instead of the tight silhouette would double-image the water against
+  the background — the silhouette cut is what keeps it tight.) Its cast shadow / water darkening is a
+  SEPARATE multiply ratio composited before the players. Sprites order by `camera_depth` (painter
+  order) + a per-sprite depth map for the players/mesh-layers. (`_obj_is_transmissive` — material-based
+  water/glass detection — is still used for the PLAYER water tint, not for sprites.)
 - **Overlay parts** (hat / jacket / sleeves / pants 2nd layer) must ALWAYS export, even if the
   rig's "Second layer" toggle is OFF. `_static_export_steps` forces it ON via
   `_force_selection_props_on` (restored at the end), like the legacy/animated renders. The browser
