@@ -187,18 +187,30 @@ needs a mesh, add an in-Blender check.
   by visibility (robust to Blender's non-uniform `.NNN` dup suffixes).
 - `discover_layers()` / `_static_split_layers()` — optional scenery layers; mesh-type vs sprite-type.
 - `_static_export_steps()` — the static-v2 generator (atlas bakes → geometry → images → sprites →
-  manifest). `_static_export()` drains it synchronously.
+  masks → water → manifest). `_static_export()` drains it synchronously. The modal operator runs ONE
+  `next()` per timer tick, so every `yield prog(...)` is a UI step; prog is yielded BEFORE each step
+  so the blocking render carries its OWN label (an after-yield labelled the slow image pass with the
+  previous step's name). `total` must equal the actual number of yields or the bar won't hit 100%.
 - `_static_collect()` / `_static_write_geometry()` — weld geometry, capture per-part positions,
   both arm variants (`_set_arm_style`), `parts` meta (label / tri_range / overlay / variant).
-- `_static_render_images()` — background, foreground, screen light, per-entity shadow ratios.
-- `_static_render_layers()` — tight sprite beauty per sprite-type layer.
+- `_static_render_images()` — background, foreground, screen light, per-entity shadow ratios. A
+  GENERATOR: `yield`s one progress tuple per beauty render (bg / 2 foreground / optional screen
+  light / each entity shadow) so the modal bar advances DURING the long pass instead of freezing on
+  one label; drained via `yield from`, RETURNS the dict. Renders still block the UI individually
+  (true F12-style live progress needs a non-blocking render job + event-driven export). If you
+  add/remove a render here, update `n_image_renders` in `_static_export_steps` to match.
+- `_static_render_layers()` — tight sprite beauty per sprite-type layer. Streaming generator like
+  `_static_render_images` (yields one step per sprite group; counted as `n_sprite_renders`).
+- `_static_render_masks()` — per-entity Object-Index occlusion mask. Streaming generator (one step
+  per player x arm-variant, then per mesh-layer; `n_mask_renders`).
 - `_static_render_water_tint()` — per-player screen-space WATER TINT (a colored multiply over the
   submerged part). Two-background matting (player as white/black emission behind the lit water) gives
   the pure transmission `T = white - black` (the reflection cancels); blurred + clamped to `[lo,1]`.
   The browser does `skin * atlas * 2 * T`, so a submerged player stays re-skinnable but tinted (NOT
   the reflection, which would hide the skin). Note: the atlas already bakes most of the underwater
   DIMMING (it's a multiply too), so the tint's visible job is mainly the COLOR; subtle in a scene
-  whose water is reflective (the clamp shows where T-only can't see through a glint).
+  whose water is reflective (the clamp shows where T-only can't see through a glint). Streaming
+  generator (one step per player; `n_water_renders`, gated on transmissive scenery existing).
 - `_obj_is_transmissive()` — water/glass vs opaque, by material transmission (general, not by name).
 - `_bake_player_light_atlas()` / `_hide_others_for_bake()` / `_force_bake_visible()` — atlas baking.
 - `_expand_pixel_uvs()` / `_mesh_uv_handedness()` — pixel-UV cell expansion + degenerate-face fix.

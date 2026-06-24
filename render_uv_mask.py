@@ -3134,7 +3134,7 @@ def _static_write_geometry(players, out_dir=None, mesh_layers=None):
         bpy.context.view_layer.update()
 
 
-def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None):
+def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None, prog=None):
     """Render the static scenery images for the CURRENT frame, matching the DENSE mesh (AntiLag
     off, no simplify), plus a TOGGLEABLE per-entity shadow.
       * `background.<ext>` = the CLEAN scene -- every player AND optional layer hidden (no baked
@@ -3149,8 +3149,10 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None):
         before drawing the meshes, so a toggle removes the entity and its shadow together. Captures
         cast shadows AND reflections darker than the water (brighter reflections clamp to 1 -- a
         future additive pass). Optional layers (`groups`) are kept out of bg/fg (their own sprites).
-    Returns {'background', 'foreground', 'light', 'shadows', 'resolution'}. Self-contained: restores
-    AntiLag/simplify, the full session, and visibility."""
+    GENERATOR: `yield`s a per-render progress tuple before each beauty render (bg / each foreground /
+    light / each entity shadow) so the modal panel bar advances during the long pass, and RETURNS
+    {'background', 'foreground', 'light', 'shadows', 'resolution'} (capture it via `yield from`).
+    Self-contained: restores AntiLag/simplify, the full session, and visibility."""
     s = bpy.context.scene
     W = s.render.resolution_x * MASK_RES_PCT // 100
     H = s.render.resolution_y * MASK_RES_PCT // 100
@@ -3158,6 +3160,10 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None):
     os.makedirs(out_dir, exist_ok=True)
     groups = groups or []
     mesh_layers = mesh_layers or []
+    def _y(msg):
+        # progress tuple for the modal bar (prog is supplied by _static_export_steps). Called
+        # standalone (prog=None) it returns a harmless no-op fraction so the generator still drains.
+        return prog(msg) if prog else (0.0, msg)
     layer_mesh_names = {m.name for g in groups for m in g["meshes"]}      # all layers (mesh+sprite)
     mesh_layer_names = {m.name for ml in mesh_layers for m in ml["meshes"]}   # retexturable -> drawn
     sprite_layer_names = layer_mesh_names - mesh_layer_names              # own beauty, own fg/shadow
@@ -3191,6 +3197,7 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None):
         #    at the panel "Samples" -- the SAME quality as the per-entity shadow / sprite renders, so
         #    the shadow ratio and the sprite |S - clean| stay consistent and the composite has no
         #    quality seam. Raise "Samples" for a cleaner backdrop.
+        yield _y("rendering background")
         sess.mute_drivers(True)
         clean_hr = {o: o.hide_render for o in s.objects if o.name in entity_names}
         for o in clean_hr:
@@ -3213,6 +3220,7 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None):
         mesh_entity_set = {o.name for o in mesh_entity_objs}
 
         # 2) FOREGROUND: scenery-with-entities-holdout INTERSECT the entity silhouette, WebP+alpha
+        yield _y("rendering foreground (scenery)")
         hold = {o: o.is_holdout for o in mesh_entity_objs}
         for o in mesh_entity_objs:
             o.is_holdout = True
@@ -3221,6 +3229,7 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None):
         for o, v in hold.items():
             o.is_holdout = v
         # entity silhouette: render only the mesh entities (players + mesh layers)
+        yield _y("rendering foreground (silhouette)")
         camsnap = {}
         for o in s.objects:
             if o.type == 'MESH' and o.name not in mesh_entity_set:
@@ -3252,6 +3261,7 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None):
         # lattice. The renderer samples it by screen position and relights as skin*light*2.
         light_rel = None
         if STATIC_LIGHT_SPACE == "screen":
+            yield _y("rendering light (screen-space)")
             scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in player_set]
             gray = _gray_diffuse_material()
             sv = _swap_materials(player_objs, gray)
@@ -3281,7 +3291,8 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None):
         shadows = {}        # players + sprite layers: each gets its own multiply ratio
         entities = ([("player", p["label"], list(p["char_all"])) for p in players]
                     + [("layer", g["name"], list(g["meshes"])) for g in shadow_groups])
-        for kind, name, objs in entities:
+        for _si, (kind, name, objs) in enumerate(entities):
+            yield _y(f"rendering shadow {_si + 1}/{len(entities)}: {name}")
             obj_names = {o.name for o in objs}
             sess.restore_visibility()                       # active entity keeps its real visibility
             muted = []
@@ -3462,7 +3473,8 @@ def _obj_is_transmissive(o):
     return any(_material_is_transmissive(sl.material) for sl in o.material_slots if sl.material)
 
 
-def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zmax, out_dir=None):
+def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zmax, out_dir=None,
+                          prog=None):
     """Render each SPRITE-type layer EXACTLY as the full Blender scene shows it, then CUT it to the
     group's own silhouette: render the mob with ALL scenery visible and normal (every OTHER entity
     hidden) -> `S` has the real water/glass surface, with its real reflections, OVER the mob's
@@ -3475,12 +3487,9 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
     GLOBAL `[zmin, zmax]` (the SAME window scale as the mesh / positions.bin), re-encoded 8-bit over
     the sprite's OWN `[wmin, wmax]` for precision, so the browser can `gl_FragDepth` it and depth-test
     the sprite per-pixel against the players / mesh-layers (so a spear/bucket in front occludes -- and
-    Also writes a per-sprite DEPTH map `<name>_depth.webp`: the group's camera depth normalized to the
-    GLOBAL `[zmin, zmax]` (the SAME window scale as the mesh / positions.bin), re-encoded 8-bit over
-    the sprite's OWN `[wmin, wmax]` for precision, so the browser can `gl_FragDepth` it and depth-test
-    the sprite per-pixel against the players / mesh-layers (so a spear/bucket in front occludes -- and
-    is occluded by -- the arms correctly). Returns
-    [{name, object, kind, image, depth, depth_range, camera_depth}], back -> front. Self-contained."""
+    is occluded by -- the arms correctly). GENERATOR: `yield`s a progress tuple per sprite group and
+    RETURNS [{name, object, kind, image, depth, depth_range, camera_depth}], back -> front (capture via
+    `yield from`). Self-contained."""
     if not sprite_groups:
         return []
     s = bpy.context.scene
@@ -3491,9 +3500,12 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
     zspan = max(zmax - zmin, 1e-6)
     sess = _Session()
     infos = []
+    def _y(msg):
+        return prog(msg) if prog else (0.0, msg)
     try:
         sess.vl.use_pass_z = True                  # for the per-sprite depth map
-        for g in sprite_groups:
+        for _si, g in enumerate(sprite_groups):
+            yield _y(f"rendering sprite {_si + 1}/{len(sprite_groups)}: {g['name']}")
             meshes = g["meshes"]
             safe = g["name"]
             group_names = {m.name for m in meshes}
@@ -3605,7 +3617,7 @@ def _box_blur_rgb(rgb2d, iterations=2):
     return out
 
 
-def _static_render_water_tint(players, all_layer_mesh_names=None, out_dir=None):
+def _static_render_water_tint(players, all_layer_mesh_names=None, out_dir=None, prog=None):
     """Per player, a screen-space WATER-TINT map so a SUBMERGED player stays re-skinnable but is
     tinted by the transmissive surface in front of it (water/glass), instead of looking like a flat
     decal on top of it. The PURE transmission is extracted by two-background matting -- the player as
@@ -3615,8 +3627,9 @@ def _static_render_water_tint(players, all_layer_mesh_names=None, out_dir=None):
     so only the SOLID submerged interior is tinted, not the anti-aliased rim; the result is box-blurred
     (the glass render is noisy / refraction-patterned) and clamped to `[lo, 1]` (the deepest / most
     reflective water never goes to black). 1 = no change (dry / above the waterline); the browser
-    multiplies the relit skin by it, and it is skin-independent. Returns {label: file}; a dry player
-    is skipped, and if the scene has no transmissive scenery nothing is written. Self-contained."""
+    multiplies the relit skin by it, and it is skin-independent. GENERATOR: `yield`s a progress tuple
+    per player and RETURNS {label: file} (capture via `yield from`); a dry player is skipped, and if
+    the scene has no transmissive scenery nothing is written. Self-contained."""
     s = bpy.context.scene
     out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
     os.makedirs(out_dir, exist_ok=True)
@@ -3645,8 +3658,11 @@ def _static_render_water_tint(players, all_layer_mesh_names=None, out_dir=None):
     black = _emit("NSK_wt_black", 0.0)
     sess = _Session()
     out = {}
+    def _y(msg):
+        return prog(msg) if prog else (0.0, msg)
     try:
-        for p in players:
+        for _wi, p in enumerate(players):
+            yield _y(f"rendering water tint {_wi + 1}/{len(players)}: {p['label']}")
             meshes = [o for o in p["char_all"] if o.type == 'MESH']
             own = {m.name for m in p["char_all"]}
             saved = {o: [sl.material for sl in o.material_slots] for o in meshes}
@@ -3711,7 +3727,7 @@ def _static_render_water_tint(players, all_layer_mesh_names=None, out_dir=None):
     return out
 
 
-def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=None):
+def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=None, prog=None):
     """Per-entity SCENERY-occlusion mask via the Object Index pass: the entity's meshes get
     pass_index=1, every OTHER entity (the optional players/layers) is hidden, the real scenery stays.
     `mask = (front-most object index == 1)`: 1 where the entity is visible, 0 where the FIXED scenery
@@ -3720,7 +3736,8 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
     The browser clips each drawn entity to its mask, so the scenery occludes it WITHOUT a foreground
     painting over the (toggleable) optional layers. Because the clean background already contains that
     front scenery, revealing it through the clip is identical to a foreground for opaque scenery.
-    Returns {player_label: {variant: file}, layer_name: file}. Self-contained."""
+    GENERATOR: `yield`s a progress tuple per mask (player x arm-variant, then mesh-layer) and RETURNS
+    {player_label: {variant: file}, layer_name: file} (capture via `yield from`). Self-contained."""
     s = bpy.context.scene
     out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
     os.makedirs(out_dir, exist_ok=True)
@@ -3746,6 +3763,8 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
     sess = _Session()
     masks = {}
     saved_idx = {o.name: o.pass_index for o in s.objects}
+    def _y(msg):
+        return prog(msg) if prog else (0.0, msg)
     try:
         sess.vl.use_pass_object_index = True
 
@@ -3784,6 +3803,7 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
             active = {o.name for o in p["char_all"]}
             variants = {}
             for vname, vval in MASK_ARM_VARIANTS:
+                yield _y(f"rendering mask: {p['label']} / {vname}")
                 sess.restore_visibility()
                 arm, saved = _set_arm_style(p, vval)
                 muted = _hide_others_for_bake(s, active, entity_names)
@@ -3799,6 +3819,7 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
             masks[p["label"]] = variants
 
         for ml in mesh_layers:
+            yield _y(f"rendering mask layer: {ml['name']}")
             active = {m.name for m in ml["meshes"]}
             sess.restore_visibility()
             muted = _hide_others_for_bake(s, active, entity_names)
@@ -3948,13 +3969,31 @@ def _static_export_steps(players, op=None, out_dir=None):
     groups = [g for g in all_groups if _layer_mode(g) != "OVERLAY"]
     mesh_layers, sprite_groups = _static_split_layers(groups)   # retexturable meshes vs flat sprites
     n_atlas = (len(players) if uv_light else 0) + len(mesh_layers)
-    # atlases/textures + geometry + images + (sprites) + masks + water tint + (overlay) + manifest
-    total = n_atlas + 2 + (1 if sprite_groups else 0) + 1 + 1 + (1 if overlay_groups else 0) + 1
+    # EVERY render step now streams ONE yield per render so the modal bar advances during each long
+    # pass. Keep these counts in sync with the yields in the matching functions (prog() clamps the
+    # fraction so a mismatch only shifts where the bar lands, never overshoots):
+    #   images : bg + 2 foreground + optional screen light + one per entity shadow (players + sprites)
+    #   sprites: one beauty-cut per sprite group
+    #   masks  : one Object-Index per player x arm-variant + one per mesh-layer
+    #   water  : one two-background matte per player, but only if the scene has transmissive scenery
+    #            (else _static_render_water_tint early-returns with no renders)
+    n_image_renders = (3 + (1 if STATIC_LIGHT_SPACE == "screen" else 0)
+                       + len(players) + len(sprite_groups))
+    _entity_nm = ({o.name for p in players for o in p["char_all"]}
+                  | {m.name for g in groups for m in g["meshes"]})
+    has_transmissive = any(_obj_is_transmissive(o) for o in bpy.context.scene.objects
+                           if o.type == 'MESH' and o.name not in _entity_nm)
+    n_sprite_renders = len(sprite_groups)
+    n_mask_renders = len(players) * len(MASK_ARM_VARIANTS) + len(mesh_layers)
+    n_water_renders = len(players) if has_transmissive else 0
+    # atlases/textures + geometry + images + sprites + masks + water + (overlay) + manifest
+    total = (n_atlas + 1 + n_image_renders + n_sprite_renders + n_mask_renders
+             + n_water_renders + (1 if overlay_groups else 0) + 1)
     state = {"done": 0}
     def prog(msg):
         state["done"] += 1
         print(f"[STATIC {state['done']}/{total}] {msg}")
-        return (state["done"] / total, msg)
+        return (min(state["done"] / total, 1.0), msg)   # clamp: a miscount never overshoots the bar
     # Expand the rig's inset per-pixel UVs to fill their skin-pixel cells (no gap-grid in the atlas,
     # high-res atlas usable again, HD skins work). Modifies the base mesh UVs so the atlas bake AND
     # the collected mesh.bin UVs both use them; restored in the finally.
@@ -3992,6 +4031,10 @@ def _static_export_steps(players, op=None, out_dir=None):
             try:
                 if uv_light:
                     for p in players:
+                        # prog BEFORE each step so the panel shows the step that is RUNNING, not the one
+                        # that just finished (the renders below block, so an after-yield would label the
+                        # render with the previous step's name -- e.g. "mesh.bin" during the image pass).
+                        yield prog(f"baking light atlas: {p['label']}")
                         sess.restore_visibility()
                         muted = _hide_others_for_bake(s, {o.name for o in p["char_all"]},
                                                       entity_names)
@@ -4002,8 +4045,8 @@ def _static_export_steps(players, op=None, out_dir=None):
                             d.mute = False
                         if rel:
                             atlas_by_label[p["label"]] = os.path.basename(rel)
-                        yield prog(f"atlas {p['label']}")
                 for ml in mesh_layers:       # retexturable layer: own UV light atlas + base texture
+                    yield prog(f"baking atlas+tex: {ml['name']}")
                     sess.restore_visibility()
                     muted = _hide_others_for_bake(s, {m.name for m in ml["meshes"]}, entity_names)
                     bpy.context.view_layer.update()
@@ -4015,42 +4058,44 @@ def _static_export_steps(players, op=None, out_dir=None):
                     tex = _static_export_layer_texture(ml["image"], out_dir, ml["name"])
                     mesh_layer_assets[ml["name"]] = {
                         "atlas": os.path.basename(rel) if rel else None, "tex": tex}
-                    yield prog(f"atlas+tex {ml['name']}")
             finally:
                 sess.restore()
                 bpy.context.view_layer.update()
+        all_layer_mesh_names = {m.name for g in groups for m in g["meshes"]}
+        # Each step below yields its label BEFORE running (see the atlas loop note): the blocking
+        # render then carries its OWN name in the panel, not the previous step's (the geometry is <1s,
+        # so an after-yield made the slow image pass show up labelled "mesh.bin / positions.bin").
         # 2) DENSE mesh.bin + positions.bin (K=1), players + mesh-type layers
+        yield prog("mesh.bin / positions.bin")
         geo = _static_write_geometry(players, out_dir=out_dir, mesh_layers=mesh_layers)
-        yield prog(f"mesh.bin / positions.bin ({geo['tris']} tris)")
         # 3) clean background + foreground (+ screen-space light when light_space="screen") +
         #    per-entity toggleable shadow ratios. Layers are excluded from bg/fg (own sprites).
-        imgs = _static_render_images(players, out_dir=out_dir, groups=groups,
-                                     mesh_layers=mesh_layers)
-        yield prog("background / foreground / shadows"
-                   + ("" if uv_light else " / light"))
+        # _static_render_images streams one yield PER beauty render (bg / each foreground / light /
+        # each entity shadow), so the panel bar advances during the long pass instead of freezing on
+        # one label. `yield from` forwards those to the modal and captures the returned dict.
+        imgs = yield from _static_render_images(players, out_dir=out_dir, groups=groups,
+                                                mesh_layers=mesh_layers, prog=prog)
         # 4) sprite-type layers: tight silhouette beauty each (shadow is a separate ratio, step 3)
         sprite_infos = []
         if sprite_groups:
-            all_layer_mesh_names = {m.name for g in groups for m in g["meshes"]}
-            sprite_infos = _static_render_layers(players, sprite_groups, all_layer_mesh_names,
-                                                 geo["zmin"], geo["zmax"], out_dir=out_dir)
-            yield prog(f"sprites ({len(sprite_infos)})")
+            sprite_infos = yield from _static_render_layers(
+                players, sprite_groups, all_layer_mesh_names,
+                geo["zmin"], geo["zmax"], out_dir=out_dir, prog=prog)
         # 4b) per-entity scenery-occlusion masks (players per variant + mesh-layers) -- the static
         #     replacement for the foreground (occludes by the fixed scenery, leaves layers alone)
-        all_layer_mesh_names = {m.name for g in groups for m in g["meshes"]}
-        masks = _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=out_dir)
-        yield prog(f"masks ({len(masks)})")
-        # 4b) per-player WATER TINT: a submerged player stays re-skinnable but is tinted by the water
+        masks = yield from _static_render_masks(players, mesh_layers, all_layer_mesh_names,
+                                                out_dir=out_dir, prog=prog)
+        # 4d) per-player WATER TINT: a submerged player stays re-skinnable but is tinted by the water
         #     in front of it (a colored multiply over the relit skin), instead of a flat decal on top.
-        water_tints = _static_render_water_tint(players, all_layer_mesh_names, out_dir=out_dir)
-        yield prog(f"water tint ({len(water_tints)})")
+        water_tints = yield from _static_render_water_tint(players, all_layer_mesh_names,
+                                                           out_dir=out_dir, prog=prog)
         # 4c) OVERLAY layers (rain / glare): rendered alone -> foreground.webp, composited on top
         if overlay_groups:
+            yield prog(f"rendering overlay ({len(overlay_groups)})")
             ov_fg = _static_render_overlay(overlay_names, out_dir=out_dir)
             if ov_fg:
                 imgs["foreground"] = STATIC_OUT_SUBDIR + "/" + ov_fg
                 imgs["foreground_overlay"] = True
-            yield prog(f"overlay ({len(overlay_groups)})")
         # unify layer manifest entries: mesh-type (geometry range + atlas + tex) + sprite-type
         layer_entries = []
         for lr in geo.get("layers", []):
@@ -4061,9 +4106,9 @@ def _static_export_steps(players, op=None, out_dir=None):
         layer_entries.sort(key=lambda e: (e.get("camera_depth") is None,
                                           -(e.get("camera_depth") or 0.0)))   # back -> front
         # 5) manifest
+        yield prog("manifest.json")
         manifest = _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=layer_entries,
                                           masks=masks, water_tints=water_tints)
-        yield prog("manifest.json")
         print(f"[STATIC] export complete -> {out_dir} ({geo['tris']} tris, "
               f"light={STATIC_LIGHT_SPACE})")
         return manifest
