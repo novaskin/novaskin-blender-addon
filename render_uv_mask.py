@@ -3727,6 +3727,17 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
     # glass water is the front-most index and the submerged part falls out of the mask (vanishes).
     transmissive_scenery = [o for o in s.objects if o.type == 'MESH'
                             and o.name not in entity_names and _obj_is_transmissive(o)]
+    # Render the entity OPAQUE for the Object-Index: the 2nd-layer (jacket / sleeves / pants) material
+    # is a CUTOUT -- transparent wherever the CURRENT skin has no overlay there -- so the textured
+    # Object-Index sees straight through it and the overlay falls OUT of the mask (a default skin with
+    # no jacket -> the mask is base-only). But the mask must clip ANY skin (another skin MAY have a
+    # jacket there), so it has to follow the full GEOMETRY, not the loaded skin's texture.
+    mask_opaque = bpy.data.materials.new("NSK_mask_opaque")
+    mask_opaque.use_nodes = True
+    _nt = mask_opaque.node_tree
+    _nt.nodes.clear()
+    _nt.links.new(_nt.nodes.new("ShaderNodeBsdfDiffuse").outputs[0],
+                  _nt.nodes.new("ShaderNodeOutputMaterial").inputs[0])
     sess = _Session()
     masks = {}
     saved_idx = {o.name: o.pass_index for o in s.objects}
@@ -3741,8 +3752,16 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
             tr_hidden = [o for o in transmissive_scenery if not o.hide_render]
             for o in tr_hidden:
                 o.hide_render = True                  # water does not occlude the submerged entity
+            mesh_objs = [o for o in active_objs if o.type == 'MESH']
+            saved_mats = {o: [sl.material for sl in o.material_slots] for o in mesh_objs}
+            for o in mesh_objs:
+                for sl in o.material_slots:
+                    sl.material = mask_opaque          # full geometry silhouette, skin-independent
             bpy.context.view_layer.update()
             oid, W, H = sess.render_pass('Object Index', 'CYCLES', STATIC_MASK_SAMPLES, MASK_RES_PCT)
+            for o, mats in saved_mats.items():
+                for i, sl in enumerate(o.material_slots):
+                    sl.material = mats[i]
             for o in tr_hidden:
                 o.hide_render = False
             if oid is None:
@@ -3791,6 +3810,7 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
         for o in s.objects:
             o.pass_index = saved_idx.get(o.name, 0)
         sess.restore()
+        bpy.data.materials.remove(mask_opaque)
         bpy.context.view_layer.update()
 
 
