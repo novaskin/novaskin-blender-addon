@@ -175,10 +175,14 @@ function tex(nearest) {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   return t;
 }
-function upload(t, srcEl) {
+function upload(t, srcEl, premult) {
   gl.bindTexture(gl.TEXTURE_2D, t);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);   // keep straight alpha
+  // Sprites are PREMULTIPLIED on upload: their lossless WebP keeps a transparent margin whose RGB is
+  // black, so a LINEAR-filtered straight-alpha edge bleeds that black in -> a dark fringe. Premultiply
+  // (rgb*=a) + an ONE/ONE_MINUS_SRC_ALPHA blend: the black margin contributes 0, no fringe. Everything
+  // else stays straight alpha.
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !!premult);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcEl);
 }
 const tBg = tex(), tFg = tex(), tLight = tex(false);   // tLight: LINEAR screen-space light
@@ -187,7 +191,8 @@ const tSkins = skins.map(img => { const t = tex(true); upload(t, img); return t;
 const mkTex = (nearest) => (img) => { if (!img) return null; const t = tex(nearest); upload(t, img); return t; };
 const tLayerTex = layerTexImgs.map(mkTex(true));        // NEAREST swappable base texture
 const tLayerAtlas = layerAtlasImgs.map(mkTex(false));   // LINEAR UV light atlas
-const tLayerSprite = layerSpriteImgs.map(mkTex(false)); // LINEAR flat sprite
+const tLayerSprite = layerSpriteImgs.map(img => {        // LINEAR flat sprite, PREMULTIPLIED (no edge fringe)
+  if (!img) return null; const t = tex(false); upload(t, img, true); return t; });
 const tLayerDepth = layerDepthImgs.map(mkTex(true));    // NEAREST per-sprite depth map
 const mkShadow = (img) => { if (!img) return null; const t = tex(false); upload(t, img); return t; };
 const tPlayerShadow = playerShadowImgs.map(mkShadow);   // multiply ratio, LINEAR
@@ -228,8 +233,8 @@ function blitQuad(t) {
   gl.uniform1i(gl.getUniformLocation(quadP, 'uTex'), 0);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
-function blitQuadBlend(t) {     // straight-alpha sprite over what's behind: out = rgb*a + behind*(1-a)
-  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+function blitQuadBlend(t, premult) {     // over what's behind: out = rgb*[a|1] + behind*(1-a)
+  gl.enable(gl.BLEND); gl.blendFunc(premult ? gl.ONE : gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   blitQuad(t);
   gl.disable(gl.BLEND);
 }
@@ -305,7 +310,7 @@ function drawDepthSprite(i) {                         // straight-alpha quad, pe
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLayerDepth[i]);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tLayerSprite[i]);
   gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);   // per-pixel occlusion vs players / mesh-layers
-  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);   // sprite tex is premultiplied
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST);
 }
@@ -313,7 +318,7 @@ function drawLayer(i) {                               // mesh -> geometry; sprit
   const L = layers[i];
   if (L.type === 'mesh') { if (tLayerTex[i] && tLayerAtlas[i]) drawMesh([L.tri_range], tLayerTex[i], tLayerAtlas[i], false, tLayerMask[i]); }
   else if (tLayerDepth[i]) drawDepthSprite(i);       // per-pixel depth-tested against the meshes
-  else if (tLayerSprite[i]) blitQuadBlend(tLayerSprite[i]);   // fallback: whole-object painter order
+  else if (tLayerSprite[i]) blitQuadBlend(tLayerSprite[i], true);   // fallback: whole-object painter order
 }
 
 function draw() {
