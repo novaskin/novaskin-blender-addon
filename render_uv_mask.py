@@ -3692,7 +3692,12 @@ def _static_render_water_tint(players, all_layer_mesh_names=None, out_dir=None):
             if int(tinted.sum()) < 16:
                 continue                                                # essentially dry -> no map
             tint = np.ones((T.shape[0], 4), 'float32')
-            tint[tinted, :3] = np.clip(T[tinted], TINT_LO, 1.0)
+            # ONE representative water colour over the whole submerged region, NOT the per-pixel
+            # transmission. The per-pixel T collapses to the TINT_LO clamp where the water is deep or
+            # reflective (T -> 0, T-only cannot see through there), painting a dark "bar" that reads as
+            # a shadow instead of the water. The median is robust to those dark outliers, so it is the
+            # actual water tint -- a clean, uniform overlay.
+            tint[tinted, :3] = np.clip(np.median(T[tinted], axis=0), TINT_LO, 1.0)
             fn = f"{p['label']}_watertint.webp"
             _save_image(tint.reshape(-1), W, H, os.path.join(out_dir, fn),
                         file_format='WEBP', lossless=True)
