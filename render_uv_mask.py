@@ -2173,20 +2173,11 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
             for vname, vval in MASK_ARM_VARIANTS:
                 sess.restore_visibility()
                 arm, saved_arm = _set_arm_style(p, vval)
-                others = set(o.name for op in players if op is not p for o in op["char_all"])
-                muted = []
-                for o in s.objects:
-                    if o.name in others:
-                        if o.animation_data:
-                            for d in o.animation_data.drivers:
-                                if d.data_path == "hide_render" and not d.mute:
-                                    d.mute = True
-                                    muted.append(d)
-                        o.hide_render = True
+                active_names = set(o.name for o in p["char_all"])
+                muted = _hide_others_for_bake(s, active_names, char_names)   # hide the OTHER players
                 if ILLUM_PURE_SHADOW:
                     for o in p["char_all"]:
                         o.visible_diffuse = False   # pure shadow, but loses self-bounce
-                active_names = set(o.name for o in p["char_all"])
                 scenery = ([o for o in s.objects
                             if o.type == 'MESH' and o.name not in active_names]
                            if ILLUM_HIDE_SCENERY_FROM_CAMERA else [])
@@ -2367,7 +2358,7 @@ def _bbox_dict(bbox, size):
     return out
 
 
-def _write_manifest(players, out_path, layer_infos=None):
+def _write_manifest(players, out_path, layer_infos=None, overlay=None):
     s = bpy.context.scene
     ordered = sorted((p for p in players if p.get("camera_depth") is not None),
                      key=lambda p: p["camera_depth"], reverse=True)  # back -> front
@@ -2427,6 +2418,7 @@ def _write_manifest(players, out_path, layer_infos=None):
             "illum_backgrounds": ([f"illum_{v}{LIGHTSHADOW_EXT}" for v, _ in MASK_ARM_VARIANTS]
                                   if EXPORT_ILLUM_BACKGROUND else None),
             "background": ("background.png" if EXPORT_BACKGROUND else None),
+            "overlay": overlay,   # OVERLAY layers (rain/glare) on top of everything (straight alpha); None if none
             "player_illum_shadow": ({
                 "illum": ([f"illum_{v}{LIGHTSHADOW_EXT}" for v, _ in MASK_ARM_VARIANTS]
                           if EXPORT_ILLUM else None),
@@ -2517,8 +2509,11 @@ def _render_steps(players, op=None):
     # background (their cast shadow/look is exported independently in step 6). force_hidden
     # makes every restore_visibility() keep them hidden; the final sess.restore() puts them
     # back. A group can be many meshes (a marked armature/collection) -> all hidden together.
-    layer_groups = discover_layers()
-    layer_meshes = [m for g in layer_groups for m in g["meshes"]]
+    all_groups = discover_layers()
+    overlay_groups = [g for g in all_groups if _layer_mode(g) == "OVERLAY"]   # rain/glare -> composited on top
+    overlay_names = {m.name for g in overlay_groups for m in g["meshes"]}
+    layer_groups = [g for g in all_groups if _layer_mode(g) != "OVERLAY"]     # the rest -> per-group steps
+    layer_meshes = [m for g in all_groups for m in g["meshes"]]               # hide ALL (incl. overlay) below
     sess.force_hidden = {m.name for m in layer_meshes}
     for m in layer_meshes:
         m.hide_render = True
@@ -2552,6 +2547,7 @@ def _render_steps(players, op=None):
                        + (1 if (EXPORT_LAYER_UV and len(g["meshes"]) == 1) else 0)  # UV
                        for g in layer_groups))
                 if layer_groups else 0)                            # optional layers
+             + (1 if overlay_groups else 0)                        # overlay (rain/glare)
              + 1)                                                  # manifest
     total = max(total, 1)
     state = {"done": 0}
@@ -2698,11 +2694,16 @@ def _render_steps(players, op=None):
         layer_infos = []
         if layer_groups:
             yield from _layer_steps(players, layer_groups, sess, prog, layer_infos)
+        # 6b) OVERLAY layers (rain / glare): rendered ALONE -> overlay.webp, composited on top of everything
+        overlay_file = None
+        if overlay_groups:
+            yield prog(f"Overlay ({len(overlay_groups)})")
+            overlay_file = _static_render_overlay(overlay_names, out_dir=_abs(OUT_DIR))
         # 7) manifest with export details + average depth to order the rigs
         for p in players:
             p["camera_depth"] = _player_camera_depth(p)
         _write_manifest(players, os.path.join(_abs(OUT_DIR), "manifest.json"),
-                        layer_infos)
+                        layer_infos, overlay=overlay_file)
         yield prog("Manifest")
     finally:
         sess.restore()
