@@ -16,11 +16,10 @@ a classic add-on. Current version: **1.2.2**.
 
 ## Repo layout
 
-The git repo is rooted at `thomas-legacy-rig/` (the parent `blender_novaskin/` is NOT a repo — it
-holds scratch `.blend` files, test renders, and the `wallpaper-1` / `wallpaper-2` scene folders).
+The git repo is rooted at `novaskin-blender-addon/`.
 
 ```
-thomas-legacy-rig/
+novaskin-blender-addon/
   render_uv_mask.py        THE deliverable — the whole add-on in one file
   blender_manifest.toml    extension manifest (version lives here too)
   build_addon.py           packages render_uv_mask.py -> dist/<id>-<version>.zip
