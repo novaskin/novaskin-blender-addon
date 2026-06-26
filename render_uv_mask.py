@@ -2143,7 +2143,7 @@ def _load_gray_channel(path, W, H):
     return a.reshape(-1, 4)[:, 0]
 
 
-def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
+def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None, do_shadow=True):
     """Generator form of export_player_illum_shadow: yields prog(msg) after the clean
     render and after each player/variant, so a modal operator can show progress."""
     s = sess.s
@@ -2153,7 +2153,7 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
     # CLEAN scene (all players hidden) -- the shadow ratio's baseline (SHADOW only)
     clean = None
     W = H = None
-    if EXPORT_SHADOW:
+    if EXPORT_SHADOW and do_shadow:
         sess.restore_visibility()
         sess.mute_drivers(True)
         for o in s.objects:
@@ -2228,7 +2228,7 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                             finally:
                                 for o, c in sc.items():
                                     o.visible_camera = c
-                        if EXPORT_SHADOW:
+                        if EXPORT_SHADOW and do_shadow:
                             # SHADOW: base INVISIBLE to the camera (still casting), scenery
                             # VISIBLE (the shadow falls on it).
                             sh_cam = {o: o.visible_camera for o in p["char_all"]}
@@ -2278,7 +2278,7 @@ def _illum_shadow_steps(players, sess, gray_mat, prog, light_maps=None):
                 # SHADOW output: ratio vs the clean scene (no body masking -- the body isn't
                 # in the render, so the contact shadow under/around it is kept). In DISPLAY
                 # space (view-transformed) so a multiply onto the display background matches.
-                if EXPORT_SHADOW:
+                if EXPORT_SHADOW and do_shadow:
                     if SHADOW_DISPLAY_RATIO:
                         sh_d, cl_d = _to_display(comb_sh), _to_display(clean)
                     else:
@@ -2359,7 +2359,7 @@ def _bbox_dict(bbox, size):
     return out
 
 
-def _write_manifest(players, out_path, layer_infos=None, overlay=None, foregrounds=None):
+def _write_manifest(players, out_path, layer_infos=None, overlay=None, foregrounds=None, background=None):
     s = bpy.context.scene
     ordered = sorted((p for p in players if p.get("camera_depth") is not None),
                      key=lambda p: p["camera_depth"], reverse=True)  # back -> front
@@ -2418,13 +2418,12 @@ def _write_manifest(players, out_path, layer_infos=None, overlay=None, foregroun
             "lightshadow_format": LIGHTSHADOW_FORMAT,
             "illum_backgrounds": ([f"illum_{v}{LIGHTSHADOW_EXT}" for v, _ in MASK_ARM_VARIANTS]
                                   if EXPORT_ILLUM_BACKGROUND else None),
-            "background": ("background.png" if EXPORT_BACKGROUND else None),
+            "background": background,   # clean scene, rendered by the shared _static_render_images
             "overlay": overlay,   # OVERLAY layers (rain/glare) on top of everything (straight alpha); None if none
             "player_illum_shadow": ({
                 "illum": ([f"illum_{v}{LIGHTSHADOW_EXT}" for v, _ in MASK_ARM_VARIANTS]
                           if EXPORT_ILLUM else None),
-                "shadow": ([f"shadow_{v}{LIGHTSHADOW_EXT}" for v, _ in MASK_ARM_VARIANTS]
-                           if EXPORT_SHADOW else None),
+                "shadow": None,   # player shadow moved to players[].shadow (shared per-entity ratio)
                 "note": ("per player (in the subfolder); shadow is a DISPLAY-space multiply "
                          "(1=no shadow) -- multiply it onto the display background."
                          if SHADOW_DISPLAY_RATIO else
@@ -2450,6 +2449,7 @@ def _write_manifest(players, out_path, layer_infos=None, overlay=None, foregroun
                                 for v, _ in MASK_ARM_VARIANTS] if COMPOSITE_BASE_LAYER else None),
                 "masks": [v for v, _ in MASK_ARM_VARIANTS],
                 "foreground": (foregrounds or {}).get(p["label"]),   # {variant: file}; viewer uses a<1 (tint)
+                "shadow": p.get("shadow"),   # shared per-entity multiply ratio (1=no shadow)
             }
             for p in players
         ],
@@ -2539,13 +2539,13 @@ def _render_steps(players, op=None):
     n_variants = len(MASK_ARM_VARIANTS)
     total = (len(players)                                          # depth ranges
              + len(players) * n_variants                           # masks
-             + (((1 if EXPORT_SHADOW else 0) + len(players) * n_variants)
+             + (len(players) * n_variants
                 if (EXPORT_ILLUM or EXPORT_SHADOW)
-                else (n_variants if EXPORT_ILLUM_BACKGROUND else 0))  # illum/shadow
+                else (n_variants if EXPORT_ILLUM_BACKGROUND else 0))  # illum light (shadow shared, below)
              + n_parts                                             # front UVs
              + (len(players) * n_variants if COMPOSITE_BASE_LAYER else 0)  # base composites
              + (n_parts if EXPORT_BACKFACE_UV else 0)              # back UVs
-             + (1 if EXPORT_BACKGROUND else 0)          # background
+             + (1 + (len(players) + len(sprite_groups) if EXPORT_SHADOW else 0))  # shared bg + entity shadows
              + (((1 if EXPORT_SHADOW else 0)                       # mesh-layers: clean baseline
                  + sum(1 + (1 if EXPORT_SHADOW else 0)             # beauty + shadow
                        + (1 if len(g["meshes"]) == 1 else 0)       # UV (single-mesh retexturable)
@@ -2561,7 +2561,7 @@ def _render_steps(players, op=None):
     def prog(msg):
         state["done"] += 1
         print(f"[{state['done']}/{total}] {msg}")
-        return (state["done"] / total, msg)
+        return (min(state["done"] / total, 1.0), msg)   # clamp: a miscount never overshoots
 
     # light_maps[(player_label, variant)] = sRGB RGB light (N,3), filled by the illum step
     # and embedded as a 'light' layer in EXR UVs. Empty if the illum step is disabled.
@@ -2601,7 +2601,7 @@ def _render_steps(players, op=None):
         # 2) ILLUM (light) + shadow FIRST, so the light can be packed into the UV alpha.
         if EXPORT_ILLUM or EXPORT_SHADOW:
             yield from _illum_shadow_steps(players, sess, _gray_diffuse_material(), prog,
-                                           light_maps)
+                                           light_maps, do_shadow=False)   # shadow is the shared ratio
         elif EXPORT_ILLUM_BACKGROUND:   # global illum (all together) -- legacy path
             gd = _gray_diffuse_material()
             saved_il = _swap_materials(all_char, gd)
@@ -2692,16 +2692,24 @@ def _render_steps(players, op=None):
                         yield prog(f"UV back: {p['label']} / {lab}")
             finally:
                 _restore_materials(saved_mats)
-        # 5) background of the scene without players/layers (empty scene)
-        if EXPORT_BACKGROUND:
-            _render_background(players, sess)
-            yield prog("Background")
-        # 6) optional layers: retexturable (mesh-type) groups -> per-group UV/mask/shadow steps; SPRITE
-        # groups -> the SHARED `_static_render_layers` (mesh exporter tight-cut beauty + own-range depth
-        # map), so sprites are IDENTICAL across the mesh and legacy exporters.
+        # 5) SHARED scenery passes, reused VERBATIM from the mesh exporter -- the ONLY thing the legacy
+        #    does differently is the player export above (per-part UV maps instead of mesh.bin). Release
+        #    the optional layers (the player passes needed them hidden) so the shared renders snapshot
+        #    them VISIBLE, then render the clean background + the per-entity shadow ratio (players AND
+        #    SPRITE layers), exactly as the mesh exporter does.
+        sess.force_hidden = set()
+        for _lm in (mm for g in layer_groups for mm in g["meshes"]):
+            _lm.hide_render = False
+        bpy.context.view_layer.update()
+        imgs = yield from _static_render_images(players, out_dir=_abs(OUT_DIR), groups=layer_groups,
+                                                mesh_layers=mesh_layers, prog=prog,
+                                                do_bg=True, do_shadows=EXPORT_SHADOW)
+        shadows = imgs.get("shadows") or {}
+        for p in players:
+            p["shadow"] = shadows.get(p["label"])
+        # 6) optional layers: SPRITE -> the SHARED `_static_render_layers` (tight-cut beauty + own-range
+        #    depth, IDENTICAL to the mesh exporter); mesh-type (retexturable) -> per-group UV/mask/shadow.
         layer_infos = []
-        if mesh_layers:
-            yield from _layer_steps(players, mesh_layers, sess, prog, layer_infos)
         if sprite_groups:
             sprite_infos = yield from _static_render_layers(
                 players, sprite_groups, all_layer_mesh_names, 0.0, 1.0,    # zmin=0,zmax=1 -> own-range depth
@@ -2710,7 +2718,10 @@ def _render_steps(players, op=None):
                 layer_infos.append({"name": si["name"], "object": si["object"], "kind": si["kind"],
                                     "image": si["image"], "depth": si["depth"],
                                     "depth_range_viewer": si["depth_range"],
+                                    "shadow": shadows.get(si["name"]),
                                     "camera_depth": si["camera_depth"]})
+        if mesh_layers:
+            yield from _layer_steps(players, mesh_layers, sess, prog, layer_infos)
         # 6a) per-player FOREGROUND matte (occlusion + transmission tint), shared with the mesh exporter.
         # Legacy keeps the MASK for OPAQUE occlusion; the viewer composites only the TRANSMISSIVE part
         # (a<1, water/glass) over the masked player. Flat <label>_foreground_<variant>.webp at the root.
@@ -2727,7 +2738,8 @@ def _render_steps(players, op=None):
         for p in players:
             p["camera_depth"] = _player_camera_depth(p)
         _write_manifest(players, os.path.join(_abs(OUT_DIR), "manifest.json"),
-                        layer_infos, overlay=overlay_file, foregrounds=foregrounds)
+                        layer_infos, overlay=overlay_file, foregrounds=foregrounds,
+                        background=imgs.get("background"))
         yield prog("Manifest")
     finally:
         sess.restore()
