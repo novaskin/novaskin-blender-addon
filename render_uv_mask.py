@@ -2390,7 +2390,7 @@ def _bbox_dict(bbox, size):
     return out
 
 
-def _write_manifest(players, out_path, layer_infos=None, overlay=None):
+def _write_manifest(players, out_path, layer_infos=None, overlay=None, foregrounds=None):
     s = bpy.context.scene
     ordered = sorted((p for p in players if p.get("camera_depth") is not None),
                      key=lambda p: p["camera_depth"], reverse=True)  # back -> front
@@ -2480,6 +2480,7 @@ def _write_manifest(players, out_path, layer_infos=None, overlay=None):
                 "base_layer": ([COMPOSITE_OUTPUT_NAME.format(variant=v) + UV_EXT
                                 for v, _ in MASK_ARM_VARIANTS] if COMPOSITE_BASE_LAYER else None),
                 "masks": [v for v, _ in MASK_ARM_VARIANTS],
+                "foreground": (foregrounds or {}).get(p["label"]),   # {variant: file}; viewer uses a<1 (tint)
             }
             for p in players
         ],
@@ -2579,6 +2580,7 @@ def _render_steps(players, op=None):
                        + (1 if (EXPORT_LAYER_UV and len(g["meshes"]) == 1) else 0)  # UV
                        for g in layer_groups))
                 if layer_groups else 0)                            # optional layers
+             + len(players) * n_variants                           # foreground matte (per player/variant)
              + (1 if overlay_groups else 0)                        # overlay (rain/glare)
              + 1)                                                  # manifest
     total = max(total, 1)
@@ -2726,6 +2728,12 @@ def _render_steps(players, op=None):
         layer_infos = []
         if layer_groups:
             yield from _layer_steps(players, layer_groups, sess, prog, layer_infos)
+        # 6a) per-player FOREGROUND matte (occlusion + transmission tint), shared with the mesh exporter.
+        # Legacy keeps the MASK for OPAQUE occlusion; the viewer composites only the TRANSMISSIVE part
+        # (a<1, water/glass) over the masked player. Flat <label>_foreground_<variant>.webp at the root.
+        all_layer_mesh_names = {m.name for m in layer_meshes}
+        foregrounds = yield from _static_render_foreground(players, [], all_layer_mesh_names,
+                                                           out_dir=_abs(OUT_DIR), prog=prog)
         # 6b) OVERLAY layers (rain / glare): rendered ALONE -> overlay.webp, composited on top of everything
         overlay_file = None
         if overlay_groups:
@@ -2735,7 +2743,7 @@ def _render_steps(players, op=None):
         for p in players:
             p["camera_depth"] = _player_camera_depth(p)
         _write_manifest(players, os.path.join(_abs(OUT_DIR), "manifest.json"),
-                        layer_infos, overlay=overlay_file)
+                        layer_infos, overlay=overlay_file, foregrounds=foregrounds)
         yield prog("Manifest")
     finally:
         sess.restore()
