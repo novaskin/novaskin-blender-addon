@@ -2501,6 +2501,7 @@ def _render_steps(players, op=None):
     # back in the finally below.
     forced_props = _force_selection_props_on(players)
     forced_visible = _force_player_parts_visible(players)
+    hidden_widgets = _hide_bone_shapes(bpy.context.scene)   # kill bone-widget 'dirt' in every render pass
     for p in players:
         os.makedirs(os.path.join(_abs(OUT_DIR), p["label"]), exist_ok=True)
 
@@ -2698,9 +2699,8 @@ def _render_steps(players, op=None):
         #    them VISIBLE, then render the clean background + the per-entity shadow ratio (players AND
         #    SPRITE layers), exactly as the mesh exporter does.
         sess.force_hidden = set()
-        for _lm in (mm for g in layer_groups for mm in g["meshes"]):
-            _lm.hide_render = False
-        bpy.context.view_layer.update()
+        sess.restore_visibility()         # the player passes hid the scenery + force_hidden hid the layers;
+        bpy.context.view_layer.update()   # restore the FULL scene so the shared session snapshots it visible
         imgs = yield from _static_render_images(players, out_dir=_abs(OUT_DIR), groups=layer_groups,
                                                 mesh_layers=mesh_layers, prog=prog,
                                                 do_bg=True, do_shadows=EXPORT_SHADOW)
@@ -2746,6 +2746,7 @@ def _render_steps(players, op=None):
         for o in forced_visible:   # put back the original manual hide_render
             o.hide_render = True
         _restore_selection_props(forced_props)   # restore the artist's Second-layer toggle
+        _restore_bone_shapes(hidden_widgets)     # un-hide the bone widgets
     return results
 
 
