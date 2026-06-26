@@ -3805,16 +3805,16 @@ def _static_render_foreground(players, mesh_layers, all_layer_mesh_names, out_di
                 for sl in o.material_slots:
                     sl.material = white
             bpy.context.view_layer.update()
-            Cw, W, H = _render_combined_array(sess, MASK_RES_PCT)
+            Cw, W, H = _render_combined_array(sess, ILLUM_RES_PCT)   # BG's resolution -> the opaque overlay pixel-matches the bg
             for o in meshes:
                 for sl in o.material_slots:
                     sl.material = black
             bpy.context.view_layer.update()
-            Cb, _, _ = _render_combined_array(sess, MASK_RES_PCT)
+            Cb, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
             for o in scenery:
                 o.hide_render = True                            # the entity ALONE -> its silhouette
             bpy.context.view_layer.update()
-            Cs, _, _ = _render_combined_array(sess, MASK_RES_PCT, transparent=True)
+            Cs, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
         finally:
             for o, vis in saved_vis.items():
                 for a, v in vis.items():

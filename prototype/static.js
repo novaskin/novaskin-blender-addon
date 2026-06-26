@@ -102,7 +102,7 @@ const layerForegroundImgs = await Promise.all(
 const canvas = document.getElementById('gl');
 const SS = 2;                          // supersample: render at SSx, CSS downscales -> anti-aliases
 canvas.width = W * SS; canvas.height = H * SS;   // the silhouette + the dense-mesh T-junction cracks
-const gl = canvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true });
+const gl = canvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true, stencil: true });
 function sh(t, s) { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o);
   if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(o); return o; }
 function prog(v, f) { const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, v));
@@ -128,8 +128,8 @@ const meshP = prog(
      gl_Position=vec4(vScr*2.-1., aPx.z*2.-1., 1.); }`,
   `#version 300 es
    precision highp float;
-   uniform sampler2D uSkin; uniform sampler2D uLight; uniform sampler2D uForeground;
-   uniform bool uUseLight; uniform bool uScreenLight; uniform bool uUseForeground; uniform int uPass;
+   uniform sampler2D uSkin; uniform sampler2D uLight;
+   uniform bool uUseLight; uniform bool uScreenLight; uniform int uPass;
    in vec2 vUv; in vec2 vScr; out vec4 frag;
    // anti-aliased pixel-art sampling: snap UV to the texel CENTER (crisp interior) but ramp across the
    // texel SEAM over ~1 screen pixel (fwidth) -- the base texture keeps its hard pixels WITHOUT the
@@ -143,19 +143,13 @@ const meshP = prog(
    void main(){
      vec4 s=texAA(uSkin,vUv);                   // skin, premultiplied
      if(s.a<0.004) discard;                     // outside the entity silhouette
-     // FRONT matte: straight colour + alpha of everything in front of the entity. Where it FULLY
-     // covers (opaque scenery, a~1) reveal the background (it already holds that scenery) instead of
-     // drawing the entity; where partial (water/glass tint) composite it OVER the relit entity.
-     vec4 fr = uUseForeground ? texture(uForeground, vScr) : vec4(0.0);
-     if(fr.a>=0.996) discard;
      if(uPass==0 && s.a<0.996) discard;         // opaque pass: solid skin texels (write depth)
      if(uPass==1 && s.a>=0.996) discard;        // transparent pass: skin edge
      vec2 luv = uScreenLight ? vScr : vUv;
      vec3 l = uUseLight ? texture(uLight, luv).rgb*2.0 : vec3(1.0);
      vec3 base = s.a>1e-4 ? s.rgb/s.a : vec3(0.0);   // un-premultiply -> straight skin colour
-     vec3 relit = base*l;                            // relit skin (the tint is in the foreground now)
-     // foreground (STRAIGHT colour + alpha) OVER the relit entity: out = fr.rgb*fr.a + (1-fr.a)*relit_premult
-     frag = vec4(fr.rgb*fr.a + (1.0-fr.a)*relit*s.a, fr.a + (1.0-fr.a)*s.a);
+     vec3 relit = base*l;                            // relit skin; the foreground is a separate overlay (drawn after)
+     frag = vec4(relit*s.a, s.a);                    // premultiplied relit entity, drawn COMPLETE
    }`);
 
 // depth-aware sprite: a straight-alpha quad that writes per-pixel gl_FragDepth (decoded from its
@@ -209,9 +203,10 @@ const tLayerDepth = layerDepthImgs.map(mkTex(true));    // NEAREST per-sprite de
 const mkShadow = (img) => { if (!img) return null; const t = tex(false); upload(t, img); return t; };
 const tPlayerShadow = playerShadowImgs.map(mkShadow);   // multiply ratio, LINEAR
 const tLayerShadow = layerShadowImgs.map(mkShadow);
-const tPlayerForeground = playerForegroundImgs.map(m => m   // {variant: tex} foreground matte (straight RGBA)
-  ? Object.fromEntries(Object.entries(m).map(([v, img]) => [v, mkTex(false)(img)])) : null);
-const tLayerForeground = layerForegroundImgs.map(mkTex(false));
+const mkTexP = (img) => { if (!img) return null; const t = tex(false); upload(t, img, true); return t; };   // LINEAR + PREMULT
+const tPlayerForeground = playerForegroundImgs.map(m => m   // {variant: tex} foreground matte, PREMULTIPLIED (no edge fringe)
+  ? Object.fromEntries(Object.entries(m).map(([v, img]) => [v, mkTexP(img)])) : null);
+const tLayerForeground = layerForegroundImgs.map(mkTexP);
 upload(tBg, imgBg); if (imgOverlay) upload(tOverlay, imgOverlay);
 if (imgLight) upload(tLight, imgLight);
 
@@ -265,6 +260,11 @@ function blitQuadBlend(t, premult) {     // over what's behind: out = rgb*[a|1] 
   blitQuad(t);
   gl.disable(gl.BLEND);
 }
+function blitForeground(t) {              // premult overlay CLIPPED to the entity's drawn pixels (stencil==1),
+  gl.enable(gl.STENCIL_TEST); gl.stencilFunc(gl.EQUAL, 1, 0xFF); gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+  blitQuadBlend(t, true);                //   so it never doubles the bg where the skin is transparent (empty hat)
+  gl.disable(gl.STENCIL_TEST);
+}
 
 // players + layer sprites merged back -> front by camera_depth (larger = farther; null = farthest)
 const drawOrder = [
@@ -276,23 +276,22 @@ const playerOn = (i) => { const e = document.getElementById('ck_player_' + i); r
 
 // shared mesh draw (players + mesh-type layers): relit skin/tex * light * 2, depth-tested.
 // `ranges` = the tri ranges to draw (per part, so disabled overlay parts are simply omitted).
-function drawMesh(ranges, skinTex, atlasTex, screenLight, foregroundTex) {
+function drawMesh(ranges, skinTex, atlasTex, screenLight) {
   if (!ranges.length) return;
   gl.useProgram(meshP); gl.bindVertexArray(meshVao);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uForeground'), 2);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), ck('ck_li') ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uScreenLight'), screenLight ? 1 : 0);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseForeground'), (foregroundTex && ck('ck_foreground')) ? 1 : 0);
-  if (foregroundTex) { gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, foregroundTex); }
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, screenLight ? tLight : atlasTex);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, skinTex);
   const uPass = gl.getUniformLocation(meshP, 'uPass');
   const drawAll = () => { for (const [t0, t1] of ranges)
     gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, idxType, t0 * 3 * idxSize); };
   gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);   // per-vertex depth: self + inter-entity
+  gl.enable(gl.STENCIL_TEST); gl.stencilFunc(gl.ALWAYS, 1, 0xFF);   // mark this entity's DRAWN pixels --
+  gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE);                       //   skin-transparent texels discard -> stay 0
   // pass 0: solid texels -> write depth, no blend
   gl.uniform1i(uPass, 0); gl.disable(gl.BLEND); gl.depthMask(true);
   drawAll();
@@ -300,7 +299,7 @@ function drawMesh(ranges, skinTex, atlasTex, screenLight, foregroundTex) {
   gl.uniform1i(uPass, 1);
   gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);   // premultiplied
   drawAll();
-  gl.depthMask(true); gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST);
+  gl.depthMask(true); gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST); gl.disable(gl.STENCIL_TEST);
 }
 const overlayPartOn = (i, label) => {
   const e = document.getElementById('ck_ov_' + i + '_' + label); return !e || e.checked;
@@ -318,9 +317,12 @@ function playerRanges(p, i) {                         // base + enabled overlays
 }
 function drawPlayer(i) {
   const p = manifest.players[i];
-  const foreground = tPlayerForeground[i] ? tPlayerForeground[i][playerVariant(i)] : null;
   drawMesh(playerRanges(p, i), tSkins[i],
-           lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen', foreground);
+           lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen');
+  // foreground = screen-space overlay OVER the complete player, NO depth test: straight-alpha composite
+  // (opaque scenery restores the bg, water/glass tints, a=0 leaves the player).
+  const foreground = tPlayerForeground[i] ? tPlayerForeground[i][playerVariant(i)] : null;
+  if (foreground && ck('ck_foreground')) blitForeground(foreground);   // premult, stencil-clipped to the player
 }
 function drawDepthSprite(i) {                         // straight-alpha quad, per-pixel gl_FragDepth
   const L = layers[i];
@@ -339,7 +341,12 @@ function drawDepthSprite(i) {                         // straight-alpha quad, pe
 }
 function drawLayer(i) {                               // mesh -> geometry; sprite -> depth quad / flat
   const L = layers[i];
-  if (L.type === 'mesh') { if (tLayerTex[i] && tLayerAtlas[i]) drawMesh([L.tri_range], tLayerTex[i], tLayerAtlas[i], false, tLayerForeground[i]); }
+  if (L.type === 'mesh') {
+    if (tLayerTex[i] && tLayerAtlas[i]) {
+      drawMesh([L.tri_range], tLayerTex[i], tLayerAtlas[i], false);
+      if (tLayerForeground[i] && ck('ck_foreground')) blitForeground(tLayerForeground[i]);   // stencil-clipped overlay
+    }
+  }
   else if (tLayerDepth[i]) drawDepthSprite(i);       // per-pixel depth-tested against the meshes
   else if (tLayerSprite[i]) blitQuadBlend(tLayerSprite[i], true);   // fallback: whole-object painter order
 }
@@ -348,7 +355,7 @@ function draw() {
   gl.viewport(0, 0, W * SS, H * SS);
   gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   gl.clearColor(0.13, 0.13, 0.13, 1);
-  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
 
   if (ck('ck_bg')) blitQuad(tBg);
 
