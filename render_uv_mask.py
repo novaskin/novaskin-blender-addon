@@ -1934,62 +1934,29 @@ def _layer_steps(players, groups, sess, prog, layer_infos):
                    and o.name not in group_names and o.name not in char_names
                    and o.name not in layer_mesh_names]
 
-        # BEAUTY: SPRITE-type groups use the TIGHT-CUT (S = the group in the FULL opaque scene,
-        # masked to D = the group's silhouette) -- so transmissive scenery (water/glass) renders the
-        # REAL terrain through the submerged part, not the old holdout's flat-decal-on-the-water. The
-        # bbox crop keeps it fast (two quick renders). Mesh-type (retexturable) groups keep the HOLDOUT
-        # (its occlusion clips the retexture UV via `occl`). Display-encoded like background.png.
+        # BEAUTY: the (mesh-type / retexturable) group alone over a transparent film, OCCLUDED by the
+        # scenery as a HOLDOUT (its occlusion clips the retexture UV via `occl`). Display-encoded like
+        # background.png. SPRITE-type groups never reach _layer_steps -- _render_steps routes them to
+        # the SHARED `_static_render_layers` (mesh exporter tight-cut beauty + own-range depth map).
         _isolate(meshes)
-        if _layer_mode(g) == "SPRITE":
-            bb = _screen_bbox(meshes)
-            bsave = (s.render.use_border, s.render.use_crop_to_border, s.render.border_min_x,
-                     s.render.border_max_x, s.render.border_min_y, s.render.border_max_y)
-            if bb:
-                s.render.use_border = True
-                s.render.use_crop_to_border = False
-                (s.render.border_min_x, s.render.border_max_x,
-                 s.render.border_min_y, s.render.border_max_y) = bb
-            sc_hr = {o: o.hide_render for o in scenery}
-            try:
-                print(f"[LAYER sprite] {label}")
-                comb, W, H = _render_combined_array(           # S: the group in the FULL opaque scene
-                    sess, ILLUM_RES_PCT,
-                    use_scene_settings=BACKGROUND_USE_SCENE_SETTINGS and not DRAFT_MODE)
-                for o in scenery:
-                    o.hide_render = True
-                bpy.context.view_layer.update()
-                sil, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)   # D: silhouette
-            finally:
-                for o in scenery:
-                    o.hide_render = sc_hr[o]
-                (s.render.use_border, s.render.use_crop_to_border, s.render.border_min_x,
-                 s.render.border_max_x, s.render.border_min_y, s.render.border_max_y) = bsave
-                bpy.context.view_layer.update()
-            alpha = np.clip(sil[:, 3], 0.0, 1.0)               # the group's own tight silhouette
-            vis = alpha > 1e-3
-            beauty = np.zeros((comb.shape[0], 4), dtype='float32')
-            beauty[vis, :3] = _to_display(comb[vis, :3])       # S is opaque -> rgb is the straight colour
-            beauty[:, :3] = _anim_dilate_light(beauty[:, :3], vis, W, H)
-            beauty[:, 3] = alpha
-        else:
-            sc = {o: o.is_holdout for o in scenery}            # mesh-type: HOLDOUT -> occlusion clips the UV
-            for o in scenery:
-                o.is_holdout = True
-            bpy.context.view_layer.update()
-            try:
-                print(f"[LAYER beauty] {label}")
-                comb, W, H = _render_combined_array(
-                    sess, ILLUM_RES_PCT, transparent=True,
-                    use_scene_settings=BACKGROUND_USE_SCENE_SETTINGS and not DRAFT_MODE)
-            finally:
-                for o, c in sc.items():
-                    o.is_holdout = c
-            alpha = np.clip(comb[:, 3], 0.0, 1.0)
-            straight = np.where(alpha[:, None] > 1e-4,
-                                comb[:, :3] / np.maximum(alpha[:, None], 1e-4), 0.0)
-            beauty = np.empty((comb.shape[0], 4), dtype='float32')
-            beauty[:, :3] = _to_display(straight)
-            beauty[:, 3] = alpha
+        sc = {o: o.is_holdout for o in scenery}                # HOLDOUT -> occlusion clips the UV
+        for o in scenery:
+            o.is_holdout = True
+        bpy.context.view_layer.update()
+        try:
+            print(f"[LAYER beauty] {label}")
+            comb, W, H = _render_combined_array(
+                sess, ILLUM_RES_PCT, transparent=True,
+                use_scene_settings=BACKGROUND_USE_SCENE_SETTINGS and not DRAFT_MODE)
+        finally:
+            for o, c in sc.items():
+                o.is_holdout = c
+        alpha = np.clip(comb[:, 3], 0.0, 1.0)
+        straight = np.where(alpha[:, None] > 1e-4,
+                            comb[:, :3] / np.maximum(alpha[:, None], 1e-4), 0.0)
+        beauty = np.empty((comb.shape[0], 4), dtype='float32')
+        beauty[:, :3] = _to_display(straight)
+        beauty[:, 3] = alpha
         _save_image(beauty.reshape(-1), W, H, os.path.join(out_dir, safe + ".png"))
         info["image"] = f"layers/{safe}.png"
         info["bbox"] = _bbox_dict(_topleft_bbox(alpha > 0.004, W, H), (W, H))
@@ -2549,6 +2516,8 @@ def _render_steps(players, op=None):
     overlay_names = {m.name for g in overlay_groups for m in g["meshes"]}
     layer_groups = [g for g in all_groups if _layer_mode(g) != "OVERLAY"]     # the rest -> per-group steps
     layer_meshes = [m for g in all_groups for m in g["meshes"]]               # hide ALL (incl. overlay) below
+    mesh_layers, sprite_groups = _static_split_layers(layer_groups)   # retexturable-UV vs baked sprites
+    all_layer_mesh_names = {m.name for m in layer_meshes}            # sprite/foreground isolation
     sess.force_hidden = {m.name for m in layer_meshes}
     for m in layer_meshes:
         m.hide_render = True
@@ -2577,11 +2546,12 @@ def _render_steps(players, op=None):
              + (len(players) * n_variants if COMPOSITE_BASE_LAYER else 0)  # base composites
              + (n_parts if EXPORT_BACKFACE_UV else 0)              # back UVs
              + (1 if EXPORT_BACKGROUND else 0)          # background
-             + (((1 if EXPORT_SHADOW else 0)                       # layers: clean baseline
+             + (((1 if EXPORT_SHADOW else 0)                       # mesh-layers: clean baseline
                  + sum(1 + (1 if EXPORT_SHADOW else 0)             # beauty + shadow
-                       + (1 if (_layer_mode(g) in {"TEXTURE", "PLAYER"} and len(g["meshes"]) == 1) else 0)  # UV
-                       for g in layer_groups))
-                if layer_groups else 0)                            # optional layers
+                       + (1 if len(g["meshes"]) == 1 else 0)       # UV (single-mesh retexturable)
+                       for g in mesh_layers))
+                if mesh_layers else 0)                             # retexturable mesh-layers
+             + len(sprite_groups)                                  # sprites (one shared render each)
              + (len(players) * n_variants if EXPORT_FOREGROUND else 0)   # foreground matte (per player/variant)
              + (1 if overlay_groups else 0)                        # overlay (rain/glare)
              + 1)                                                  # manifest
@@ -2726,16 +2696,26 @@ def _render_steps(players, op=None):
         if EXPORT_BACKGROUND:
             _render_background(players, sess)
             yield prog("Background")
-        # 6) optional layers (marked scenery objects/rigs/collections), each as one group
+        # 6) optional layers: retexturable (mesh-type) groups -> per-group UV/mask/shadow steps; SPRITE
+        # groups -> the SHARED `_static_render_layers` (mesh exporter tight-cut beauty + own-range depth
+        # map), so sprites are IDENTICAL across the mesh and legacy exporters.
         layer_infos = []
-        if layer_groups:
-            yield from _layer_steps(players, layer_groups, sess, prog, layer_infos)
+        if mesh_layers:
+            yield from _layer_steps(players, mesh_layers, sess, prog, layer_infos)
+        if sprite_groups:
+            sprite_infos = yield from _static_render_layers(
+                players, sprite_groups, all_layer_mesh_names, 0.0, 1.0,    # zmin=0,zmax=1 -> own-range depth
+                out_dir=_abs(OUT_DIR), prog=prog)
+            for si in sprite_infos:
+                layer_infos.append({"name": si["name"], "object": si["object"], "kind": si["kind"],
+                                    "image": si["image"], "depth": si["depth"],
+                                    "depth_range_viewer": si["depth_range"],
+                                    "camera_depth": si["camera_depth"]})
         # 6a) per-player FOREGROUND matte (occlusion + transmission tint), shared with the mesh exporter.
         # Legacy keeps the MASK for OPAQUE occlusion; the viewer composites only the TRANSMISSIVE part
         # (a<1, water/glass) over the masked player. Flat <label>_foreground_<variant>.webp at the root.
         foregrounds = {}
         if EXPORT_FOREGROUND:
-            all_layer_mesh_names = {m.name for m in layer_meshes}
             foregrounds = yield from _static_render_foreground(players, [], all_layer_mesh_names,
                                                                out_dir=_abs(OUT_DIR), prog=prog)
         # 6b) OVERLAY layers (rain / glare): rendered ALONE -> overlay.webp, composited on top of everything
@@ -3627,7 +3607,9 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
     GLOBAL `[zmin, zmax]` (the SAME window scale as the mesh / positions.bin), re-encoded 8-bit over
     the sprite's OWN `[wmin, wmax]` for precision, so the browser can `gl_FragDepth` it and depth-test
     the sprite per-pixel against the players / mesh-layers (so a spear/bucket in front occludes -- and
-    is occluded by -- the arms correctly). GENERATOR: `yield`s a progress tuple per sprite group and
+    is occluded by -- the arms correctly). Pass zmin=0/zmax=1 to SKIP the global-window step and encode
+    each sprite in its OWN absolute camera-depth range -- the legacy UV exporter does this, matching its
+    players' per-entity own-range `depth_range_viewer`. GENERATOR: `yield`s a progress tuple per sprite group and
     RETURNS [{name, object, kind, image, depth, depth_range, camera_depth}], back -> front (capture via
     `yield from`). Self-contained."""
     if not sprite_groups:
