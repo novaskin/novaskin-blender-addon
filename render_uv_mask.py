@@ -2019,11 +2019,12 @@ def _layer_steps(players, groups, sess, prog, layer_infos):
             info["shadow"] = f"layers/{safe}_shadow{LIGHTSHADOW_EXT}"
             yield prog(f"Layer shadow: {label}")
 
-        # UV + LIGHT (generic retexture) -- SINGLE-mesh groups only: a multi-mesh group's
-        # meshes don't share one UV/texture space, so a combined UV is meaningless (the
-        # beauty already bakes their real materials). gray render for the light (only if the
-        # Illum toggle is on), then the UV pass clipped by the beauty's occlusion.
-        if EXPORT_LAYER_UV and len(meshes) == 1:
+        # UV + LIGHT (generic retexture) -- only RETEXTURABLE mesh-type (TEXTURE/PLAYER) SINGLE-mesh
+        # groups: those are the ones the viewer re-skins like a player, so they emit UV maps (R=U, G=V,
+        # B=depth, A=coverage + light), occlusion-clipped by the beauty's holdout. SPRITE groups bake
+        # their real look into the beauty above and never need a UV. (A multi-mesh mesh-type group's
+        # meshes don't share one UV space -- a per-part UV like a player rig is a future case.)
+        if _layer_mode(g) in {"TEXTURE", "PLAYER"} and len(meshes) == 1:
             ly = meshes[0]
             lmap = None
             if EXPORT_ILLUM:
@@ -2577,7 +2578,7 @@ def _render_steps(players, op=None):
              + (1 if EXPORT_BACKGROUND else 0)          # background
              + (((1 if EXPORT_SHADOW else 0)                       # layers: clean baseline
                  + sum(1 + (1 if EXPORT_SHADOW else 0)             # beauty + shadow
-                       + (1 if (EXPORT_LAYER_UV and len(g["meshes"]) == 1) else 0)  # UV
+                       + (1 if (_layer_mode(g) in {"TEXTURE", "PLAYER"} and len(g["meshes"]) == 1) else 0)  # UV
                        for g in layer_groups))
                 if layer_groups else 0)                            # optional layers
              + len(players) * n_variants                           # foreground matte (per player/variant)
