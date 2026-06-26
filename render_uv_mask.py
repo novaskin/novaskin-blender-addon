@@ -1933,30 +1933,62 @@ def _layer_steps(players, groups, sess, prog, layer_infos):
                    and o.name not in group_names and o.name not in char_names
                    and o.name not in layer_mesh_names]
 
-        # BEAUTY: the group alone over a transparent film, OCCLUDED by the scenery. The
-        # scenery is a holdout: camera rays hitting it cut the alpha (zero where it is in
-        # front of the group) but it still lights/shadows the meshes -- the lighting stays
-        # real. Un-premultiply in linear, then encode to display. Final look -> scene
-        # settings (engine/samples/denoise), like background.png.
+        # BEAUTY: SPRITE-type groups use the TIGHT-CUT (S = the group in the FULL opaque scene,
+        # masked to D = the group's silhouette) -- so transmissive scenery (water/glass) renders the
+        # REAL terrain through the submerged part, not the old holdout's flat-decal-on-the-water. The
+        # bbox crop keeps it fast (two quick renders). Mesh-type (retexturable) groups keep the HOLDOUT
+        # (its occlusion clips the retexture UV via `occl`). Display-encoded like background.png.
         _isolate(meshes)
-        sc = {o: o.is_holdout for o in scenery}
-        for o in scenery:
-            o.is_holdout = True
-        bpy.context.view_layer.update()
-        try:
-            print(f"[LAYER beauty] {label}")
-            comb, W, H = _render_combined_array(
-                sess, ILLUM_RES_PCT, transparent=True,
-                use_scene_settings=BACKGROUND_USE_SCENE_SETTINGS and not DRAFT_MODE)
-        finally:
-            for o, c in sc.items():
-                o.is_holdout = c
-        alpha = np.clip(comb[:, 3], 0.0, 1.0)
-        straight = np.where(alpha[:, None] > 1e-4,
-                            comb[:, :3] / np.maximum(alpha[:, None], 1e-4), 0.0)
-        beauty = np.empty((comb.shape[0], 4), dtype='float32')
-        beauty[:, :3] = _to_display(straight)
-        beauty[:, 3] = alpha
+        if _layer_mode(g) == "SPRITE":
+            bb = _screen_bbox(meshes)
+            bsave = (s.render.use_border, s.render.use_crop_to_border, s.render.border_min_x,
+                     s.render.border_max_x, s.render.border_min_y, s.render.border_max_y)
+            if bb:
+                s.render.use_border = True
+                s.render.use_crop_to_border = False
+                (s.render.border_min_x, s.render.border_max_x,
+                 s.render.border_min_y, s.render.border_max_y) = bb
+            sc_hr = {o: o.hide_render for o in scenery}
+            try:
+                print(f"[LAYER sprite] {label}")
+                comb, W, H = _render_combined_array(           # S: the group in the FULL opaque scene
+                    sess, ILLUM_RES_PCT,
+                    use_scene_settings=BACKGROUND_USE_SCENE_SETTINGS and not DRAFT_MODE)
+                for o in scenery:
+                    o.hide_render = True
+                bpy.context.view_layer.update()
+                sil, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)   # D: silhouette
+            finally:
+                for o in scenery:
+                    o.hide_render = sc_hr[o]
+                (s.render.use_border, s.render.use_crop_to_border, s.render.border_min_x,
+                 s.render.border_max_x, s.render.border_min_y, s.render.border_max_y) = bsave
+                bpy.context.view_layer.update()
+            alpha = np.clip(sil[:, 3], 0.0, 1.0)               # the group's own tight silhouette
+            vis = alpha > 1e-3
+            beauty = np.zeros((comb.shape[0], 4), dtype='float32')
+            beauty[vis, :3] = _to_display(comb[vis, :3])       # S is opaque -> rgb is the straight colour
+            beauty[:, :3] = _anim_dilate_light(beauty[:, :3], vis, W, H)
+            beauty[:, 3] = alpha
+        else:
+            sc = {o: o.is_holdout for o in scenery}            # mesh-type: HOLDOUT -> occlusion clips the UV
+            for o in scenery:
+                o.is_holdout = True
+            bpy.context.view_layer.update()
+            try:
+                print(f"[LAYER beauty] {label}")
+                comb, W, H = _render_combined_array(
+                    sess, ILLUM_RES_PCT, transparent=True,
+                    use_scene_settings=BACKGROUND_USE_SCENE_SETTINGS and not DRAFT_MODE)
+            finally:
+                for o, c in sc.items():
+                    o.is_holdout = c
+            alpha = np.clip(comb[:, 3], 0.0, 1.0)
+            straight = np.where(alpha[:, None] > 1e-4,
+                                comb[:, :3] / np.maximum(alpha[:, None], 1e-4), 0.0)
+            beauty = np.empty((comb.shape[0], 4), dtype='float32')
+            beauty[:, :3] = _to_display(straight)
+            beauty[:, 3] = alpha
         _save_image(beauty.reshape(-1), W, H, os.path.join(out_dir, safe + ".png"))
         info["image"] = f"layers/{safe}.png"
         info["bbox"] = _bbox_dict(_topleft_bbox(alpha > 0.004, W, H), (W, H))
