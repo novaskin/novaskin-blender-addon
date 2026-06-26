@@ -376,6 +376,13 @@ STATIC_OUT_SUBDIR = "static"   # self-contained static-v2 export dir (alongside 
 #              old per-part export and the animated mode). Sampled by screen position. Use this if
 #              the atlas ever looks off on a different rig.
 STATIC_LIGHT_SPACE = "uv"
+# Per-step toggles for the static export (mirrored from the panel by _apply_settings). A step turned
+# OFF is skipped and its assets are reused from the previous export's manifest. Defaults here keep
+# scripted/headless exports doing the full run.
+STATIC_DO_ATLAS = STATIC_DO_BACKGROUND = STATIC_DO_FOREGROUND = STATIC_DO_SHADOWS = True
+STATIC_DO_SPRITES = STATIC_DO_MASKS = True
+# the tint (transmissive surface in front of the players) is gated by the Foreground toggle --
+# both are "what is in front of the player" (opaque foreground composite + transmissive tint multiply)
 # Static background + foreground images. The foreground is ALWAYS WebP because it needs a real
 # alpha channel (the scenery in front of the players over transparency); the matte split is a
 # VIDEO-only workaround (no in-browser video codec carries alpha on Safari) -- a still image
@@ -1136,6 +1143,8 @@ class _Session:
         self.created_group = False
         self.created_rl = False
         self.created_viewer = False
+        self.created_group_output = None     # NodeGroupOutput added by ensure_group_output(), if any
+        self._created_go_socket = None       # interface OUTPUT socket added for it, if any
 
         ng = s.compositing_node_group
         if ng is None:
@@ -1207,7 +1216,36 @@ class _Session:
                 o.hide_render = True
         bpy.context.view_layer.update()
 
+    def ensure_group_output(self):
+        """A non-blocking INVOKE_DEFAULT render (the modal tier-2 driver) requires the compositing
+        node group to expose a valid output node. The render setup mutes the File Output and reads
+        only the Viewer, which a blocking EXEC render tolerates but INVOKE rejects ('No Group Output
+        or File Output nodes in scene'). Add a Group Output fed by the Render Layers Image (no file
+        written) so INVOKE is happy; the Viewer stays the read source. Idempotent; the node (and the
+        interface socket it needs) are removed in restore() unless the whole group was created by us."""
+        ng = self.ng
+        go = next((n for n in ng.nodes if n.type == 'GROUP_OUTPUT'), None)
+        if go is None:
+            has_out = any(getattr(it, "in_out", "") == 'OUTPUT'
+                          for it in ng.interface.items_tree
+                          if getattr(it, "item_type", "") == 'SOCKET')
+            if not has_out:
+                self._created_go_socket = ng.interface.new_socket(
+                    "Image", in_out='OUTPUT', socket_type='NodeSocketColor')
+            go = ng.nodes.new('NodeGroupOutput')
+            self.created_group_output = go
+        img = self.rl.outputs.get('Image')
+        if img is not None and go.inputs and not go.inputs[0].is_linked:
+            ng.links.new(img, go.inputs[0])
+
     def render_pass(self, socket_name, engine, samples, res_pct):
+        """SYNC wrapper: drains render_pass_gen with a blocking render (the current behaviour)."""
+        return _drain_render(self.render_pass_gen(socket_name, engine, samples, res_pct))
+
+    def render_pass_gen(self, socket_name, engine, samples, res_pct):
+        """Render one Render-Layers pass (UV / Depth / Object Index), read via the Viewer. GENERATOR:
+        yields `_RENDER` where the blocking render used to be, RETURNS (arr, W, H) -- or (None, 0, 0)
+        if the socket is missing / the Viewer is empty."""
         s, ng = self.s, self.ng
         # make sure sockets of just-enabled passes already exist on the Render Layers node
         bpy.context.view_layer.update()
@@ -1221,6 +1259,7 @@ class _Session:
         ng.links.new(sock, vin)
         if self.out_node:
             self.out_node.mute = True
+        self.ensure_group_output()
         s.render.engine = engine
         if hasattr(s, 'cycles'):
             s.cycles.samples = samples
@@ -1229,7 +1268,7 @@ class _Session:
         s.render.film_transparent = True
         s.render.use_compositing = True
         bpy.context.view_layer.update()
-        bpy.ops.render.render(write_still=False)
+        yield _RENDER
         vimg = bpy.data.images.get('Viewer Node')
         if not vimg or len(vimg.pixels) == 0:
             print("[render_pass] Viewer Node empty (requires a GUI).")
@@ -1247,6 +1286,16 @@ class _Session:
         # If we created the whole group, it is removed at the end (taking its nodes with it).
         # Otherwise, we only remove the nodes we created inside the user's group.
         if not self.created_group:
+            if self.created_group_output is not None:
+                try:
+                    ng.nodes.remove(self.created_group_output)
+                except Exception:
+                    pass
+            if self._created_go_socket is not None:
+                try:
+                    ng.interface.remove(self._created_go_socket)
+                except Exception:
+                    pass
             if self.created_viewer:
                 ng.nodes.remove(self.viewer)
             elif self.viewer_orig is not None:
@@ -1997,11 +2046,45 @@ def _layer_steps(players, groups, sess, prog, layer_infos):
         layer_infos.append(info)
 
 
+# --- Tier-2 cooperative render ---------------------------------------------------------------
+# The render primitives YIELD this sentinel where they used to call bpy.ops.render.render() inline.
+# A DRIVER decides how to run it: _drain_render() (sync, below) runs a blocking EXEC render -- the
+# current behaviour, used by execute()/headless/MCP and the non-streamed callers (animated export,
+# atlas bake, depth probe). The static modal operator instead runs each as a non-blocking
+# INVOKE_DEFAULT job so the UI stays live and Cycles shows its own sample progress.
+_RENDER = object()
+
+
+def _drain_render(gen):
+    """Run a render-yielding generator to completion SYNCHRONOUSLY: each `_RENDER` it yields becomes
+    a blocking `bpy.ops.render.render()`. Returns the generator's return value. Progress tuples it
+    forwards (from a nested streaming gen) are ignored on the sync path."""
+    try:
+        x = next(gen)
+        while True:
+            if x is _RENDER:
+                bpy.ops.render.render(write_still=False)
+                x = gen.send(None)
+            else:
+                x = next(gen)
+    except StopIteration as e:
+        return e.value
+
+
 def _render_combined_array(sess, res_pct, transparent=False, use_scene_settings=False):
-    """Render the Combined pass (beauty, with denoise) -> linear RGBA array, read via the
-    Viewer. transparent=True renders over a transparent film (alpha = coverage).
-    use_scene_settings=True renders with the USER's engine/samples/denoise (from the
-    _Session snapshot) -- for final-look images (layer beauty), like background.png."""
+    """SYNC wrapper around _render_combined_array_gen (drains it with blocking renders). Existing
+    callers -- animated export, atlas bake, depth probe, the execute() path -- keep calling this and
+    behave exactly as before. The static modal export uses `yield from _render_combined_array_gen(...)`
+    so each render runs as a live INVOKE job instead."""
+    return _drain_render(_render_combined_array_gen(sess, res_pct, transparent, use_scene_settings))
+
+
+def _render_combined_array_gen(sess, res_pct, transparent=False, use_scene_settings=False):
+    """Render the Combined pass (beauty, with denoise) -> linear RGBA array, read via the Viewer.
+    GENERATOR: yields `_RENDER` where the blocking render used to be (incl. the empty-Viewer retry),
+    reads the Viewer when resumed, and RETURNS (arr, W, H). transparent=True renders over a
+    transparent film (alpha = coverage). use_scene_settings=True uses the USER's engine/samples/
+    denoise (from the _Session snapshot) -- for final-look images (layer beauty), like background.png."""
     s = sess.s
     ng = sess.ng
     vin = sess.viewer.inputs[0]
@@ -2011,6 +2094,7 @@ def _render_combined_array(sess, res_pct, transparent=False, use_scene_settings=
     ng.links.new(img_sock, vin)
     if sess.out_node:
         sess.out_node.mute = True
+    sess.ensure_group_output()
     if use_scene_settings:
         s.render.engine = sess.engine
         if hasattr(s, 'cycles'):
@@ -2027,12 +2111,12 @@ def _render_combined_array(sess, res_pct, transparent=False, use_scene_settings=
     s.render.film_transparent = transparent
     s.render.use_compositing = True
     bpy.context.view_layer.update()
-    bpy.ops.render.render(write_still=False)
+    yield _RENDER
     vimg = bpy.data.images.get('Viewer Node')
     if not vimg or len(vimg.pixels) == 0:
         # transient empty Viewer (same hiccup the depth probe retries) -- retry once
         print("[render] empty Viewer node on the combined render -- retrying once")
-        bpy.ops.render.render(write_still=False)
+        yield _RENDER
         vimg = bpy.data.images.get('Viewer Node')
         if not vimg or len(vimg.pixels) == 0:
             raise RuntimeError("Viewer node empty after retry (combined render)")
@@ -3134,7 +3218,8 @@ def _static_write_geometry(players, out_dir=None, mesh_layers=None):
         bpy.context.view_layer.update()
 
 
-def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None, prog=None):
+def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None, prog=None,
+                          do_bg=True, do_fg=True, do_shadows=True, existing=None):
     """Render the static scenery images for the CURRENT frame, matching the DENSE mesh (AntiLag
     off, no simplify), plus a TOGGLEABLE per-entity shadow.
       * `background.<ext>` = the CLEAN scene -- every player AND optional layer hidden (no baked
@@ -3197,19 +3282,29 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None, 
         #    at the panel "Samples" -- the SAME quality as the per-entity shadow / sprite renders, so
         #    the shadow ratio and the sprite |S - clean| stay consistent and the composite has no
         #    quality seam. Raise "Samples" for a cleaner backdrop.
-        yield _y("rendering background")
-        sess.mute_drivers(True)
-        clean_hr = {o: o.hide_render for o in s.objects if o.name in entity_names}
-        for o in clean_hr:
-            o.hide_render = True
-        bpy.context.view_layer.update()
-        bg, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT)
-        clean_disp = np.clip(_to_display(bg), 1e-4, None)   # shadow-ratio baseline (display space)
-        buf = np.ones((bg.shape[0], 4), 'float32')
-        buf[:, :3] = _to_display(bg)
-        _save_image(buf.reshape(-1), rW, rH, os.path.join(out_dir, "background" + STATIC_BG_EXT),
-                    file_format=STATIC_BG_FORMAT, quality=STATIC_BG_QUALITY)
-        sess.restore_visibility()                           # drivers back
+        rW = rH = None
+        clean_disp = None
+        need_bg = do_bg or do_shadows           # the shadow ratio needs the clean-background baseline
+        if need_bg:
+            yield _y("rendering background" if do_bg else "rendering background (for shadows)")
+            sess.mute_drivers(True)
+            clean_hr = {o: o.hide_render for o in s.objects if o.name in entity_names}
+            for o in clean_hr:
+                o.hide_render = True
+            bpy.context.view_layer.update()
+            bg, rW, rH = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT)
+            clean_disp = np.clip(_to_display(bg), 1e-4, None)   # shadow-ratio baseline (display space)
+            if do_bg:
+                buf = np.ones((bg.shape[0], 4), 'float32')
+                buf[:, :3] = _to_display(bg)
+                _save_image(buf.reshape(-1), rW, rH, os.path.join(out_dir, "background" + STATIC_BG_EXT),
+                            file_format=STATIC_BG_FORMAT, quality=STATIC_BG_QUALITY)
+            else:
+                bg_rel = existing["background"]             # rendered for clean_disp only; reuse file
+            sess.restore_visibility()                       # drivers back
+        else:
+            yield _y("background (reused)")
+            bg_rel = existing["background"]
         for o in s.objects:                                 # only SPRITE layers stay hidden (their
             if o.name in sprite_layer_names:                # own beauty/fg); mesh layers participate
                 o.hide_render = True
@@ -3220,47 +3315,55 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None, 
         mesh_entity_set = {o.name for o in mesh_entity_objs}
 
         # 2) FOREGROUND: scenery-with-entities-holdout INTERSECT the entity silhouette, WebP+alpha
-        yield _y("rendering foreground (scenery)")
-        hold = {o: o.is_holdout for o in mesh_entity_objs}
-        for o in mesh_entity_objs:
-            o.is_holdout = True
-        bpy.context.view_layer.update()
-        C, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
-        for o, v in hold.items():
-            o.is_holdout = v
-        # entity silhouette: render only the mesh entities (players + mesh layers)
-        yield _y("rendering foreground (silhouette)")
-        camsnap = {}
-        for o in s.objects:
-            if o.type == 'MESH' and o.name not in mesh_entity_set:
-                camsnap[o.name] = o.hide_render
-                o.hide_render = True
-        bpy.context.view_layer.update()
-        D, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
-        for n, v in camsnap.items():
-            ob = s.objects.get(n)
-            if ob is not None:
-                ob.hide_render = v
-        ca = np.clip(C[:, 3], 0.0, 1.0)
-        straight = np.where(ca[:, None] > 1e-4, C[:, :3] / np.maximum(ca[:, None], 1e-4), 0.0)
-        alpha = np.where(D[:, 3] > 0.5, ca, 0.0)        # scenery in front AND over an entity
-        vis = alpha > 1e-4
-        fg = np.zeros((C.shape[0], 4), 'float32')
-        fg[vis, :3] = _to_display(straight[vis])
-        # STRAIGHT alpha, composited as out = fg.rgb*fg.a + behind*(1-fg.a) (multiply by alpha at
-        # sample time). Dilate the color outward so partial-alpha EDGE texels carry real scenery
-        # color (not zeroed black); the fully transparent rgb is don't-care (x alpha=0).
-        fg[:, :3] = _anim_dilate_light(fg[:, :3], vis, rW, rH)
-        fg[:, 3] = alpha
-        _save_image(fg.reshape(-1), rW, rH, os.path.join(out_dir, "foreground.webp"),
-                    file_format='WEBP', lossless=STATIC_FG_LOSSLESS, quality=STATIC_FG_QUALITY)
+        if do_fg:
+            yield _y("rendering foreground (scenery)")
+            hold = {o: o.is_holdout for o in mesh_entity_objs}
+            for o in mesh_entity_objs:
+                o.is_holdout = True
+            bpy.context.view_layer.update()
+            try:
+                C, cW, cH = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT, transparent=True)
+            finally:                                   # restore holdout even if cancelled mid-render
+                for o, v in hold.items():
+                    o.is_holdout = v
+            if rW is None:                             # no bg render this time -- take size from here
+                rW, rH = cW, cH
+            # entity silhouette: render only the mesh entities (players + mesh layers)
+            yield _y("rendering foreground (silhouette)")
+            camsnap = {}
+            for o in s.objects:
+                if o.type == 'MESH' and o.name not in mesh_entity_set:
+                    camsnap[o.name] = o.hide_render
+                    o.hide_render = True
+            bpy.context.view_layer.update()
+            D, _, _ = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT, transparent=True)
+            for n, v in camsnap.items():
+                ob = s.objects.get(n)
+                if ob is not None:
+                    ob.hide_render = v
+            ca = np.clip(C[:, 3], 0.0, 1.0)
+            straight = np.where(ca[:, None] > 1e-4, C[:, :3] / np.maximum(ca[:, None], 1e-4), 0.0)
+            alpha = np.where(D[:, 3] > 0.5, ca, 0.0)        # scenery in front AND over an entity
+            vis = alpha > 1e-4
+            fg = np.zeros((C.shape[0], 4), 'float32')
+            fg[vis, :3] = _to_display(straight[vis])
+            # STRAIGHT alpha, composited as out = fg.rgb*fg.a + behind*(1-fg.a) (multiply by alpha at
+            # sample time). Dilate the color outward so partial-alpha EDGE texels carry real scenery
+            # color (not zeroed black); the fully transparent rgb is don't-care (x alpha=0).
+            fg[:, :3] = _anim_dilate_light(fg[:, :3], vis, rW, rH)
+            fg[:, 3] = alpha
+            _save_image(fg.reshape(-1), rW, rH, os.path.join(out_dir, "foreground.webp"),
+                        file_format='WEBP', lossless=STATIC_FG_LOSSLESS, quality=STATIC_FG_QUALITY)
+        else:
+            yield _y("foreground (reused)")
+            fg_rel = existing["foreground"]
 
         # 3) LIGHT (screen-space): the visible players rendered GRAY, scenery camera-invisible but
         # still lighting/shadowing -- the combined lit-gray at screen resolution, like the old
         # per-part export and the animated 'light' frame. VIEWPORT-quality soft shadows, no UV
         # lattice. The renderer samples it by screen position and relights as skin*light*2.
-        light_rel = None
-        if STATIC_LIGHT_SPACE == "screen":
+        light_rel = (existing.get("light") if (existing and not do_bg) else None)
+        if STATIC_LIGHT_SPACE == "screen" and do_bg:
             yield _y("rendering light (screen-space)")
             scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in player_set]
             gray = _gray_diffuse_material()
@@ -3269,10 +3372,12 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None, 
             for o in scenery:
                 o.visible_camera = False
             bpy.context.view_layer.update()
-            L, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
-            for o, v in sc2.items():
-                o.visible_camera = v
-            _restore_materials(sv)
+            try:
+                L, _, _ = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT, transparent=True)
+            finally:                                   # restore camera-vis + materials even on cancel
+                for o, v in sc2.items():
+                    o.visible_camera = v
+                _restore_materials(sv)
             la = np.clip(L[:, 3], 0.0, 1.0)
             lst = np.where(la[:, None] > 1e-4, L[:, :3] / np.maximum(la[:, None], 1e-4), 0.0)
             lst = _anim_dilate_light(lst, la > 0.01, rW, rH)
@@ -3288,9 +3393,14 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None, 
         #    sign/poster with no material) -- letting them cast would dim the whole scene; skip them.
         mesh_layer_group_names = {ml["name"] for ml in mesh_layers}
         shadow_groups = [g for g in groups if g["name"] not in mesh_layer_group_names]
-        shadows = {}        # players + sprite layers: each gets its own multiply ratio
-        entities = ([("player", p["label"], list(p["char_all"])) for p in players]
-                    + [("layer", g["name"], list(g["meshes"])) for g in shadow_groups])
+        if do_shadows:
+            shadows = {}        # players + sprite layers: each gets its own multiply ratio
+            entities = ([("player", p["label"], list(p["char_all"])) for p in players]
+                        + [("layer", g["name"], list(g["meshes"])) for g in shadow_groups])
+        else:
+            shadows = dict((existing or {}).get("shadows") or {})   # reuse the previous shadows
+            entities = []
+            yield _y("shadows (reused)")
         for _si, (kind, name, objs) in enumerate(entities):
             yield _y(f"rendering shadow {_si + 1}/{len(entities)}: {name}")
             obj_names = {o.name for o in objs}
@@ -3309,7 +3419,7 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None, 
                 o.visible_camera = False
             bpy.context.view_layer.update()
             try:
-                sh, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+                sh, _, _ = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT)
             finally:
                 for o, v in cam_save.items():
                     o.visible_camera = v
@@ -3461,7 +3571,7 @@ def _material_is_transmissive(mat):
 
 def _obj_is_transmissive(o):
     """Does this object contain a see-through SURFACE (water / glass / ice) -- so a submerged entity
-    behind it shows THROUGH it (and gets the water tint) rather than being occluded/clipped? True if
+    behind it shows THROUGH it (and gets the tint) rather than being occluded/clipped? True if
     ANY material is transmissive: the water is often part of a MULTI-material object (a voxel terrain
     whose water blocks share the mesh with grass/dirt/stone, an ocean plane), so requiring EVERY
     material would miss it. False positives are avoided in `_material_is_transmissive`, which does NOT
@@ -3471,6 +3581,40 @@ def _obj_is_transmissive(o):
     if ov is not None:
         return bool(ov)
     return any(_material_is_transmissive(sl.material) for sl in o.material_slots if sl.material)
+
+
+def _screen_bbox(objs, margin=0.08):
+    """Screen-space (0..1) bounding box of `objs` -- their EVALUATED bound-boxes projected through the
+    active camera -- padded by `margin`, as (xmin, xmax, ymin, ymax) for a render BORDER, or None.
+    Lets a sprite render only the mob's region instead of the whole 4K frame."""
+    s = bpy.context.scene
+    cam = s.camera
+    if cam is None:
+        return None
+    dg = bpy.context.evaluated_depsgraph_get()
+    ce = cam.evaluated_get(dg)
+    P = np.array(ce.calc_matrix_camera(dg, x=s.render.resolution_x, y=s.render.resolution_y)
+                 @ ce.matrix_world.inverted())
+    xs, ys = [], []
+    for o in objs:
+        ev = o.evaluated_get(dg)
+        mw = np.array(ev.matrix_world)
+        for c in ev.bound_box:
+            clip = P @ (mw @ np.array([c[0], c[1], c[2], 1.0]))
+            if clip[3] <= 1e-6:
+                continue
+            xs.append(clip[0] / clip[3] * 0.5 + 0.5)
+            ys.append(clip[1] / clip[3] * 0.5 + 0.5)
+    if not xs:
+        return None
+    xmin, xmax, ymin, ymax = min(xs), max(xs), min(ys), max(ys)
+    px = (xmax - xmin) * margin + 0.02
+    py = (ymax - ymin) * margin + 0.02
+    xmin = max(0.0, xmin - px); xmax = min(1.0, xmax + px)
+    ymin = max(0.0, ymin - py); ymax = min(1.0, ymax + py)
+    if xmax - xmin < 1e-3 or ymax - ymin < 1e-3:
+        return None
+    return (xmin, xmax, ymin, ymax)
 
 
 def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zmax, out_dir=None,
@@ -3523,6 +3667,23 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
             scenery = [o for o in s.objects if o.type == 'MESH'
                        and o.name not in group_names and o.name not in entity_names]
             bpy.context.view_layer.update()
+            # BBOX CROP: render ONLY the mob's screen-space region (a render border) instead of the
+            # whole 4K frame -- the mob is a tiny part of it, so this is ~10-50x faster (and keeps the
+            # UI block short). These three renders run SYNCHRONOUSLY (blocking): the back-to-back
+            # S -> hide-scenery -> D sequence needs the silhouette pass to render with the scenery
+            # actually hidden, and the async modal could NOT guarantee that -- its INVOKE render did not
+            # reliably pick up the mid-sequence scene change (a depsgraph update AND a settle grace both
+            # failed), so the silhouette rendered the whole scenery and the sprite kept its background.
+            # Sync renders off the live depsgraph, so the cut is always correct. Only these quick
+            # (bbox-cropped) renders block; the slow image / shadow / water passes stay async (UI live).
+            bb = _screen_bbox(meshes)
+            bsave = (s.render.use_border, s.render.use_crop_to_border, s.render.border_min_x,
+                     s.render.border_max_x, s.render.border_min_y, s.render.border_max_y)
+            if bb:
+                s.render.use_border = True
+                s.render.use_crop_to_border = False
+                (s.render.border_min_x, s.render.border_max_x,
+                 s.render.border_min_y, s.render.border_max_y) = bb
             try:
                 # S: the mob in the FULL (opaque) scene -- the exact Blender look, water over submerged
                 comb, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT)
@@ -3539,6 +3700,8 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
                     o.hide_render = sc_hr[o]
             finally:
                 bpy.context.view_layer.update()
+                (s.render.use_border, s.render.use_crop_to_border, s.render.border_min_x,
+                 s.render.border_max_x, s.render.border_min_y, s.render.border_max_y) = bsave
 
             alpha = np.clip(sil[:, 3], 0.0, 1.0)               # the mob's own silhouette (soft AA edge)
             vis = alpha > 1e-3
@@ -3617,8 +3780,8 @@ def _box_blur_rgb(rgb2d, iterations=2):
     return out
 
 
-def _static_render_water_tint(players, all_layer_mesh_names=None, out_dir=None, prog=None):
-    """Per player, a screen-space WATER-TINT map so a SUBMERGED player stays re-skinnable but is
+def _static_render_tint(players, all_layer_mesh_names=None, out_dir=None, prog=None):
+    """Per player, a screen-space TINT map so a SUBMERGED player stays re-skinnable but is
     tinted by the transmissive surface in front of it (water/glass), instead of looking like a flat
     decal on top of it. The PURE transmission is extracted by two-background matting -- the player as
     flat WHITE then BLACK emission behind the (lit) water; `T = white - black` CANCELS the surface's
@@ -3640,7 +3803,7 @@ def _static_render_water_tint(players, all_layer_mesh_names=None, out_dir=None, 
     if not transmissive:
         return {}                                  # no water/glass anywhere -> no tint to bake
     opaque = [o for o in scenery if o not in transmissive]
-    TINT_LO = 0.25                                  # darkest the deep/reflective water tints (no black
+    TINT_LO = 0.25                                  # darkest the deep/reflective tints (no black
     #                                                 blobs where the surface is fully reflective)
 
     def _emit(name, v):
@@ -3654,15 +3817,15 @@ def _static_render_water_tint(players, all_layer_mesh_names=None, out_dir=None, 
         nt.links.new(em.outputs[0], op.inputs[0])
         return mat
 
-    white = _emit("NSK_wt_white", 1.0)
-    black = _emit("NSK_wt_black", 0.0)
+    white = _emit("NSK_tint_white", 1.0)
+    black = _emit("NSK_tint_black", 0.0)
     sess = _Session()
     out = {}
     def _y(msg):
         return prog(msg) if prog else (0.0, msg)
     try:
         for _wi, p in enumerate(players):
-            yield _y(f"rendering water tint {_wi + 1}/{len(players)}: {p['label']}")
+            yield _y(f"rendering tint {_wi + 1}/{len(players)}: {p['label']}")
             meshes = [o for o in p["char_all"] if o.type == 'MESH']
             own = {m.name for m in p["char_all"]}
             saved = {o: [sl.material for sl in o.material_slots] for o in meshes}
@@ -3681,18 +3844,35 @@ def _static_render_water_tint(players, all_layer_mesh_names=None, out_dir=None, 
             for o in opaque:
                 o.hide_render = True
             tr_hr = {o: o.hide_render for o in transmissive}
+            # SYNCHRONOUS (blocking) + bbox-cropped. The matte swaps the player's emission material AND
+            # hides the water between back-to-back renders. Async could NOT guarantee the silhouette
+            # render saw the water hidden -- its INVOKE render did not reliably pick up the mid-sequence
+            # scene change (the same race that broke the sprites), so a player whose render raced got the
+            # whole water SURFACE folded into its silhouette -> a wide water blob tinted instead of the
+            # player. Sync renders off the live depsgraph, always correct; the bbox (the player's screen
+            # region, at MASK_RES_PCT) keeps the block short.
+            bb = _screen_bbox(meshes)
+            bsave = (s.render.use_border, s.render.use_crop_to_border, s.render.border_min_x,
+                     s.render.border_max_x, s.render.border_min_y, s.render.border_max_y)
+            if bb:
+                s.render.use_border = True
+                s.render.use_crop_to_border = False
+                (s.render.border_min_x, s.render.border_max_x,
+                 s.render.border_min_y, s.render.border_max_y) = bb
             try:
                 _set(white)
                 bpy.context.view_layer.update()
-                Aw, W, H = _render_combined_array(sess, MASK_RES_PCT)    # white emission, water in front
+                Aw, W, H = _render_combined_array(sess, MASK_RES_PCT)  # white emission
                 _set(black)
                 bpy.context.view_layer.update()
-                Ab, _, _ = _render_combined_array(sess, MASK_RES_PCT)    # black emission, water in front
+                Ab, _, _ = _render_combined_array(sess, MASK_RES_PCT)  # black emission
                 for o in transmissive:
                     o.hide_render = True                                  # silhouette: the player alone
                 bpy.context.view_layer.update()
                 cov_arr, _, _ = _render_combined_array(sess, MASK_RES_PCT, transparent=True)
             finally:
+                (s.render.use_border, s.render.use_crop_to_border, s.render.border_min_x,
+                 s.render.border_max_x, s.render.border_min_y, s.render.border_max_y) = bsave
                 for o, v in tr_hr.items():
                     o.hide_render = v
                 for o, v in op_hr.items():
@@ -3712,13 +3892,13 @@ def _static_render_water_tint(players, all_layer_mesh_names=None, out_dir=None, 
             # transmission. The per-pixel T collapses to the TINT_LO clamp where the water is deep or
             # reflective (T -> 0, T-only cannot see through there), painting a dark "bar" that reads as
             # a shadow instead of the water. The median is robust to those dark outliers, so it is the
-            # actual water tint -- a clean, uniform overlay.
+            # actual tint -- a clean, uniform overlay.
             tint[tinted, :3] = np.clip(np.median(T[tinted], axis=0), TINT_LO, 1.0)
-            fn = f"{p['label']}_watertint.webp"
+            fn = f"{p['label']}_tint.webp"
             _save_image(tint.reshape(-1), W, H, os.path.join(out_dir, fn),
                         file_format='WEBP', lossless=True)
             out[p["label"]] = fn
-            print(f"[STATIC watertint] {p['label']} -> {fn} ({int(tinted.sum())} px tinted)")
+            print(f"[STATIC tint] {p['label']} -> {fn} ({int(tinted.sum())} px tinted)")
     finally:
         sess.restore()
         bpy.context.view_layer.update()
@@ -3744,7 +3924,7 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
     char_names = {o.name for p in players for o in p["char_all"]}
     entity_names = char_names | set(all_layer_mesh_names)
     # A TRANSMISSIVE surface (water/glass) must NOT clip a submerged entity: it is see-through, so the
-    # entity shows THROUGH it (and then gets the water tint on top), not hidden behind it. Hide the
+    # entity shows THROUGH it (and then gets the tint on top), not hidden behind it. Hide the
     # transmissive scenery for the Object-Index render so only OPAQUE scenery occludes -- otherwise the
     # glass water is the front-most index and the submerged part falls out of the mask (vanishes).
     transmissive_scenery = [o for o in s.objects if o.type == 'MESH'
@@ -3782,12 +3962,15 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
                 for sl in o.material_slots:
                     sl.material = mask_opaque          # full geometry silhouette, skin-independent
             bpy.context.view_layer.update()
-            oid, W, H = sess.render_pass('Object Index', 'CYCLES', STATIC_MASK_SAMPLES, MASK_RES_PCT)
-            for o, mats in saved_mats.items():
-                for i, sl in enumerate(o.material_slots):
-                    sl.material = mats[i]
-            for o in tr_hidden:
-                o.hide_render = False
+            try:
+                oid, W, H = yield from sess.render_pass_gen(
+                    'Object Index', 'CYCLES', STATIC_MASK_SAMPLES, MASK_RES_PCT)
+            finally:                                   # restore materials + water vis even on cancel
+                for o, mats in saved_mats.items():
+                    for i, sl in enumerate(o.material_slots):
+                        sl.material = mats[i]
+                for o in tr_hidden:
+                    o.hide_render = False
             if oid is None:
                 return None
             m = (np.round(oid[:, 0]).astype(np.int32) == 1).astype('float32')   # 1 = entity visible
@@ -3808,7 +3991,7 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
                 arm, saved = _set_arm_style(p, vval)
                 muted = _hide_others_for_bake(s, active, entity_names)
                 try:
-                    fn = _render_mask(list(p["char_all"]), f"{p['label']}_mask_{vname}.webp")
+                    fn = yield from _render_mask(list(p["char_all"]), f"{p['label']}_mask_{vname}.webp")
                 finally:
                     for d in muted:
                         d.mute = False
@@ -3824,7 +4007,7 @@ def _static_render_masks(players, mesh_layers, all_layer_mesh_names, out_dir=Non
             sess.restore_visibility()
             muted = _hide_others_for_bake(s, active, entity_names)
             try:
-                fn = _render_mask(list(ml["meshes"]), f"{ml['name']}_mask.webp")
+                fn = yield from _render_mask(list(ml["meshes"]), f"{ml['name']}_mask.webp")
             finally:
                 for d in muted:
                     d.mute = False
@@ -3882,7 +4065,7 @@ def _static_render_overlay(overlay_names, out_dir=None):
 
 
 def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, masks=None,
-                           water_tints=None):
+                           tints=None):
     """Write `static/manifest.json` tying the static-v2 pieces together (paths are bare file names,
     relative to the manifest's own dir). `light_space` selects how the renderer samples the light:
     "screen" -> one `light` image sampled by screen position (viewport-quality, default); "uv" ->
@@ -3891,7 +4074,7 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, mask
     light_space = STATIC_LIGHT_SPACE
     shadows = imgs.get("shadows") or {}
     masks = masks or {}
-    water_tints = water_tints or {}
+    tints = tints or {}
     players_meta = []
     for pm in geo["players"]:
         e = dict(pm)
@@ -3899,7 +4082,7 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, mask
             e["atlas"] = atlas_by_label.get(pm["label"])
         e["shadow"] = shadows.get(pm["label"])    # display-space multiply ratio, toggleable
         e["mask"] = masks.get(pm["label"])        # {variant: file} scenery-occlusion clip
-        e["water_tint"] = water_tints.get(pm["label"])   # screen-space colored multiply (submerged)
+        e["tint"] = tints.get(pm["label"])   # screen-space colored multiply (submerged)
         players_meta.append(e)
     if layers:
         layers = [dict(l, shadow=shadows.get(l["name"]), mask=masks.get(l["name"]))
@@ -3947,6 +4130,45 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, mask
     return manifest
 
 
+def _existing_static_data(out_dir):
+    """Load the previous export's manifest.json (if any) and reconstruct the per-step INPUT dicts that
+    `_static_export_steps` feeds the manifest writer, so a SKIPPED (toggled-off) step can reuse its
+    already-rendered assets on disk. Returns None when there is no prior manifest to reuse."""
+    path = os.path.join(out_dir, "manifest.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as fh:
+            m = json.load(fh)
+    except Exception as e:
+        print(f"[STATIC] cannot read existing manifest for reuse ({e!r}) -- will re-render all")
+        return None
+    players, layers = m.get("players", []), m.get("layers", [])
+    sub = STATIC_OUT_SUBDIR + "/"
+    shadows = {p["label"]: p["shadow"] for p in players if p.get("shadow")}
+    for l in layers:
+        if l.get("shadow"):
+            shadows[l["name"]] = l["shadow"]
+    imgs = {"background": sub + m["background"], "foreground": sub + m["foreground"],
+            "foreground_overlay": m.get("foreground_overlay"),
+            "shadows": shadows, "resolution": m.get("resolution")}
+    if m.get("light"):
+        imgs["light"] = sub + m["light"]
+    masks = {p["label"]: p["mask"] for p in players if p.get("mask")}
+    for l in layers:
+        if l.get("mask"):
+            masks[l["name"]] = l["mask"]
+    return {
+        "atlas_by_label": {p["label"]: p["atlas"] for p in players if p.get("atlas")},
+        "mesh_layer_assets": {l["name"]: {"atlas": l.get("atlas"), "tex": l.get("tex")}
+                              for l in layers if l.get("type") == "mesh"},
+        "imgs": imgs,
+        "sprite_infos": [l for l in layers if l.get("type") == "sprite"],
+        "masks": masks,
+        "tints": {p["label"]: p["tint"] for p in players if p.get("tint")},
+    }
+
+
 def _static_export_steps(players, op=None, out_dir=None):
     """Generator for the static-v2 export (yields (frac, msg) like `_anim_render_steps`) into
     `<OUT_DIR>/static/`: per-player UV light atlas + DENSE `mesh.bin`/`positions.bin` (K=1) +
@@ -3976,19 +4198,36 @@ def _static_export_steps(players, op=None, out_dir=None):
     #   sprites: one beauty-cut per sprite group
     #   masks  : one Object-Index per player x arm-variant + one per mesh-layer
     #   water  : one two-background matte per player, but only if the scene has transmissive scenery
-    #            (else _static_render_water_tint early-returns with no renders)
-    n_image_renders = (3 + (1 if STATIC_LIGHT_SPACE == "screen" else 0)
-                       + len(players) + len(sprite_groups))
+    #            (else _static_render_tint early-returns with no renders)
     _entity_nm = ({o.name for p in players for o in p["char_all"]}
                   | {m.name for g in groups for m in g["meshes"]})
     has_transmissive = any(_obj_is_transmissive(o) for o in bpy.context.scene.objects
                            if o.type == 'MESH' and o.name not in _entity_nm)
-    n_sprite_renders = len(sprite_groups)
     n_mask_renders = len(players) * len(MASK_ARM_VARIANTS) + len(mesh_layers)
-    n_water_renders = len(players) if has_transmissive else 0
-    # atlases/textures + geometry + images + sprites + masks + water + (overlay) + manifest
-    total = (n_atlas + 1 + n_image_renders + n_sprite_renders + n_mask_renders
-             + n_water_renders + (1 if overlay_groups else 0) + 1)
+    n_tint_renders = len(players) if has_transmissive else 0
+    # per-step toggles: a step turned OFF is reused from the previous manifest (1 yield instead of N).
+    reuse_any = not (STATIC_DO_ATLAS and STATIC_DO_BACKGROUND and STATIC_DO_FOREGROUND
+                     and STATIC_DO_SHADOWS and STATIC_DO_SPRITES and STATIC_DO_MASKS)
+    existing = _existing_static_data(out_dir) if reuse_any else None
+    if reuse_any and existing is None:
+        print("[STATIC] a step is OFF but there is no previous export to reuse -- rendering all")
+    # render a step when it is ON, or when there is nothing to reuse (the manifest needs every part)
+    do_atlas = STATIC_DO_ATLAS or not existing
+    do_bg = STATIC_DO_BACKGROUND or not existing
+    do_fg = STATIC_DO_FOREGROUND or not existing      # also gates the tint (front of the player)
+    do_shadows = STATIC_DO_SHADOWS or not existing
+    do_sprites = STATIC_DO_SPRITES or not existing
+    do_masks = STATIC_DO_MASKS or not existing
+    _has_atlas = uv_light or bool(mesh_layers)
+    ya = n_atlas if do_atlas else (1 if _has_atlas else 0)
+    # images sub-yields: 1 background + (2 foreground | 1) + (screen light if bg) + (N shadows | 1)
+    yi = (1 + (2 if do_fg else 1) + (1 if (STATIC_LIGHT_SPACE == "screen" and do_bg) else 0)
+          + ((len(players) + len(sprite_groups)) if do_shadows else 1))
+    ys = (len(sprite_groups) if do_sprites else 1) if sprite_groups else 0
+    ym = n_mask_renders if do_masks else 1
+    yw = (n_tint_renders if do_fg else 1) if has_transmissive else 0   # tint follows Foreground
+    # atlases + geometry + images + sprites + masks + water + (overlay) + manifest
+    total = ya + 1 + yi + ys + ym + yw + (1 if overlay_groups else 0) + 1
     state = {"done": 0}
     def prog(msg):
         state["done"] += 1
@@ -4022,7 +4261,11 @@ def _static_export_steps(players, op=None, out_dir=None):
         #    rendered in step 3 instead). Baked in the normal look so it sees the real lighting.
         atlas_by_label = {}
         mesh_layer_assets = {}      # layer name -> {"atlas": file, "tex": file}
-        if uv_light or mesh_layers:
+        if not do_atlas and _has_atlas:                 # reuse the previous export's atlas (toggle off)
+            atlas_by_label = (existing or {}).get("atlas_by_label", {})
+            mesh_layer_assets = (existing or {}).get("mesh_layer_assets", {})
+            yield prog("light atlas (reused)")
+        elif do_atlas and (uv_light or mesh_layers):
             s = bpy.context.scene
             sess = _Session()
             # other entities are hidden per bake so each atlas is independent (keep the scenery)
@@ -4073,22 +4316,33 @@ def _static_export_steps(players, op=None, out_dir=None):
         # _static_render_images streams one yield PER beauty render (bg / each foreground / light /
         # each entity shadow), so the panel bar advances during the long pass instead of freezing on
         # one label. `yield from` forwards those to the modal and captures the returned dict.
-        imgs = yield from _static_render_images(players, out_dir=out_dir, groups=groups,
-                                                mesh_layers=mesh_layers, prog=prog)
+        imgs = yield from _static_render_images(
+            players, out_dir=out_dir, groups=groups, mesh_layers=mesh_layers, prog=prog,
+            do_bg=do_bg, do_fg=do_fg, do_shadows=do_shadows,
+            existing=(existing["imgs"] if existing else None))
         # 4) sprite-type layers: tight silhouette beauty each (shadow is a separate ratio, step 3)
         sprite_infos = []
-        if sprite_groups:
+        if do_sprites and sprite_groups:
             sprite_infos = yield from _static_render_layers(
                 players, sprite_groups, all_layer_mesh_names,
                 geo["zmin"], geo["zmax"], out_dir=out_dir, prog=prog)
+        elif sprite_groups:
+            sprite_infos = list(existing["sprite_infos"]); yield prog("sprites (reused)")
         # 4b) per-entity scenery-occlusion masks (players per variant + mesh-layers) -- the static
         #     replacement for the foreground (occludes by the fixed scenery, leaves layers alone)
-        masks = yield from _static_render_masks(players, mesh_layers, all_layer_mesh_names,
-                                                out_dir=out_dir, prog=prog)
-        # 4d) per-player WATER TINT: a submerged player stays re-skinnable but is tinted by the water
-        #     in front of it (a colored multiply over the relit skin), instead of a flat decal on top.
-        water_tints = yield from _static_render_water_tint(players, all_layer_mesh_names,
-                                                           out_dir=out_dir, prog=prog)
+        if do_masks:
+            masks = yield from _static_render_masks(players, mesh_layers, all_layer_mesh_names,
+                                                    out_dir=out_dir, prog=prog)
+        else:
+            masks = dict(existing["masks"]); yield prog("masks (reused)")
+        # 4d) per-player TINT: a submerged player stays re-skinnable but is tinted by the water
+        #     in front of it (a colored multiply over the relit skin). It is the TRANSMISSIVE half of
+        #     "what is in front of the player", so it follows the Foreground (do_fg) toggle.
+        if do_fg:
+            tints = yield from _static_render_tint(players, all_layer_mesh_names,
+                                                               out_dir=out_dir, prog=prog)
+        else:
+            tints = dict(existing["tints"]); yield prog("tint (reused)")
         # 4c) OVERLAY layers (rain / glare): rendered alone -> foreground.webp, composited on top
         if overlay_groups:
             yield prog(f"rendering overlay ({len(overlay_groups)})")
@@ -4108,7 +4362,7 @@ def _static_export_steps(players, op=None, out_dir=None):
         # 5) manifest
         yield prog("manifest.json")
         manifest = _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=layer_entries,
-                                          masks=masks, water_tints=water_tints)
+                                          masks=masks, tints=tints)
         print(f"[STATIC] export complete -> {out_dir} ({geo['tris']} tris, "
               f"light={STATIC_LIGHT_SPACE})")
         return manifest
@@ -4123,13 +4377,10 @@ def _static_export_steps(players, op=None, out_dir=None):
 
 
 def _static_export(players, out_dir=None, op=None):
-    """Synchronous drain of `_static_export_steps` (scripts/standalone). Returns the manifest."""
-    gen = _static_export_steps(players, op=op, out_dir=out_dir)
-    try:
-        while True:
-            next(gen)
-    except StopIteration as e:
-        return e.value
+    """Synchronous drain of `_static_export_steps` (scripts/standalone). Returns the manifest.
+    Uses _drain_render so each `_RENDER` the streaming functions emit runs as a blocking render here
+    (the modal operator runs them as live INVOKE_DEFAULT jobs instead)."""
+    return _drain_render(_static_export_steps(players, op=op, out_dir=out_dir))
 
 
 def _anim_encode(adir, fps):
@@ -4460,6 +4711,29 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
     export_shadow: BoolProperty(name="Shadow", default=True)
     composite_base_layer: BoolProperty(name="Base Layer Composite", default=True)
     export_background: BoolProperty(name="Background (no players/layers)", default=True)
+    # Per-step toggles for the static "Export Mesh (v2)" export. Turning one OFF skips that (slow)
+    # pass and REUSES the asset from the previous export's manifest -- so you can re-render just one
+    # step (e.g. only the sprites) without redoing the rest. Geometry + manifest always run.
+    static_atlas: BoolProperty(
+        name="Light Atlas", default=True,
+        description="Export Mesh v2: bake the per-character / per-layer relight atlas. OFF reuses the "
+                    "previous export's atlas (re-render other steps without re-baking)")
+    static_background: BoolProperty(
+        name="Background", default=True,
+        description="Export Mesh v2: render the clean background image. OFF reuses the previous export")
+    static_foreground: BoolProperty(
+        name="Foreground", default=True,
+        description="Export Mesh v2: render everything IN FRONT of the players -- the opaque foreground "
+                    "AND the transmissive water/glass tint (submerged players). OFF reuses the previous")
+    static_shadows: BoolProperty(
+        name="Shadows", default=True,
+        description="Export Mesh v2: render the per-entity shadow ratios (the slow pass). OFF reuses")
+    static_sprites: BoolProperty(
+        name="Sprites", default=True,
+        description="Export Mesh v2: render the sprite-type scenery layers. OFF reuses the previous")
+    static_masks: BoolProperty(
+        name="Masks", default=True,
+        description="Export Mesh v2: render the per-entity scenery-occlusion masks. OFF reuses")
     fix_2layer_position: BoolProperty(
         name="Fix Hat Position and Scale", default=True,
         description="Snap the hat (2_Layer_Extrusion) onto the head and scale it to the "
@@ -4515,6 +4789,12 @@ def _apply_settings(scene, draft=False):
     g["EXPORT_SHADOW"] = st.export_shadow
     g["COMPOSITE_BASE_LAYER"] = st.composite_base_layer
     g["EXPORT_BACKGROUND"] = st.export_background
+    g["STATIC_DO_ATLAS"] = st.static_atlas
+    g["STATIC_DO_BACKGROUND"] = st.static_background
+    g["STATIC_DO_FOREGROUND"] = st.static_foreground
+    g["STATIC_DO_SHADOWS"] = st.static_shadows
+    g["STATIC_DO_SPRITES"] = st.static_sprites
+    g["STATIC_DO_MASKS"] = st.static_masks
     g["FIX_2LAYER_POSITION"] = st.fix_2layer_position
     g["LIGHTSHADOW_FORMAT"] = st.lightshadow_format
     g["JPEG_QUALITY"] = st.jpeg_quality
@@ -4563,10 +4843,11 @@ class _NovaSkinModalMixin:
     which silently kills the parent's button. Each operator provides `_start_msg` and
     `_make_gen(players)` (its work generator); `draft` defaults to False if the operator has none.
 
-    Responsiveness note: bpy is single-threaded, so a render always blocks the main thread for its
-    duration. The modal/timer runs the work in small chunks, redrawing + updating progress between
-    them and allowing Esc to cancel -- the UI is responsive between steps (each step still blocks
-    briefly while its render runs). True non-blocking rendering is not possible."""
+    Responsiveness note: the work generator yields its renders as `_RENDER` sentinels; this modal
+    runs each as a non-blocking INVOKE_DEFAULT job (tier 2) and resumes on render_complete, so the UI
+    stays live and Cycles shows its own sample progress DURING each render. The synchronous execute()
+    path (scripts / headless / the modal-start fallback) instead runs each `_RENDER` as a blocking
+    render via _drain_render."""
     _start_msg = "starting..."
 
     def _make_gen(self, players):
@@ -4587,6 +4868,10 @@ class _NovaSkinModalMixin:
             self._gen = self._make_gen(players)
             self._wm = context.window_manager
             self._result = None
+            self._render_pending = False     # tier-2: an INVOKE render in flight (see modal())
+            self._render_done = self._render_cancelled = False
+            self._render_h_done = self._render_h_cancel = None
+            self._disp_saved = False
             self._wm.progress_begin(0.0, 1.0)
             # robust window: a panel-button context may not carry context.window in some builds
             win = context.window or (self._wm.windows[0] if self._wm.windows else None)
@@ -4618,11 +4903,8 @@ class _NovaSkinModalMixin:
                 self.report({'ERROR'}, e)
             return {'CANCELLED'}
         self._players = players
-        gen = self._make_gen(players)
         try:
-            while True:
-                next(gen)
-        except StopIteration:
+            self._result = _drain_render(self._make_gen(players))   # _RENDER -> blocking render here
             self.report({'INFO'}, f"NovaSkin: exported {len(players)} player(s) -> {OUT_DIR}")
             return {'FINISHED'}
         except Exception as ex:
@@ -4643,30 +4925,124 @@ class _NovaSkinModalMixin:
             _set_progress_header(warn)
             return {'RUNNING_MODAL'}
         if event.type == 'TIMER':
-            if _PROGRESS.get("cancel"):           # Cancel button in the panel
+            if getattr(self, "_render_pending", False):
+                # An INVOKE_DEFAULT render is in flight. NEVER touch the scene now (restoring it would
+                # free the compositor group the render is using -> crash) -- wait for render_complete,
+                # THEN honour a pending cancel or resume. To stop the CURRENT render immediately the
+                # user presses Esc, which the render's own modal handles (-> render_cancel -> below).
+                if not self._render_done:
+                    # render_complete is NOT a reliable "done" signal -- some renders finish without
+                    # ever firing it (seen with the sprite beauty pass), which would hang us forever.
+                    # The robust signal is the render JOB stopping. Use render_complete as a fast path
+                    # and is_job_running() as the authority: once the job has run and then stopped,
+                    # the render is done (resume; the gen reads the Viewer, retrying if it is empty).
+                    import time
+                    if bpy.app.is_job_running('RENDER'):
+                        self._render_was_running = True
+                        self._render_idle_since = None
+                    else:
+                        if getattr(self, "_render_idle_since", None) is None:
+                            self._render_idle_since = time.time()
+                        idle = time.time() - self._render_idle_since
+                        # was_running: the render JOB stopped, but it is NOT fully released the instant
+                        # is_job_running() flips -- resuming immediately makes the NEXT render read the
+                        # OLD scene (the back-to-back sprite passes then render the whole scenery, so
+                        # the silhouette never cuts the mob). Wait a short grace for the depsgraph /
+                        # Viewer to settle. render_complete, when it fires, is immediate + correct.
+                        # never ran: a silent INVOKE that started nothing -- give up after a long idle.
+                        grace = 2.0 if getattr(self, "_render_was_running", False) else 120.0
+                        if idle > grace:
+                            self._render_done = True
+                if not self._render_done:
+                    if _PROGRESS.get("cancel"):
+                        msg = "NovaSkin: cancelling after this render finishes  (press Esc to stop it now)"
+                        context.workspace.status_text_set(msg)
+                        _set_progress_header(msg)
+                    return {'RUNNING_MODAL'}        # UI stays live; Cycles shows its sample progress
+                self._teardown_render_wait()
+                if self._render_cancelled or _PROGRESS.get("cancel"):
+                    return self._finish(context, cancelled=True)
+                return self._advance(context)       # resume the gen past `yield _RENDER`
+            if _PROGRESS.get("cancel"):             # Cancel button in the panel (between renders)
                 return self._finish(context, cancelled=True)
-            try:
-                frac, msg = next(self._gen)
-            except StopIteration as e:
-                self._result = e.value
-                return self._finish(context, cancelled=False)
-            except Exception as ex:
-                self.report({'ERROR'}, f"NovaSkin failed: {ex}")
-                print(f"NovaSkin failed: {ex!r}")
-                return self._finish(context, cancelled=True)
-            self._wm.progress_update(frac)
-            _PROGRESS.update(frac=frac, msg=msg)
-            label = f"NovaSkin {frac * 100:.0f}%  -  {msg}  (Esc to cancel)"
-            context.workspace.status_text_set(label)
-            _set_progress_header(label)
-            return {'RUNNING_MODAL'}
+            return self._advance(context)
         return {'PASS_THROUGH'}
+
+    def _advance(self, context):
+        """Pull the next item from the work generator: a `_RENDER` sentinel means 'render now'
+        (launched as a live INVOKE job); a (frac, msg) tuple is a progress update."""
+        try:
+            x = next(self._gen)
+        except StopIteration as e:
+            self._result = e.value
+            return self._finish(context, cancelled=False)
+        except Exception as ex:
+            self.report({'ERROR'}, f"NovaSkin failed: {ex}")
+            print(f"NovaSkin failed: {ex!r}")
+            return self._finish(context, cancelled=True)
+        if x is _RENDER:
+            self._launch_render(context)
+            return {'RUNNING_MODAL'}
+        frac, msg = x
+        self._wm.progress_update(frac)
+        _PROGRESS.update(frac=frac, msg=msg)
+        label = f"NovaSkin {frac * 100:.0f}%  -  {msg}  (Esc to cancel)"
+        context.workspace.status_text_set(label)
+        _set_progress_header(label)
+        return {'RUNNING_MODAL'}
+
+    def _launch_render(self, context):
+        """Tier 2: run the render as a non-blocking INVOKE_DEFAULT job so the UI stays responsive and
+        Cycles shows its own sample progress. A render_complete handler flips `_render_done` and the
+        modal resumes the generator next tick (it then reads the Viewer). The result window is
+        suppressed (display 'NONE'). Falls back to a blocking render if INVOKE is unavailable."""
+        self._render_done = False
+        self._render_cancelled = False
+        def _on_done(scene, dg=None):
+            self._render_done = True
+        def _on_cancel(scene, dg=None):
+            self._render_done = True
+            self._render_cancelled = True
+        self._render_h_done = _on_done
+        self._render_h_cancel = _on_cancel
+        bpy.app.handlers.render_complete.append(_on_done)
+        bpy.app.handlers.render_cancel.append(_on_cancel)
+        if not getattr(self, "_disp_saved", False):
+            try:
+                self._disp_prev = context.preferences.view.render_display_type
+                context.preferences.view.render_display_type = 'NONE'
+                self._disp_saved = True
+            except Exception:
+                pass
+        self._render_pending = True
+        self._render_was_running = False    # is_job_running() fallback state (see modal())
+        self._render_idle_since = None
+        try:
+            bpy.ops.render.render('INVOKE_DEFAULT', write_still=False)
+        except Exception as ex:
+            print(f"[NovaSkin] INVOKE render unavailable ({ex!r}); blocking this render")
+            bpy.ops.render.render(write_still=False)   # _on_done fires during this blocking call
+
+    def _teardown_render_wait(self):
+        for h, coll in ((getattr(self, "_render_h_done", None), bpy.app.handlers.render_complete),
+                        (getattr(self, "_render_h_cancel", None), bpy.app.handlers.render_cancel)):
+            if h is not None and h in coll:
+                coll.remove(h)
+        self._render_h_done = self._render_h_cancel = None
+        self._render_pending = False
 
     def cancel(self, context):
         # Blender ends the modal by itself (file load, area close, add-on reload...). Restore.
         self._finish(context, cancelled=True)
 
     def _finish(self, context, cancelled):
+        self._teardown_render_wait()                 # drop any in-flight render handlers
+        if getattr(self, "_disp_saved", False):
+            try:
+                context.preferences.view.render_display_type = self._disp_prev
+            except Exception:
+                pass
+            self._disp_saved = False
         bpy.app.driver_namespace.pop(_ACTIVE_KEY, None)
         wm = getattr(self, "_wm", None) or context.window_manager
         if getattr(self, "_timer", None) is not None:
@@ -4889,6 +5265,14 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             box.prop(st, "export_mesh")           # mesh v2 (new) vs legacy per-part
             if st.export_mesh:
                 box.prop(st, "atlas_res")         # static (mesh v2) UV light-atlas size
+                col = box.column(align=True)
+                col.label(text="Steps (off = reuse previous export):")
+                col.prop(st, "static_background")
+                col.prop(st, "static_foreground")     # also covers the water/glass tint
+                col.prop(st, "static_atlas")
+                col.prop(st, "static_shadows")
+                col.prop(st, "static_sprites")
+                col.prop(st, "static_masks")
             else:
                 box.prop(st, "export_backface_uv")
                 box.prop(st, "export_illum")

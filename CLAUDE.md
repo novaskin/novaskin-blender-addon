@@ -82,7 +82,7 @@ The panel (3D Viewport sidebar → "NovaSkin" tab) has Export / Layers / Animati
   the background — the silhouette cut is what keeps it tight.) Its cast shadow / water darkening is a
   SEPARATE multiply ratio composited before the players. Sprites order by `camera_depth` (painter
   order) + a per-sprite depth map for the players/mesh-layers. (`_obj_is_transmissive` — material-based
-  water/glass detection — is still used for the PLAYER water tint, not for sprites.)
+  water/glass detection — is still used for the PLAYER tint, not for sprites.)
 - **Overlay parts** (hat / jacket / sleeves / pants 2nd layer) must ALWAYS export, even if the
   rig's "Second layer" toggle is OFF. `_static_export_steps` forces it ON via
   `_force_selection_props_on` (restored at the end), like the legacy/animated renders. The browser
@@ -203,14 +203,14 @@ needs a mesh, add an in-Blender check.
   `_static_render_images` (yields one step per sprite group; counted as `n_sprite_renders`).
 - `_static_render_masks()` — per-entity Object-Index occlusion mask. Streaming generator (one step
   per player x arm-variant, then per mesh-layer; `n_mask_renders`).
-- `_static_render_water_tint()` — per-player screen-space WATER TINT (a colored multiply over the
+- `_static_render_tint()` — per-player screen-space TINT (a colored multiply over the
   submerged part). Two-background matting (player as white/black emission behind the lit water) gives
   the pure transmission `T = white - black` (the reflection cancels); blurred + clamped to `[lo,1]`.
   The browser does `skin * atlas * 2 * T`, so a submerged player stays re-skinnable but tinted (NOT
   the reflection, which would hide the skin). Note: the atlas already bakes most of the underwater
   DIMMING (it's a multiply too), so the tint's visible job is mainly the COLOR; subtle in a scene
   whose water is reflective (the clamp shows where T-only can't see through a glint). Streaming
-  generator (one step per player; `n_water_renders`, gated on transmissive scenery existing).
+  generator (one step per player; `n_tint_renders`, gated on transmissive scenery existing).
 - `_obj_is_transmissive()` — water/glass vs opaque, by material transmission (general, not by name).
 - `_bake_player_light_atlas()` / `_hide_others_for_bake()` / `_force_bake_visible()` — atlas baking.
 - `_expand_pixel_uvs()` / `_mesh_uv_handedness()` — pixel-UV cell expansion + degenerate-face fix.
