@@ -95,9 +95,9 @@ const loadMaskVariants = async (m) => {
 const playerMaskImgs = await Promise.all(manifest.players.map(p => loadMaskVariants(p.mask)));
 const layerMaskImgs = await Promise.all(
   layers.map(L => (L.type === 'mesh' && L.mask) ? loadImage(DIR + L.mask + _cb) : null));
-// per-player screen-space WATER TINT (colored multiply over the submerged part; absent = dry player)
-const playerWaterTintImgs = await Promise.all(
-  manifest.players.map(p => p.water_tint ? loadImage(DIR + p.water_tint + _cb) : null));
+// per-player screen-space TINT (colored multiply over the submerged part; absent = dry player)
+const playerTintImgs = await Promise.all(
+  manifest.players.map(p => p.tint ? loadImage(DIR + p.tint + _cb) : null));
 
 // --- GL setup ---
 const canvas = document.getElementById('gl');
@@ -129,22 +129,32 @@ const meshP = prog(
      gl_Position=vec4(vScr*2.-1., aPx.z*2.-1., 1.); }`,
   `#version 300 es
    precision highp float;
-   uniform sampler2D uSkin; uniform sampler2D uLight; uniform sampler2D uMask; uniform sampler2D uWaterTint;
-   uniform bool uUseLight; uniform bool uScreenLight; uniform bool uUseMask; uniform bool uUseWaterTint; uniform int uPass;
+   uniform sampler2D uSkin; uniform sampler2D uLight; uniform sampler2D uMask; uniform sampler2D uTint;
+   uniform bool uUseLight; uniform bool uScreenLight; uniform bool uUseMask; uniform bool uUseTint; uniform int uPass;
    in vec2 vUv; in vec2 vScr; out vec4 frag;
+   // anti-aliased pixel-art sampling: snap UV to the texel CENTER (crisp interior) but ramp across the
+   // texel SEAM over ~1 screen pixel (fwidth) -- the base texture keeps its hard pixels WITHOUT the
+   // jagged seam, the smooth boundary a supersampled Blender beauty render gives. uSkin (the player skin
+   // OR a mesh-layer texture) is PREMULTIPLIED so this LINEAR blend across a transparent seam stays
+   // fringe-free (a transparent texel contributes 0, not its black RGB).
+   vec4 texAA(sampler2D tx, vec2 uv){
+     vec2 ts=vec2(textureSize(tx,0)); vec2 p=uv*ts; vec2 seam=floor(p+0.5);
+     p=seam+clamp((p-seam)/max(fwidth(p),1e-5),-0.5,0.5); return texture(tx,p/ts);
+   }
    void main(){
      float m = uUseMask ? texture(uMask, vScr).r : 1.0;   // scenery-occlusion coverage (0..1)
-     vec4 s=texture(uSkin,vUv);
+     vec4 s=texAA(uSkin,vUv);                   // premultiplied; un-premultiply below for the relight
      float a = s.a * m;                         // fold the mask into alpha: soft occlusion edge,
      if(a<0.004) discard;                       // and a thin sub-0.5 mask sliver fades, not cracks
      if(uPass==0 && a<0.996) discard;           // opaque pass: only solid texels (write depth)
      if(uPass==1 && a>=0.996) discard;          // transparent pass: mask edge + semi-transparent skin
      vec2 luv = uScreenLight ? vScr : vUv;
      vec3 l = uUseLight ? texture(uLight, luv).rgb*2.0 : vec3(1.0);
-     // water tint: a colored multiply over the SUBMERGED part (1 above the waterline), so the relit
+     // tint: a colored multiply over the SUBMERGED part (1 above the waterline), so the relit
      // skin shows tinted through the water instead of as a decal on top. Screen-space, skin-independent.
-     vec3 wt = uUseWaterTint ? texture(uWaterTint, vScr).rgb : vec3(1.0);
-     frag=vec4(s.rgb*l*wt, a);                   // straight alpha (SRC_ALPHA blend on the semi pass)
+     vec3 wt = uUseTint ? texture(uTint, vScr).rgb : vec3(1.0);
+     vec3 base = s.a>1e-4 ? s.rgb/s.a : vec3(0.0);   // un-premultiply -> straight-alpha skin color
+     frag=vec4(base*l*wt, a);                    // straight alpha (SRC_ALPHA blend on the semi pass)
    }`);
 
 // depth-aware sprite: a straight-alpha quad that writes per-pixel gl_FragDepth (decoded from its
@@ -187,9 +197,10 @@ function upload(t, srcEl, premult) {
 }
 const tBg = tex(), tFg = tex(), tLight = tex(false);   // tLight: LINEAR screen-space light
 const tAtlas = atlasImgs.map(img => { const t = tex(false); upload(t, img); return t; });  // LINEAR
-const tSkins = skins.map(img => { const t = tex(true); upload(t, img); return t; });        // NEAREST
+const tSkins = skins.map(img => { const t = tex(false); upload(t, img, true); return t; });  // LINEAR + PREMULT (texel-AA)
 const mkTex = (nearest) => (img) => { if (!img) return null; const t = tex(nearest); upload(t, img); return t; };
-const tLayerTex = layerTexImgs.map(mkTex(true));        // NEAREST swappable base texture
+const tLayerTex = layerTexImgs.map(img => {            // LINEAR + PREMULT swappable base texture (texel-AA)
+  if (!img) return null; const t = tex(false); upload(t, img, true); return t; });
 const tLayerAtlas = layerAtlasImgs.map(mkTex(false));   // LINEAR UV light atlas
 const tLayerSprite = layerSpriteImgs.map(img => {        // LINEAR flat sprite, PREMULTIPLIED (no edge fringe)
   if (!img) return null; const t = tex(false); upload(t, img, true); return t; });
@@ -200,9 +211,25 @@ const tLayerShadow = layerShadowImgs.map(mkShadow);
 const tPlayerMask = playerMaskImgs.map(m => m   // {variant: tex} screen-space scenery-occlusion clip
   ? Object.fromEntries(Object.entries(m).map(([v, img]) => [v, mkTex(false)(img)])) : null);
 const tLayerMask = layerMaskImgs.map(mkTex(false));
-const tPlayerWaterTint = playerWaterTintImgs.map(mkTex(false));   // LINEAR colored multiply (submerged)
+const tPlayerTint = playerTintImgs.map(mkTex(false));   // LINEAR colored multiply (submerged)
 upload(tBg, imgBg); upload(tFg, imgFg);
 if (imgLight) upload(tLight, imgLight);
+
+// SHADOW ACCUMULATION BUFFER: the optional per-entity shadows are MULTIPLY ratios (~1 outside the
+// shadow, <1 inside). Multiplying each onto the canvas in turn double-darkens where two overlap
+// (out = bg * sA * sB). Instead, combine them all into this offscreen buffer with a MIN blend (the
+// DARKEST ratio wins, no accumulation), then multiply that single image onto the scene ONCE.
+const shadowTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W * SS, H * SS, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+const shadowFbo = gl.createFramebuffer();
+gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFbo);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, shadowTex, 0);
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 
 // quad VAO (location 0 = 2D position in [0,1])
 const quadVao = gl.createVertexArray();
@@ -249,20 +276,20 @@ const playerOn = (i) => { const e = document.getElementById('ck_player_' + i); r
 
 // shared mesh draw (players + mesh-type layers): relit skin/tex * light * 2, depth-tested.
 // `ranges` = the tri ranges to draw (per part, so disabled overlay parts are simply omitted).
-function drawMesh(ranges, skinTex, atlasTex, screenLight, maskTex, waterTintTex) {
+function drawMesh(ranges, skinTex, atlasTex, screenLight, maskTex, tintTex) {
   if (!ranges.length) return;
   gl.useProgram(meshP); gl.bindVertexArray(meshVao);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uMask'), 2);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uWaterTint'), 3);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uTint'), 3);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), ck('ck_li') ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uScreenLight'), screenLight ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uUseMask'), (maskTex && ck('ck_mask')) ? 1 : 0);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseWaterTint'), (waterTintTex && ck('ck_water')) ? 1 : 0);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseTint'), (tintTex && ck('ck_tint')) ? 1 : 0);
   if (maskTex) { gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, maskTex); }
-  if (waterTintTex) { gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, waterTintTex); }
+  if (tintTex) { gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, tintTex); }
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, screenLight ? tLight : atlasTex);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, skinTex);
   const uPass = gl.getUniformLocation(meshP, 'uPass');
@@ -297,7 +324,7 @@ function drawPlayer(i) {
   const mask = tPlayerMask[i] ? tPlayerMask[i][playerVariant(i)] : null;
   drawMesh(playerRanges(p, i), tSkins[i],
            lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen', mask,
-           tPlayerWaterTint[i]);
+           tPlayerTint[i]);
 }
 function drawDepthSprite(i) {                         // straight-alpha quad, per-pixel gl_FragDepth
   const L = layers[i];
@@ -330,14 +357,20 @@ function draw() {
   if (ck('ck_bg')) blitQuad(tBg);
 
   const showPlayers = ck('ck_pl');
-  // shadow pass: multiply each ENABLED entity's ratio onto the scenery (behind the meshes).
-  // out = bg * ratio (blendFunc ZERO, SRC_COLOR); ratio is ~1 outside the shadow -> no-op there.
+  // SHADOW PASS: combine every enabled entity's ratio into shadowTex with MIN (the darkest wins, so
+  // two shadows overlapping do NOT multiply into a double-dark patch), then multiply that one combined
+  // image onto the scenery (behind the meshes) ONCE. ratio is ~1 outside the shadow -> no-op there.
   if (ck('ck_sh')) {
-    gl.enable(gl.BLEND); gl.blendFunc(gl.ZERO, gl.SRC_COLOR);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFbo);
+    gl.clearColor(1, 1, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT);   // white = no shadow
+    gl.enable(gl.BLEND); gl.blendEquation(gl.MIN);              // out = min(src, dst) -> darkest ratio
     if (showPlayers) for (let i = 0; i < tPlayerShadow.length; i++)
       if (tPlayerShadow[i] && playerOn(i)) blitQuad(tPlayerShadow[i]);
     for (let i = 0; i < tLayerShadow.length; i++)
       if (tLayerShadow[i] && layerOn(i)) blitQuad(tLayerShadow[i]);
+    gl.blendEquation(gl.FUNC_ADD);                              // restore the default add equation
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);                   // back to the canvas
+    gl.blendFunc(gl.ZERO, gl.SRC_COLOR); blitQuad(shadowTex);   // out = bg * combined shadow (once)
     gl.disable(gl.BLEND);
   }
 
@@ -353,8 +386,8 @@ function draw() {
 }
 
 // swap a player's skin / a mesh-layer's texture at runtime (file input, or __dbg.setSkin)
-function setSkin(i, source) { upload(tSkins[i], source); draw(); }
-function setLayerTex(i, source) { if (tLayerTex[i]) { upload(tLayerTex[i], source); draw(); } }
+function setSkin(i, source) { upload(tSkins[i], source, true); draw(); }   // premultiplied (texel-AA)
+function setLayerTex(i, source) { if (tLayerTex[i]) { upload(tLayerTex[i], source, true); draw(); } }   // premultiplied
 {
   const box = document.getElementById('skins');
   manifest.players.forEach((p, i) => {
@@ -378,7 +411,7 @@ function setLayerTex(i, source) { if (tLayerTex[i]) { upload(tLayerTex[i], sourc
 }
 // foreground is an OVERLAY (rain/glare in front) -> on by default; else the legacy opaque fg -> off
 document.getElementById('ck_fg').checked = !!manifest.foreground_overlay;
-for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_sh', 'ck_mask', 'ck_water', 'ck_fg'])
+for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_sh', 'ck_mask', 'ck_tint', 'ck_fg'])
   document.getElementById(id).addEventListener('change', draw);
 
 // per-layer toggles (one checkbox each, default on), labelled by the layer's object name
