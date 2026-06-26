@@ -367,7 +367,8 @@ ATLAS_EXT = {'WEBP': '.webp', 'PNG': '.png'}.get(ATLAS_FORMAT, '.png')
 # per-pixel relief still shows after smooth+lossless.
 ATLAS_BLUR_RADIUS = 0
 ATLAS_BLUR_PASSES = 2      # box passes (2-3 ~ Gaussian)
-STATIC_OUT_SUBDIR = "static"   # self-contained static-v2 export dir (alongside the legacy one)
+STATIC_OUT_SUBDIR = ""   # "" = export straight into OUT_DIR; a name (e.g. "static") would nest under it
+STATIC_OUT_PREFIX = (STATIC_OUT_SUBDIR + "/") if STATIC_OUT_SUBDIR else ""   # manifest path prefix
 # Static lighting space:
 #   "uv"     = per-player UV light atlas (`_bake_player_light_atlas`). ONE texture per player, baked
 #              in one step, covering every region -- and overlay-reveal correct (Option B). With
@@ -3204,8 +3205,8 @@ def _static_write_geometry(players, out_dir=None, mesh_layers=None):
                 "layers": st.get("layers", []), "zmin": zmin, "zmax": zmax,
                 "mesh_bytes": os.path.getsize(os.path.join(out_dir, "mesh.bin")),
                 "pos_bytes": os.path.getsize(os.path.join(out_dir, "positions.bin")),
-                "mesh_file": STATIC_OUT_SUBDIR + "/mesh.bin",
-                "positions_file": STATIC_OUT_SUBDIR + "/positions.bin"}
+                "mesh_file": STATIC_OUT_PREFIX + "mesh.bin",
+                "positions_file": STATIC_OUT_PREFIX + "positions.bin"}
     finally:
         s.render.use_simplify, s.render.simplify_subdivision_render = simp
         for a in arms:
@@ -3257,7 +3258,7 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None, 
     rig_snap = {a.name: a.pose.bones['Main_Properties'].get('AntiLag')
                 for a in arms if a.pose.bones.get('Main_Properties')}
     sess = _Session()
-    bg_rel = STATIC_OUT_SUBDIR + "/background" + STATIC_BG_EXT
+    bg_rel = STATIC_OUT_PREFIX + "background" + STATIC_BG_EXT
     try:
         # DENSE render (silhouettes match the exported mesh); arm style left as the player's own
         for a in arms:
@@ -3335,7 +3336,7 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None, 
             lbuf[:, :3] = _lin_to_srgb(lst)
             _save_image(lbuf.reshape(-1), rW, rH, os.path.join(out_dir, "light" + STATIC_BG_EXT),
                         file_format=STATIC_BG_FORMAT, quality=STATIC_BG_QUALITY)
-            light_rel = STATIC_OUT_SUBDIR + "/light" + STATIC_BG_EXT
+            light_rel = STATIC_OUT_PREFIX + "light" + STATIC_BG_EXT
 
         # 4) per-entity TOGGLEABLE shadow: each entity camera-invisible (still casting / reflecting)
         #    over the same clean baseline, every OTHER entity hidden -> display-space multiply ratio.
@@ -3996,7 +3997,7 @@ def _existing_static_data(out_dir):
         print(f"[STATIC] cannot read existing manifest for reuse ({e!r}) -- will re-render all")
         return None
     players, layers = m.get("players", []), m.get("layers", [])
-    sub = STATIC_OUT_SUBDIR + "/"
+    sub = STATIC_OUT_PREFIX
     shadows = {p["label"]: p["shadow"] for p in players if p.get("shadow")}
     for l in layers:
         if l.get("shadow"):
@@ -4184,7 +4185,7 @@ def _static_export_steps(players, op=None, out_dir=None):
             yield prog(f"rendering overlay ({len(overlay_groups)})")
             ov_file = _static_render_overlay(overlay_names, out_dir=out_dir)
             if ov_file:
-                imgs["overlay"] = STATIC_OUT_SUBDIR + "/" + ov_file
+                imgs["overlay"] = STATIC_OUT_PREFIX + ov_file
         # unify layer manifest entries: mesh-type (geometry range + atlas + tex) + sprite-type
         layer_entries = []
         for lr in geo.get("layers", []):
