@@ -1,8 +1,8 @@
 // Static wallpaper renderer prototype. Consumes <static/> as written by the exporter:
 //   manifest.json, mesh.bin (NSKM v2, u32), positions.bin (NSKA v3, K=1),
-//   background.webp, foreground.webp, <player>_atlas.<ext> (UV-space light atlas per player).
+//   background.webp (+ overlay.webp), <player>_atlas.<ext> (UV-space light atlas per player).
 // Composite: background image -> player meshes (skin(uv) * atlas(uv) * 2, depth-tested, base
-// then overlay via the shared tri range + alpha-discard) -> foreground over the top, composited
+// then overlay via the shared tri range + alpha-discard) -> overlay over the top, composited
 // STRAIGHT: out = fg.rgb*fg.a + behind*(1-fg.a) (standard SRC_ALPHA blend; the encoder's white
 // fill in fully transparent texels is harmless -- multiplied by alpha 0).
 const DIR = 'static/';
@@ -58,10 +58,11 @@ for (let i = 0; i < welded; i++) {
   posArr[i*3] = uniq[u]; posArr[i*3+1] = uniq[u+1]; posArr[i*3+2] = uniq[u+2];
 }
 
-// --- images: background + foreground + per-player atlas + per-player skin ---
+// --- images: background (+ optional overlay) + per-player atlas + per-player skin ---
 const lightSpace = manifest.light_space || 'uv';   // 'screen' (one light image) | 'uv' (per-player atlas)
-const [imgBg, imgFg] = await Promise.all([
-  loadImage(DIR + manifest.background + _cb), loadImage(DIR + manifest.foreground + _cb)]);
+const [imgBg, imgOverlay] = await Promise.all([
+  loadImage(DIR + manifest.background + _cb),
+  manifest.overlay ? loadImage(DIR + manifest.overlay + _cb) : Promise.resolve(null)]);
 const imgLight = (lightSpace === 'screen' && manifest.light)
   ? await loadImage(DIR + manifest.light + _cb) : null;
 const atlasImgs = (lightSpace === 'uv')
@@ -84,20 +85,18 @@ const playerShadowImgs = await Promise.all(
   manifest.players.map(p => p.shadow ? loadImage(DIR + p.shadow + _cb) : null));
 const layerShadowImgs = await Promise.all(
   layers.map(L => L.shadow ? loadImage(DIR + L.shadow + _cb) : null));
-// scenery-occlusion masks (screen-space, r=1 where the entity is visible past the fixed scenery).
-// Players have one per arm variant ({classic,slim}); mesh-layers have one. Replaces the foreground.
-const loadMaskVariants = async (m) => {
+// per-entity FRONT matte (screen-space RGBA: STRAIGHT colour [from the white render] + alpha of
+// everything IN FRONT of the entity -- opaque scenery occludes (a->1), water/glass tints (a<1)). Players
+// have one per arm variant ({classic,slim}); mesh-layers have one. Composited OVER the relit entity.
+const loadForegroundVariants = async (m) => {
   if (!m) return null;
   const out = {};
   for (const v of Object.keys(m)) out[v] = await loadImage(DIR + m[v] + _cb);
   return out;
 };
-const playerMaskImgs = await Promise.all(manifest.players.map(p => loadMaskVariants(p.mask)));
-const layerMaskImgs = await Promise.all(
-  layers.map(L => (L.type === 'mesh' && L.mask) ? loadImage(DIR + L.mask + _cb) : null));
-// per-player screen-space TINT (colored multiply over the submerged part; absent = dry player)
-const playerTintImgs = await Promise.all(
-  manifest.players.map(p => p.tint ? loadImage(DIR + p.tint + _cb) : null));
+const playerForegroundImgs = await Promise.all(manifest.players.map(p => loadForegroundVariants(p.foreground)));
+const layerForegroundImgs = await Promise.all(
+  layers.map(L => (L.type === 'mesh' && L.foreground) ? loadImage(DIR + L.foreground + _cb) : null));
 
 // --- GL setup ---
 const canvas = document.getElementById('gl');
@@ -110,7 +109,7 @@ function prog(v, f) { const p = gl.createProgram(); gl.attachShader(p, sh(gl.VER
   gl.attachShader(p, sh(gl.FRAGMENT_SHADER, f)); gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw gl.getProgramInfoLog(p); return p; }
 
-// full-frame textured quad (background; reused for the straight-alpha foreground when blending)
+// full-frame textured quad (background; reused for the straight-alpha overlay when blending)
 const quadP = prog(
   `#version 300 es
    layout(location=0) in vec2 aPos; out vec2 vUv;
@@ -129,8 +128,8 @@ const meshP = prog(
      gl_Position=vec4(vScr*2.-1., aPx.z*2.-1., 1.); }`,
   `#version 300 es
    precision highp float;
-   uniform sampler2D uSkin; uniform sampler2D uLight; uniform sampler2D uMask; uniform sampler2D uTint;
-   uniform bool uUseLight; uniform bool uScreenLight; uniform bool uUseMask; uniform bool uUseTint; uniform int uPass;
+   uniform sampler2D uSkin; uniform sampler2D uLight; uniform sampler2D uForeground;
+   uniform bool uUseLight; uniform bool uScreenLight; uniform bool uUseForeground; uniform int uPass;
    in vec2 vUv; in vec2 vScr; out vec4 frag;
    // anti-aliased pixel-art sampling: snap UV to the texel CENTER (crisp interior) but ramp across the
    // texel SEAM over ~1 screen pixel (fwidth) -- the base texture keeps its hard pixels WITHOUT the
@@ -142,19 +141,21 @@ const meshP = prog(
      p=seam+clamp((p-seam)/max(fwidth(p),1e-5),-0.5,0.5); return texture(tx,p/ts);
    }
    void main(){
-     float m = uUseMask ? texture(uMask, vScr).r : 1.0;   // scenery-occlusion coverage (0..1)
-     vec4 s=texAA(uSkin,vUv);                   // premultiplied; un-premultiply below for the relight
-     float a = s.a * m;                         // fold the mask into alpha: soft occlusion edge,
-     if(a<0.004) discard;                       // and a thin sub-0.5 mask sliver fades, not cracks
-     if(uPass==0 && a<0.996) discard;           // opaque pass: only solid texels (write depth)
-     if(uPass==1 && a>=0.996) discard;          // transparent pass: mask edge + semi-transparent skin
+     vec4 s=texAA(uSkin,vUv);                   // skin, premultiplied
+     if(s.a<0.004) discard;                     // outside the entity silhouette
+     // FRONT matte: straight colour + alpha of everything in front of the entity. Where it FULLY
+     // covers (opaque scenery, a~1) reveal the background (it already holds that scenery) instead of
+     // drawing the entity; where partial (water/glass tint) composite it OVER the relit entity.
+     vec4 fr = uUseForeground ? texture(uForeground, vScr) : vec4(0.0);
+     if(fr.a>=0.996) discard;
+     if(uPass==0 && s.a<0.996) discard;         // opaque pass: solid skin texels (write depth)
+     if(uPass==1 && s.a>=0.996) discard;        // transparent pass: skin edge
      vec2 luv = uScreenLight ? vScr : vUv;
      vec3 l = uUseLight ? texture(uLight, luv).rgb*2.0 : vec3(1.0);
-     // tint: a colored multiply over the SUBMERGED part (1 above the waterline), so the relit
-     // skin shows tinted through the water instead of as a decal on top. Screen-space, skin-independent.
-     vec3 wt = uUseTint ? texture(uTint, vScr).rgb : vec3(1.0);
-     vec3 base = s.a>1e-4 ? s.rgb/s.a : vec3(0.0);   // un-premultiply -> straight-alpha skin color
-     frag=vec4(base*l*wt, a);                    // straight alpha (SRC_ALPHA blend on the semi pass)
+     vec3 base = s.a>1e-4 ? s.rgb/s.a : vec3(0.0);   // un-premultiply -> straight skin colour
+     vec3 relit = base*l;                            // relit skin (the tint is in the foreground now)
+     // foreground (STRAIGHT colour + alpha) OVER the relit entity: out = fr.rgb*fr.a + (1-fr.a)*relit_premult
+     frag = vec4(fr.rgb*fr.a + (1.0-fr.a)*relit*s.a, fr.a + (1.0-fr.a)*s.a);
    }`);
 
 // depth-aware sprite: a straight-alpha quad that writes per-pixel gl_FragDepth (decoded from its
@@ -195,7 +196,7 @@ function upload(t, srcEl, premult) {
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !!premult);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcEl);
 }
-const tBg = tex(), tFg = tex(), tLight = tex(false);   // tLight: LINEAR screen-space light
+const tBg = tex(), tOverlay = tex(), tLight = tex(false);   // tLight: LINEAR screen-space light
 const tAtlas = atlasImgs.map(img => { const t = tex(false); upload(t, img); return t; });  // LINEAR
 const tSkins = skins.map(img => { const t = tex(false); upload(t, img, true); return t; });  // LINEAR + PREMULT (texel-AA)
 const mkTex = (nearest) => (img) => { if (!img) return null; const t = tex(nearest); upload(t, img); return t; };
@@ -208,11 +209,10 @@ const tLayerDepth = layerDepthImgs.map(mkTex(true));    // NEAREST per-sprite de
 const mkShadow = (img) => { if (!img) return null; const t = tex(false); upload(t, img); return t; };
 const tPlayerShadow = playerShadowImgs.map(mkShadow);   // multiply ratio, LINEAR
 const tLayerShadow = layerShadowImgs.map(mkShadow);
-const tPlayerMask = playerMaskImgs.map(m => m   // {variant: tex} screen-space scenery-occlusion clip
+const tPlayerForeground = playerForegroundImgs.map(m => m   // {variant: tex} foreground matte (straight RGBA)
   ? Object.fromEntries(Object.entries(m).map(([v, img]) => [v, mkTex(false)(img)])) : null);
-const tLayerMask = layerMaskImgs.map(mkTex(false));
-const tPlayerTint = playerTintImgs.map(mkTex(false));   // LINEAR colored multiply (submerged)
-upload(tBg, imgBg); upload(tFg, imgFg);
+const tLayerForeground = layerForegroundImgs.map(mkTex(false));
+upload(tBg, imgBg); if (imgOverlay) upload(tOverlay, imgOverlay);
 if (imgLight) upload(tLight, imgLight);
 
 // SHADOW ACCUMULATION BUFFER: the optional per-entity shadows are MULTIPLY ratios (~1 outside the
@@ -276,20 +276,17 @@ const playerOn = (i) => { const e = document.getElementById('ck_player_' + i); r
 
 // shared mesh draw (players + mesh-type layers): relit skin/tex * light * 2, depth-tested.
 // `ranges` = the tri ranges to draw (per part, so disabled overlay parts are simply omitted).
-function drawMesh(ranges, skinTex, atlasTex, screenLight, maskTex, tintTex) {
+function drawMesh(ranges, skinTex, atlasTex, screenLight, foregroundTex) {
   if (!ranges.length) return;
   gl.useProgram(meshP); gl.bindVertexArray(meshVao);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uMask'), 2);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uTint'), 3);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uForeground'), 2);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), ck('ck_li') ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uScreenLight'), screenLight ? 1 : 0);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseMask'), (maskTex && ck('ck_mask')) ? 1 : 0);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseTint'), (tintTex && ck('ck_tint')) ? 1 : 0);
-  if (maskTex) { gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, maskTex); }
-  if (tintTex) { gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, tintTex); }
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseForeground'), (foregroundTex && ck('ck_foreground')) ? 1 : 0);
+  if (foregroundTex) { gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, foregroundTex); }
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, screenLight ? tLight : atlasTex);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, skinTex);
   const uPass = gl.getUniformLocation(meshP, 'uPass');
@@ -301,7 +298,7 @@ function drawMesh(ranges, skinTex, atlasTex, screenLight, maskTex, tintTex) {
   drawAll();
   // pass 1: semi-transparent texels -> blend over what's behind, NO depth write (don't occlude)
   gl.uniform1i(uPass, 1);
-  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);   // premultiplied
   drawAll();
   gl.depthMask(true); gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST);
 }
@@ -321,10 +318,9 @@ function playerRanges(p, i) {                         // base + enabled overlays
 }
 function drawPlayer(i) {
   const p = manifest.players[i];
-  const mask = tPlayerMask[i] ? tPlayerMask[i][playerVariant(i)] : null;
+  const foreground = tPlayerForeground[i] ? tPlayerForeground[i][playerVariant(i)] : null;
   drawMesh(playerRanges(p, i), tSkins[i],
-           lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen', mask,
-           tPlayerTint[i]);
+           lightSpace === 'screen' ? null : tAtlas[i], lightSpace === 'screen', foreground);
 }
 function drawDepthSprite(i) {                         // straight-alpha quad, per-pixel gl_FragDepth
   const L = layers[i];
@@ -343,7 +339,7 @@ function drawDepthSprite(i) {                         // straight-alpha quad, pe
 }
 function drawLayer(i) {                               // mesh -> geometry; sprite -> depth quad / flat
   const L = layers[i];
-  if (L.type === 'mesh') { if (tLayerTex[i] && tLayerAtlas[i]) drawMesh([L.tri_range], tLayerTex[i], tLayerAtlas[i], false, tLayerMask[i]); }
+  if (L.type === 'mesh') { if (tLayerTex[i] && tLayerAtlas[i]) drawMesh([L.tri_range], tLayerTex[i], tLayerAtlas[i], false, tLayerForeground[i]); }
   else if (tLayerDepth[i]) drawDepthSprite(i);       // per-pixel depth-tested against the meshes
   else if (tLayerSprite[i]) blitQuadBlend(tLayerSprite[i], true);   // fallback: whole-object painter order
 }
@@ -379,10 +375,9 @@ function draw() {
     else if (layerOn(it.i)) drawLayer(it.i);         // mesh (geometry) or sprite (quad)
   }
 
-  // foreground OFF by default in static: the per-entity scenery mask already occludes each entity
-  // (revealing the bg, which contains that front scenery). Kept as an opt-in for a future
-  // semi-transparent-front layer (e.g. flames over an optional object).
-  if (ck('ck_fg')) blitQuadBlend(tFg);
+  // overlay (rain/glare in front of EVERYTHING) -> composited on top, on by default when present.
+  // (The per-entity foreground matte already handles opaque scenery occluding each entity.)
+  if (ck('ck_overlay') && manifest.overlay) blitQuadBlend(tOverlay);
 }
 
 // swap a player's skin / a mesh-layer's texture at runtime (file input, or __dbg.setSkin)
@@ -409,9 +404,9 @@ function setLayerTex(i, source) { if (tLayerTex[i]) { upload(tLayerTex[i], sourc
     lab.appendChild(inp); box.appendChild(lab);
   });
 }
-// foreground is an OVERLAY (rain/glare in front) -> on by default; else the legacy opaque fg -> off
-document.getElementById('ck_fg').checked = !!manifest.foreground_overlay;
-for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_sh', 'ck_mask', 'ck_tint', 'ck_fg'])
+// overlay (rain/glare in front of everything) -> on by default when the manifest has one
+document.getElementById('ck_overlay').checked = !!manifest.overlay;
+for (const id of ['ck_bg', 'ck_pl', 'ck_li', 'ck_sh', 'ck_foreground', 'ck_overlay'])
   document.getElementById(id).addEventListener('change', draw);
 
 // per-layer toggles (one checkbox each, default on), labelled by the layer's object name
