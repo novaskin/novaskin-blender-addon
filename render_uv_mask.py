@@ -3837,7 +3837,8 @@ def _static_render_foreground(players, mesh_layers, all_layer_mesh_names, out_di
         # sil-diff>0 would leak a spurious overlay); clamping the max to sil (=0 outside) zeroes that.
         a = np.clip(sil - diff, 0.0, sil)
         fr = np.empty((Cw3.shape[0], 4), 'float32')
-        fr[:, :3] = Cw3                                         # STRAIGHT colour (NOT premultiplied)
+        fr[:, :3] = _to_display(Cw[:, :3])                     # DISPLAY-encode the colour to MATCH the bg
+                                                               #   (linear Cw read wrong over the display bg)
         fr[:, 3] = a
         _save_image(fr.reshape(-1), W, H, os.path.join(out_dir, fn), file_format='WEBP', lossless=True)
         return fn
