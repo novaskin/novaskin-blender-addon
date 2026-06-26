@@ -148,6 +148,7 @@ UV_DEPTH_IN_BLUE = True
 # player casts on the scenery (ratio vs the clean scene). Independent toggles.
 EXPORT_ILLUM = True
 EXPORT_SHADOW = True
+EXPORT_FOREGROUND = True   # per-player FOREGROUND matte (transmission tint over the masked player)
 # Compute the shadow ratio in DISPLAY space (view-transformed, like background.png)
 # instead of linear, so multiplying it onto the (display) background in a 2D/sRGB canvas
 # reproduces the render -- a LINEAR ratio multiplied in display space over-darkens. True for
@@ -2581,7 +2582,7 @@ def _render_steps(players, op=None):
                        + (1 if (_layer_mode(g) in {"TEXTURE", "PLAYER"} and len(g["meshes"]) == 1) else 0)  # UV
                        for g in layer_groups))
                 if layer_groups else 0)                            # optional layers
-             + len(players) * n_variants                           # foreground matte (per player/variant)
+             + (len(players) * n_variants if EXPORT_FOREGROUND else 0)   # foreground matte (per player/variant)
              + (1 if overlay_groups else 0)                        # overlay (rain/glare)
              + 1)                                                  # manifest
     total = max(total, 1)
@@ -2732,9 +2733,11 @@ def _render_steps(players, op=None):
         # 6a) per-player FOREGROUND matte (occlusion + transmission tint), shared with the mesh exporter.
         # Legacy keeps the MASK for OPAQUE occlusion; the viewer composites only the TRANSMISSIVE part
         # (a<1, water/glass) over the masked player. Flat <label>_foreground_<variant>.webp at the root.
-        all_layer_mesh_names = {m.name for m in layer_meshes}
-        foregrounds = yield from _static_render_foreground(players, [], all_layer_mesh_names,
-                                                           out_dir=_abs(OUT_DIR), prog=prog)
+        foregrounds = {}
+        if EXPORT_FOREGROUND:
+            all_layer_mesh_names = {m.name for m in layer_meshes}
+            foregrounds = yield from _static_render_foreground(players, [], all_layer_mesh_names,
+                                                               out_dir=_abs(OUT_DIR), prog=prog)
         # 6b) OVERLAY layers (rain / glare): rendered ALONE -> overlay.webp, composited on top of everything
         overlay_file = None
         if overlay_groups:
@@ -4588,6 +4591,7 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
     export_backface_uv: BoolProperty(name="Back Faces", default=True)
     export_illum: BoolProperty(name="Illum", default=True)
     export_shadow: BoolProperty(name="Shadow", default=True)
+    export_foreground: BoolProperty(name="Foreground (tint)", default=True)
     composite_base_layer: BoolProperty(name="Base Layer Composite", default=True)
     export_background: BoolProperty(name="Background (no players/layers)", default=True)
     # Per-step toggles for the static "Export Mesh (v2)" export. Turning one OFF skips that (slow)
@@ -4663,6 +4667,7 @@ def _apply_settings(scene, draft=False):
     g["EXPORT_BACKFACE_UV"] = st.export_backface_uv
     g["EXPORT_ILLUM"] = st.export_illum
     g["EXPORT_SHADOW"] = st.export_shadow
+    g["EXPORT_FOREGROUND"] = st.export_foreground
     g["COMPOSITE_BASE_LAYER"] = st.composite_base_layer
     g["EXPORT_BACKGROUND"] = st.export_background
     g["STATIC_DO_ATLAS"] = st.static_atlas
@@ -5126,6 +5131,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                 box.prop(st, "export_backface_uv")
                 box.prop(st, "export_illum")
                 box.prop(st, "export_shadow")
+                box.prop(st, "export_foreground")
                 box.prop(st, "composite_base_layer")
                 box.prop(st, "export_background")
 
