@@ -2767,13 +2767,12 @@ def render_all(op=None, draft=False):
                 op.report({'ERROR'}, e)
         return None
     print(f"Players found: {[p['label'] for p in players]}")
-    gen = _render_steps(players, op=op)
     results = None
     try:
-        while True:
-            next(gen)
-    except StopIteration as e:
-        results = e.value
+        # _drain_render runs the blocking renders the reused mesh-exporter passes yield as _RENDER
+        # (_static_render_images / _render_combined_array_gen); a naive next() loop skips them,
+        # leaving the background + per-entity shadows empty (the modal operator handles _RENDER itself).
+        results = _drain_render(_render_steps(players, op=op))
     except Exception as ex:
         # an abort (e.g. depth range unavailable) -- the generator's finally already
         # restored the scene; report cleanly instead of a raw Python traceback.
