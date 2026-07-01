@@ -4578,10 +4578,15 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         name="EXR Codec",
         items=[(c, c, "") for c in ('ZIP', 'ZIPS', 'PIZ', 'PXR24', 'RLE', 'NONE', 'DWAA', 'DWAB')],
         default='ZIP')
-    export_mesh: BoolProperty(
-        name="Export Mesh (v2)", default=True,
-        description="Export the interactive 3D wallpaper: the characters as meshes you can re-skin "
-                    "live, with toggleable scenery layers. Turn off for the older flat-image export")
+    export_format: EnumProperty(
+        name="Format", default='MESH',
+        items=[('TEXTURE_UV', "Texture UV",
+                "Per-part UV maps + occlusion masks + screen-space light: the players and "
+                "retexturable layers as flat images (often the best final skin render)"),
+               ('MESH', "Mesh",
+                "Interactive 3D wallpaper: the characters as meshes you can re-skin live, with "
+                "toggleable scenery layers")],
+        description="How the players and retexturable layers are exported")
     export_backface_uv: BoolProperty(name="Back Faces", default=True)
     export_illum: BoolProperty(name="Illum", default=True)
     export_shadow: BoolProperty(name="Shadow", default=True)
@@ -5112,8 +5117,8 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         if tab == 'EXPORT':
             box = layout.box()
             box.label(text="Layer Options", icon='RENDERLAYERS')
-            box.prop(st, "export_mesh")           # mesh v2 (new) vs legacy per-part
-            if st.export_mesh:
+            box.prop(st, "export_format")         # Texture UV (legacy per-part) vs Mesh (v2)
+            if st.export_format == 'MESH':
                 col = box.column(align=True)
                 col.label(text="Steps (off = reuse previous export):")
                 col.prop(st, "static_background")
@@ -5122,18 +5127,19 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                 col.prop(st, "static_shadows")
                 col.prop(st, "static_sprites")
             else:
-                box.prop(st, "export_backface_uv")
-                box.prop(st, "export_illum")
-                box.prop(st, "export_shadow")
-                box.prop(st, "export_foreground")
-                box.prop(st, "composite_base_layer")
-                box.prop(st, "export_background")
+                col = box.column(align=True)
+                col.prop(st, "export_backface_uv")
+                col.prop(st, "export_illum")
+                col.prop(st, "export_shadow")
+                col.prop(st, "export_foreground")
+                col.prop(st, "composite_base_layer")
+                col.prop(st, "export_background")
 
             box = layout.box()
             box.label(text="Quality", icon='SETTINGS')
             box.prop(st, "illum_samples")
             box.label(text="render samples for the whole export", icon='LIGHT')
-            if st.export_mesh:
+            if st.export_format == 'MESH':
                 box.prop(st, "atlas_res")         # mesh v2 UV light-atlas size
 
             box = layout.box()
@@ -5148,7 +5154,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                 box.label(text="Render", icon='RENDER_STILL')
                 col = box.column()
                 col.scale_y = 1.4
-                if st.export_mesh:
+                if st.export_format == 'MESH':
                     col.operator("render.novaskin_static", text="Render", icon='MESH_DATA')
                 else:
                     col.operator("render.novaskin", text="Render",
