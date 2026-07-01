@@ -1,11 +1,11 @@
 # NovaSkin Export
 
 A Blender add-on that exports a scene built with the **Thomas Rig Legacy** Minecraft rig
-so the [NovaSkin wallpaper tool](https://minecraft.novaskin.me/wallpapers/tools/blender/)
-can re-texture the players with **any skin, directly in the browser** — without
-re-rendering. One click renders everything the web tool needs: the background, each
-player's data layers (UV/mask/light/shadow), optional toggleable scenery layers, and an
-experimental animated mode.
+as an **interactive 3D wallpaper** for the
+[NovaSkin wallpaper tool](https://minecraft.novaskin.me/wallpapers/tools/blender/). The
+characters ship as re-skinnable meshes with a baked light atlas, so the browser can drop
+in **any skin**, relight it, switch **classic/slim** arms and toggle scenery — all live,
+without re-rendering. One click renders everything the web tool needs.
 
 <p align="center">
   <img src="blender-panel.png" alt="NovaSkin Export panel in the 3D Viewport sidebar"
@@ -43,31 +43,30 @@ copies the file — editing the original does not update it).
 Open the **3D Viewport sidebar** (<kbd>N</kbd>) → **NovaSkin** tab:
 
 1. Check the **Rig** section — it lists the players detected in the scene.
-2. Hit **Render Draft (fast preview)** first: a quick 50 %-resolution pass to check
-   framing and your marked layers.
-3. Hit **Render for NovaSkin** for the real export.
-4. Use **Open Output Folder** to grab the results, and the **Open Wallpaper Tool**
-   button to jump to the web tool.
+2. Hit **Render**. That's it — the add-on exports the interactive **Mesh** wallpaper.
+3. Use **Open Output Folder** to grab the results, and **Open Wallpaper Tool** to jump to
+   the web tool and drop in a skin.
 
-Everything also lives in the top bar under **Render → Render for NovaSkin**, and
-scripts can call `bpy.ops.render.novaskin()`.
+Everything also lives in the top bar under **Render → Render for NovaSkin (Mesh)**, and
+scripts can call `bpy.ops.render.novaskin_static()`.
 
 While it runs you get a progress bar in the panel (plus the viewport header and status
-bar). Cancel any time with the **Cancel** button or <kbd>Esc</kbd> — the scene is always
-restored to exactly how it was, even on cancel or error. The UI stays responsive between
-steps, but each render step still blocks briefly (a Blender limitation).
+bar). Cancel any time with **Cancel** or <kbd>Esc</kbd> — the scene is always restored to
+exactly how it was, even on cancel or error. The UI stays responsive between steps, but
+each render step still blocks briefly (a Blender limitation).
 
 ### Panel options
 
-- **Output** — destination folder and the UV file format (`PNG` default; `WebP` is
-  lossless and ~60 % smaller; `EXR` for float pipelines).
-- **Layers** — which data layers to export: back-face UVs, per-player light (*Illum*),
-  cast *Shadow*, the *Base Layer Composite*, and the *Background* image.
-- **Quality** — light/shadow render samples, and the light/shadow file format
-  (JPEG/WebP/PNG + quality).
-- **Rig** — *Fix Hat Position and Scale* snaps the rig's hat onto the head at the
-  Minecraft proportions before exporting. The rig's own "Second layer" toggle does
-  **not** matter: overlays (jacket/sleeves/pants) are always exported.
+- **Layer Options → Steps** — each export step (*Background*, *Foreground*, *Light Atlas*,
+  *Shadows*, *Sprites*) has a checkbox. Turn one **off** to skip that (slow) pass and reuse
+  the asset from your previous export — handy when you only need to re-render one thing.
+  The geometry and `manifest.json` always run.
+- **Quality** — render samples for the whole export, and the light-atlas resolution
+  (*Atlas res*).
+- **Output** — destination folder.
+- **Rig** (Layers tab) — *Fix Hat Position and Scale* snaps the hat onto the head at the
+  Minecraft proportions. The rig's own "Second layer" toggle does **not** matter: overlays
+  (hat/jacket/sleeves/pants) are always exported and toggled per-part in the browser.
 
 ### Optional layers
 
@@ -79,38 +78,42 @@ build) with the **“Mark as Optional Layer”** button:
 - with **nothing selected** — marks the **active collection** (all its meshes become one
   layer). The panel shows which collection is active.
 
-Marked layers are listed in the panel with an **✕** to remove them. Player rigs are
-refused. Each layer is rendered by itself (correctly occluded by the scenery) plus the
-shadow it casts, so the web tool can toggle it on/off.
+Each optional layer is exported so the web tool can toggle it on/off, with the shadow it
+casts. Per layer you can pick how it's exported — a flat **Sprite**, a re-skinnable
+**Texture** mesh, or a full **Player**. Player rigs can't be marked as layers.
 
-### Animated export (beta)
+### Advanced: legacy & animated exports
 
-The **Animated (beta)** section exports the scene's frame range as an animated wallpaper:
-three WebM videos plus the players' animated geometry (~1 MB for 15 s), re-textured live
-in the browser. Base layer only, classic arms; optional-layer marks are ignored (those
-objects render as part of the scenery). Encoding needs `ffmpeg` installed — without it
-the PNG sequences and an `encode.sh` script are left for you to run. Start with **Export
-Animation Draft** to preview. ⚠️ A full export renders 3 passes per frame — expect it to
-take a while.
+Two extra export modes are **off by default**; enable them under
+`Edit > Preferences > Add-ons > NovaSkin Export`:
+
+- **Legacy Texture UV export** — the classic per-part UV / occlusion-mask / light / shadow
+  image export (flat images instead of a mesh). Enabling it adds a **Format** selector
+  (Texture UV / Mesh) to the sidebar plus a **Render Draft** button for quick previews.
+- **Animated export (experimental)** — exports the scene's frame range as an animated
+  wallpaper: video passes plus the players' animated geometry (~1 MB for 15 s), re-textured
+  live in the browser. Base layer only, classic arms. Needs `ffmpeg` (without it, PNG
+  sequences and an `encode.sh` are left for you to run). Enabling it shows an **Animation**
+  tab. ⚠️ A full export renders several passes per frame — expect it to take a while.
 
 ## What you get
 
-A `novaskin/` folder next to your `.blend`:
+A `novaskin/` folder next to your `.blend`. The **Mesh** export writes:
 
-- `background.png` — the scene without players;
-- one folder per player (`player1/`, `player2/`, …) with its UV maps, masks, light and
-  shadow images in both arm variants (classic/slim);
-- `layers/` — your optional layers;
-- `manifest.json` — everything the web tool needs to put it together;
-- `animated/` — the animated export, when used.
+- `mesh.bin` + `positions.bin` — the characters' geometry (both arm variants);
+- a per-character **light atlas**, **shadow** and **foreground** image;
+- your **optional layers** and a **background** image;
+- `manifest.json` — everything the web tool needs to put it together.
+
+*(The legacy Texture UV export instead writes a folder per player — `player1/`,
+`player2/`, … — with its UV/mask/light/shadow images, plus `layers/` and `background`.)*
 
 Load that folder in the wallpaper tool and swap skins freely.
 
-> **Integrating the output yourself?** All file formats, channel layouts and the
-> compositing math are documented in [docs/output-format.md](docs/output-format.md).
-> The animated pipeline design lives in
-> [docs/animated-export-plan.md](docs/animated-export-plan.md), with a reference web
-> player in [prototype/](prototype/).
+> **Integrating the output yourself?** The mesh format is described in
+> [docs/static-mesh-plan.md](docs/static-mesh-plan.md); the legacy image format, channel
+> layouts and compositing math in [docs/output-format.md](docs/output-format.md); and the
+> animated pipeline in [docs/animated-export-plan.md](docs/animated-export-plan.md).
 
 ## For developers
 
