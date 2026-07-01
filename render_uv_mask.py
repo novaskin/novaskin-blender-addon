@@ -626,13 +626,12 @@ def _hide_bone_shapes(scene):
     so hide them for the whole export. Collects every pose-bone custom_shape AND any renderable
     object that lives ONLY in a bone-shape collection. Returns the objects to un-hide afterwards."""
     widgets = set()
-    for o in scene.objects:
+    pref = tuple(p.lower() for p in BONE_SHAPE_COLLECTION_PREFIXES)
+    for o in scene.objects:                        # single pass: bone custom-shapes + shape-only objects
         if o.type == 'ARMATURE' and o.pose:
             for pb in o.pose.bones:
                 if pb.custom_shape is not None:
                     widgets.add(pb.custom_shape)
-    pref = tuple(p.lower() for p in BONE_SHAPE_COLLECTION_PREFIXES)
-    for o in scene.objects:
         colls = o.users_collection
         if colls and all(c.name.lower().startswith(pref) for c in colls):
             widgets.add(o)
@@ -1474,41 +1473,35 @@ def export_character_mask_variant(player, vname, vval, sess, all_players=None):
     sess.restore_visibility()
     arm, saved_arm = _set_arm_style(player, vval)   # switch classic/slim (master Slim main)
 
-    # Hide the OTHER players: the mask must be occluded only by the scenery, not by other
-    # players. Mute their hide_render drivers (otherwise the driver would re-show them) and
-    # set hide_render=True. The target player's armature keeps its drivers active (so its
-    # arm variant is preserved). Restored in the finally block.
-    muted = []
-    hidden = []
-    if all_players:
-        others = set(o.name for op in all_players if op is not player for o in op["char_all"])
-        for o in s.objects:
-            if o.name in others:
-                if o.animation_data:
-                    for d in o.animation_data.drivers:
-                        if d.data_path == "hide_render" and not d.mute:
-                            d.mute = True
-                            muted.append(d)
-                hidden.append((o, o.hide_render))
-                o.hide_render = True
-        bpy.context.view_layer.update()
-    # transmissive scenery (water/glass) must NOT cut the mask: the player shows THROUGH it and the
-    # foreground tints it, so hide it for the Object Index pass -- only OPAQUE scenery occludes.
+    # ONE pass over the scene sets everything the Object Index mask pass needs:
+    #  - pass_index = PLAYER_INDEX for the target player's parts, 0 for everything else;
+    #  - hide the OTHER players (mute their hide_render drivers first, else the driver would
+    #    re-show them) so the mask is occluded only by scenery, not by other players -- the target
+    #    player's armature keeps its drivers active, so its arm variant is preserved;
+    #  - hide transmissive scenery (water/glass): the player shows THROUGH it and the foreground
+    #    tints it, so only OPAQUE scenery may occlude the mask.
+    # Everything is restored in the finally block.
     char_names = set(o.name for o in player["char_all"])
-    trans_hidden = [o for o in s.objects
-                    if o.type == 'MESH' and o.name not in char_names and not o.hide_render
-                    and _obj_is_transmissive(o)]
-    for o in trans_hidden:
-        o.hide_render = True
-    if trans_hidden:
+    others = set(o.name for op in (all_players or []) if op is not player
+                 for o in op["char_all"])
+    muted, hidden, trans_hidden = [], [], []
+    for o in s.objects:
+        o.pass_index = PLAYER_INDEX if o.name in char_names else 0
+        if o.name in others:
+            if o.animation_data:
+                for d in o.animation_data.drivers:
+                    if d.data_path == "hide_render" and not d.mute:
+                        d.mute = True
+                        muted.append(d)
+            hidden.append((o, o.hide_render))
+            o.hide_render = True
+        elif (o.type == 'MESH' and o.name not in char_names and not o.hide_render
+              and _obj_is_transmissive(o)):
+            o.hide_render = True
+            trans_hidden.append(o)
+    if hidden or trans_hidden:
         bpy.context.view_layer.update()
     try:
-        for o in s.objects:
-            o.pass_index = 0
-        names = set(o.name for o in player["char_all"])
-        for o in s.objects:
-            if o.name in names:
-                o.pass_index = PLAYER_INDEX
         sess.vl.use_pass_object_index = True
         print(f"[MASK] {player['label']} / {vname}")
         arr, W, H = sess.render_pass('Object Index', 'CYCLES', MASK_SAMPLES, MASK_RES_PCT)
