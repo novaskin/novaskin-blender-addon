@@ -5096,10 +5096,43 @@ class OBJECT_OT_novaskin_layer_remove(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _legacy_export_enabled(context):
+    """Whether the legacy Texture UV export is exposed. Off by default; toggled in the add-on
+    preferences (Edit > Preferences > Add-ons > NovaSkin Export). When off, only the Mesh (v2)
+    export is offered; the legacy per-part UV export stays registered for advanced use."""
+    try:
+        return bool(context.preferences.addons[__name__].preferences.enable_legacy_export)
+    except (KeyError, AttributeError):
+        return False
+
+
+class NovaSkinAddonPreferences(bpy.types.AddonPreferences):
+    bl_idname = __name__
+
+    enable_legacy_export: BoolProperty(
+        name="Enable legacy Texture UV export",
+        default=False,
+        description="Show the export Format selector (Texture UV vs Mesh) in the NovaSkin sidebar "
+                    "and the Render menu. When off, only the interactive Mesh (v2) export is "
+                    "offered; the legacy per-part UV export still works, for advanced or "
+                    "backward-compatible use")
+
+    def draw(self, context):
+        col = self.layout.column()
+        col.prop(self, "enable_legacy_export")
+        col.label(text="When off, NovaSkin exports the interactive Mesh (v2) format only.",
+                  icon='INFO')
+
+
 def _menu_draw(self, context):
-    self.layout.operator(RENDER_OT_novaskin.bl_idname, icon='RENDER_STILL').draft = False
-    self.layout.operator(RENDER_OT_novaskin.bl_idname, text="Render Draft (NovaSkin preview)",
-                         icon='MOD_FLUID').draft = True
+    layout = self.layout
+    layout.operator(RENDER_OT_novaskin_static.bl_idname,
+                    text="Render for NovaSkin (Mesh)", icon='MESH_DATA')
+    if _legacy_export_enabled(context):
+        layout.operator(RENDER_OT_novaskin.bl_idname,
+                        text="Render for NovaSkin (Texture UV)", icon='RENDER_STILL').draft = False
+        layout.operator(RENDER_OT_novaskin.bl_idname, text="Render Draft (Texture UV preview)",
+                        icon='MOD_FLUID').draft = True
 
 
 class VIEW3D_PT_novaskin(bpy.types.Panel):
@@ -5137,10 +5170,15 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         tab = st.ui_tab
 
         if tab == 'EXPORT':
+            legacy = _legacy_export_enabled(context)
+            # Format is user-selectable only when legacy is enabled in the add-on prefs; otherwise
+            # force the Mesh (v2) export (the stored export_format is ignored).
+            fmt = st.export_format if legacy else 'MESH'
             box = layout.box()
             box.label(text="Layer Options", icon='RENDERLAYERS')
-            box.prop(st, "export_format")         # Texture UV (legacy per-part) vs Mesh (v2)
-            if st.export_format == 'MESH':
+            if legacy:
+                box.prop(st, "export_format")     # Texture UV (legacy per-part) vs Mesh (v2)
+            if fmt == 'MESH':
                 col = box.column(align=True)
                 col.label(text="Steps (off = reuse previous export):")
                 col.prop(st, "static_background")
@@ -5161,7 +5199,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             box.label(text="Quality", icon='SETTINGS')
             box.prop(st, "illum_samples")
             box.label(text="render samples for the whole export", icon='LIGHT')
-            if st.export_format == 'MESH':
+            if fmt == 'MESH':
                 box.prop(st, "atlas_res")         # mesh v2 UV light-atlas size
 
             box = layout.box()
@@ -5176,7 +5214,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                 box.label(text="Render", icon='RENDER_STILL')
                 col = box.column()
                 col.scale_y = 1.4
-                if st.export_format == 'MESH':
+                if fmt == 'MESH':
                     col.operator("render.novaskin_static", text="Render", icon='MESH_DATA')
                 else:
                     col.operator("render.novaskin", text="Render",
@@ -5260,8 +5298,8 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                       icon='INFO')
 
 
-_classes = (NovaSkinSettings, RENDER_OT_novaskin, RENDER_OT_novaskin_animated,
-            RENDER_OT_novaskin_static, RENDER_OT_novaskin_cancel,
+_classes = (NovaSkinAddonPreferences, NovaSkinSettings, RENDER_OT_novaskin,
+            RENDER_OT_novaskin_animated, RENDER_OT_novaskin_static, RENDER_OT_novaskin_cancel,
             OBJECT_OT_novaskin_layer_toggle, OBJECT_OT_novaskin_layer_remove,
             VIEW3D_PT_novaskin)
 
