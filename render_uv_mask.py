@@ -1492,6 +1492,16 @@ def export_character_mask_variant(player, vname, vval, sess, all_players=None):
                 hidden.append((o, o.hide_render))
                 o.hide_render = True
         bpy.context.view_layer.update()
+    # transmissive scenery (water/glass) must NOT cut the mask: the player shows THROUGH it and the
+    # foreground tints it, so hide it for the Object Index pass -- only OPAQUE scenery occludes.
+    char_names = set(o.name for o in player["char_all"])
+    trans_hidden = [o for o in s.objects
+                    if o.type == 'MESH' and o.name not in char_names and not o.hide_render
+                    and _obj_is_transmissive(o)]
+    for o in trans_hidden:
+        o.hide_render = True
+    if trans_hidden:
+        bpy.context.view_layer.update()
     try:
         for o in s.objects:
             o.pass_index = 0
@@ -1513,6 +1523,8 @@ def export_character_mask_variant(player, vname, vval, sess, all_players=None):
         _save_image(out.reshape(-1), W, H, path)
         return path, _topleft_bbox(m >= 0.5, W, H), W, H
     finally:
+        for o in trans_hidden:
+            o.hide_render = False
         for d in muted:
             d.mute = False
         for o, hr in hidden:
@@ -4582,7 +4594,7 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         name="Format", default='MESH',
         items=[('TEXTURE_UV', "Texture UV",
                 "Per-part UV maps + occlusion masks + screen-space light: the players and "
-                "retexturable layers as flat images (often the best final skin render)"),
+                "retexturable layers as flat images"),
                ('MESH', "Mesh",
                 "Interactive 3D wallpaper: the characters as meshes you can re-skin live, with "
                 "toggleable scenery layers")],
