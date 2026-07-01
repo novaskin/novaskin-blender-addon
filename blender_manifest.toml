@@ -3,7 +3,7 @@ schema_version = "1.0.0"
 id = "novaskin_export"
 version = "1.3.0"
 name = "NovaSkin Export"
-tagline = "Export per-part UV/mask/illum/shadow for Minecraft skins"
+tagline = "Export Minecraft scenes as re-skinnable browser wallpapers"
 maintainer = "saviski"
 type = "add-on"
 
