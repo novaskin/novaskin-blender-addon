@@ -2715,7 +2715,7 @@ def _render_steps(players, op=None):
         bpy.context.view_layer.update()   # restore the FULL scene so the shared session snapshots it visible
         imgs = yield from _static_render_images(players, out_dir=_abs(OUT_DIR), groups=layer_groups,
                                                 mesh_layers=mesh_layers, prog=prog,
-                                                do_bg=True, do_shadows=EXPORT_SHADOW)
+                                                do_bg=True, do_shadows=EXPORT_SHADOW, sub=True)
         shadows = imgs.get("shadows") or {}
         for p in players:
             p["shadow"] = shadows.get(p["label"])
@@ -2725,7 +2725,7 @@ def _render_steps(players, op=None):
         if sprite_groups:
             sprite_infos = yield from _static_render_layers(
                 players, sprite_groups, all_layer_mesh_names, 0.0, 1.0,    # zmin=0,zmax=1 -> own-range depth
-                out_dir=_abs(OUT_DIR), prog=prog)
+                out_dir=_abs(OUT_DIR), prog=prog, sub=True)
             for si in sprite_infos:
                 layer_infos.append({"name": si["name"], "object": si["object"], "kind": si["kind"],
                                     "image": si["image"], "depth": si["depth"],
@@ -2740,7 +2740,7 @@ def _render_steps(players, op=None):
         foregrounds = {}
         if EXPORT_FOREGROUND:
             foregrounds = yield from _static_render_foreground(players, [], all_layer_mesh_names,
-                                                               out_dir=_abs(OUT_DIR), prog=prog)
+                                                               out_dir=_abs(OUT_DIR), prog=prog, sub=True)
         # 6b) OVERLAY layers (rain / glare): rendered ALONE -> overlay.webp, composited on top of everything
         overlay_file = None
         if overlay_groups:
@@ -3271,7 +3271,7 @@ def _static_write_geometry(players, out_dir=None, mesh_layers=None):
 
 
 def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None, prog=None,
-                          do_bg=True, do_shadows=True, existing=None):
+                          do_bg=True, do_shadows=True, existing=None, sub=False):
     """Render the static scenery images for the CURRENT frame, matching the DENSE mesh (AntiLag
     off, no simplify), plus a TOGGLEABLE per-entity shadow.
       * `background.<ext>` = the CLEAN scene -- every player AND optional layer hidden (no baked
@@ -3433,7 +3433,12 @@ def _static_render_images(players, out_dir=None, groups=None, mesh_layers=None, 
             r = 1.0 - dark
             sbuf = np.ones((r.shape[0], 4), 'float32')
             sbuf[:, :3] = r[:, None]
-            fn = _layer_safe_name(name) + "_shadow.webp"
+            if sub:   # legacy: player -> <label>/shadow.webp, sprite layer -> layers/<name>_shadow.webp
+                fn = (f"{name}/shadow.webp" if kind == "player"
+                      else f"layers/{_layer_safe_name(name)}_shadow.webp")
+                os.makedirs(os.path.join(out_dir, os.path.dirname(fn)), exist_ok=True)
+            else:
+                fn = _layer_safe_name(name) + "_shadow.webp"
             _save_image(sbuf.reshape(-1), rW, rH, os.path.join(out_dir, fn),
                         file_format='WEBP', quality=STATIC_BG_QUALITY)
             shadows[name] = fn
@@ -3618,7 +3623,7 @@ def _screen_bbox(objs, margin=0.08):
 
 
 def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zmax, out_dir=None,
-                          prog=None):
+                          prog=None, sub=False):
     """Render each SPRITE-type layer EXACTLY as the full Blender scene shows it, then CUT it to the
     group's own silhouette: render the mob with ALL scenery visible and normal (every OTHER entity
     hidden) -> `S` has the real water/glass surface, with its real reflections, OVER the mob's
@@ -3711,7 +3716,10 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
             spr[vis, :3] = _to_display(comb[vis, :3])          # S is opaque -> rgb is the straight color
             spr[:, :3] = _anim_dilate_light(spr[:, :3], vis, rW, rH)
             spr[:, 3] = alpha
-            _save_image(spr.reshape(-1), rW, rH, os.path.join(out_dir, safe + ".webp"),
+            rel = "layers/" if sub else ""     # legacy keeps sprites in layers/<name>...; mesh v2 = flat
+            if sub:
+                os.makedirs(os.path.join(out_dir, "layers"), exist_ok=True)
+            _save_image(spr.reshape(-1), rW, rH, os.path.join(out_dir, rel + safe + ".webp"),
                         file_format='WEBP', lossless=STATIC_FG_LOSSLESS, quality=STATIC_FG_QUALITY)
 
             # DEPTH map: window depth (same scale as the mesh) re-encoded over the sprite's own range.
@@ -3728,13 +3736,13 @@ def _static_render_layers(players, sprite_groups, all_layer_mesh_names, zmin, zm
                         wmax = wmin + 1e-4
                     b = np.clip((wd - wmin) / (wmax - wmin), 0.0, 1.0)   # 8-bit over [wmin, wmax]
                     dbuf = np.ones((b.shape[0], 4), 'float32'); dbuf[:, :3] = b[:, None]
-                    depth_fn = safe + "_depth.webp"
+                    depth_fn = rel + safe + "_depth.webp"
                     _save_image(dbuf.reshape(-1), rW, rH, os.path.join(out_dir, depth_fn),
                                 file_format='WEBP', lossless=True)
                     depth_range = [round(wmin, 6), round(wmax, 6)]
             cd = _group_camera_depth(meshes)
             infos.append({"name": safe, "object": g["object"], "kind": g["kind"],
-                          "image": safe + ".webp", "depth": depth_fn, "depth_range": depth_range,
+                          "image": rel + safe + ".webp", "depth": depth_fn, "depth_range": depth_range,
                           "camera_depth": round(cd, 4) if cd is not None else None})
             print(f"[STATIC sprite] {safe} -> camera_depth={cd}, depth_range={depth_range}")
         infos.sort(key=lambda i: (i["camera_depth"] is None, -(i["camera_depth"] or 0.0)))
@@ -3782,7 +3790,7 @@ def _box_blur_rgb(rgb2d, iterations=2):
     return out
 
 
-def _static_render_foreground(players, mesh_layers, all_layer_mesh_names, out_dir=None, prog=None):
+def _static_render_foreground(players, mesh_layers, all_layer_mesh_names, out_dir=None, prog=None, sub=False):
     """Per-entity FOREGROUND matte by two-background matting -- ONE map that replaces BOTH the Object-Index
     occlusion mask AND the transmission tint (and the per-material water exclusion the mask needed).
     Render the entity as flat WHITE then BLACK emission with ALL scenery (opaque AND transmissive)
@@ -3905,7 +3913,9 @@ def _static_render_foreground(players, mesh_layers, all_layer_mesh_names, out_di
                 arm, saved_arm = _set_arm_style(p, vval)
                 muted = _hide_others_for_bake(s, active, entity_names)
                 try:
-                    fn = _render_foreground(meshes, f"{p['label']}_foreground_{vname}.webp")
+                    fg_name = (f"{p['label']}/foreground_{vname}.webp" if sub
+                               else f"{p['label']}_foreground_{vname}.webp")
+                    fn = _render_foreground(meshes, fg_name)
                 finally:
                     for d in muted:
                         d.mute = False
