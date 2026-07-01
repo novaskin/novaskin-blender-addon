@@ -5096,14 +5096,25 @@ class OBJECT_OT_novaskin_layer_remove(bpy.types.Operator):
         return {'FINISHED'}
 
 
-def _legacy_export_enabled(context):
-    """Whether the legacy Texture UV export is exposed. Off by default; toggled in the add-on
-    preferences (Edit > Preferences > Add-ons > NovaSkin Export). When off, only the Mesh (v2)
-    export is offered; the legacy per-part UV export stays registered for advanced use."""
+def _addon_pref(context, name, default=False):
+    """Read a NovaSkin add-on preference (Edit > Preferences > Add-ons > NovaSkin Export),
+    returning `default` when the add-on prefs aren't available."""
     try:
-        return bool(context.preferences.addons[__name__].preferences.enable_legacy_export)
+        return getattr(context.preferences.addons[__name__].preferences, name)
     except (KeyError, AttributeError):
-        return False
+        return default
+
+
+def _legacy_export_enabled(context):
+    """Legacy Texture UV export exposed? (add-on pref; off by default -> Mesh-only). The legacy
+    operator stays registered either way, for advanced use."""
+    return _addon_pref(context, "enable_legacy_export")
+
+
+def _animated_export_enabled(context):
+    """Experimental animated export (Animation tab) exposed? (add-on pref; off by default). The
+    animated operator stays registered either way, for advanced use."""
+    return _addon_pref(context, "enable_animated_export")
 
 
 class NovaSkinAddonPreferences(bpy.types.AddonPreferences):
@@ -5116,11 +5127,18 @@ class NovaSkinAddonPreferences(bpy.types.AddonPreferences):
                     "and the Render menu. When off, only the interactive Mesh (v2) export is "
                     "offered; the legacy per-part UV export still works, for advanced or "
                     "backward-compatible use")
+    enable_animated_export: BoolProperty(
+        name="Enable animated export (experimental)",
+        default=False,
+        description="Show the Animation tab in the NovaSkin sidebar. The animated wallpaper export "
+                    "is a work-in-progress / beta feature; its operator stays registered either "
+                    "way, for advanced use")
 
     def draw(self, context):
         col = self.layout.column()
         col.prop(self, "enable_legacy_export")
-        col.label(text="When off, NovaSkin exports the interactive Mesh (v2) format only.",
+        col.prop(self, "enable_animated_export")
+        col.label(text="Both off by default: NovaSkin exports the interactive Mesh (v2) format.",
                   icon='INFO')
 
 
@@ -5166,8 +5184,16 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         if not _player_armatures():
             layout.label(text="No Thomas rig found — see the Layers tab", icon='ERROR')
 
-        layout.row().prop(st, "ui_tab", expand=True)
+        # Tabs; the experimental Animation tab appears only when enabled in the add-on prefs.
+        anim = _animated_export_enabled(context)
+        row = layout.row(align=True)
+        row.prop_enum(st, "ui_tab", 'EXPORT')
+        row.prop_enum(st, "ui_tab", 'LAYERS')
+        if anim:
+            row.prop_enum(st, "ui_tab", 'ANIM')
         tab = st.ui_tab
+        if tab == 'ANIM' and not anim:   # pref turned off while on the Animation tab
+            tab = 'EXPORT'
 
         if tab == 'EXPORT':
             legacy = _legacy_export_enabled(context)
