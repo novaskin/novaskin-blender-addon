@@ -25,13 +25,19 @@ const cropBL = { x: crop.x, y: H - crop.y - crop.h, w: crop.w, h: crop.h };  // 
 const mb = await bin(DIR + manifest.mesh.file);
 const mh = new DataView(mb, 0, 20);
 if (new TextDecoder().decode(new Uint8Array(mb, 0, 4)) !== 'NSKM') throw 'bad mesh.bin';
+const mVer = mh.getUint32(4, true);
 const welded = mh.getUint32(8, true), uniqueN = mh.getUint32(12, true),
       ntris = mh.getUint32(16, true);
+const wide = mVer >= 2;                      // v2: u32 src/tris (welded count overflows u16)
 const mp = await inflate(new Uint8Array(mb, 20));
 let off = 0;
 const uvQ  = new Uint16Array(mp.buffer, off, welded * 2); off += welded * 4;
-const src  = new Uint16Array(mp.buffer, off, welded);     off += welded * 2;
-const tris = new Uint16Array(mp.buffer, off, ntris * 3);
+const src  = wide ? new Uint32Array(mp.buffer, off, welded)
+                  : new Uint16Array(mp.buffer, off, welded); off += welded * (wide ? 4 : 2);
+const tris = wide ? new Uint32Array(mp.buffer, off, ntris * 3)
+                  : new Uint16Array(mp.buffer, off, ntris * 3);
+const IDX_TYPE = wide ? 0x1405 : 0x1403;     // gl.UNSIGNED_INT : gl.UNSIGNED_SHORT
+const IDX_SIZE = wide ? 4 : 2;
 const uv = Float32Array.from(uvQ, v => v / 65535);
 
 // --- anim.bin: NSKA | u32 version, V, K, f32 quant, keys_fps | zlib(int16 abs/delta/ddelta)
@@ -175,6 +181,7 @@ const tSkins = skins.map((img) => { const t = tex(); upload(t, img, true); retur
 
 // swap a player's skin at runtime (file input below, or __dbg.setSkin(i, src))
 function setSkin(i, source) { upload(tSkins[i], source, true); }
+const partOff = new Set();    // disabled overlay parts, as "playerLabel::partLabel"
 {
   const box = document.getElementById('skins');
   manifest.mesh.players.forEach((p, i) => {
@@ -192,6 +199,16 @@ function setSkin(i, source) { upload(tSkins[i], source, true); }
     };
     lab.appendChild(inp);
     box.appendChild(lab);
+    // per-part toggles for the 2nd layer (manifests with parts[]; overlays borrow the base light)
+    for (const pm of (p.parts || []).filter(pm => pm.overlay)) {
+      const key = `${p.label}::${pm.label}`;
+      const pl = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = true;
+      cb.onchange = () => { cb.checked ? partOff.delete(key) : partOff.add(key); };
+      pl.appendChild(cb); pl.appendChild(document.createTextNode(pm.label + ' '));
+      box.appendChild(pl);
+    }
   });
 }
 
@@ -266,13 +283,19 @@ function draw() {
     // no depth write) -- kills the dark seam fringe and keeps hard pixels crisp.
     manifest.mesh.players.forEach((p, i) => {
       gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
-      const [t0, t1] = p.tri_range;
-      const count = (t1 - t0) * 3, offset = t0 * 3 * 2;
+      // base span + each ENABLED overlay part (v3 manifests); older exports = whole range
+      const ranges = p.parts
+        ? [[p.tri_range[0], p.overlay_tri_start ?? p.tri_range[1]],
+           ...p.parts.filter(pm => pm.overlay && !partOff.has(`${p.label}::${pm.label}`))
+                     .map(pm => pm.tri_range)]
+        : [p.tri_range];
+      const drawAll = () => { for (const [t0, t1] of ranges)
+        gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, IDX_TYPE, t0 * 3 * IDX_SIZE); };
       gl.uniform1i(uPass, 0); gl.disable(gl.BLEND); gl.depthMask(true);
-      gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, offset);
+      drawAll();
       gl.uniform1i(uPass, 1);
       gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
-      gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, offset);
+      drawAll();
       gl.depthMask(true); gl.disable(gl.BLEND);
     });
     if (useDepth) gl.disable(gl.DEPTH_TEST);
