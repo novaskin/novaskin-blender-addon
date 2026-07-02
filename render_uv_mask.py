@@ -319,11 +319,18 @@ ANIM_KEEP_SEQUENCES = False  # keep seq/ PNGs after a successful encode
 ANIM_RESUME = True
 ANIM_BASE_LABELS = ["head", "body", "arm_left_classic", "arm_right_classic",
                     "leg_left", "leg_right"]
+# 2nd-layer (overlay) part keywords exported with the animated mesh (classic only; the slim
+# variants stay out). Overlays carry NO light of their own: the shell is ~coincident with the
+# base underneath, so the viewer draws them sampling the SAME base light video at their screen
+# position (measured error ~1% -- the light is low-frequency). The light pass hides them, so
+# the base light stays overlay-free (no phantom brim shadow, same design as the mesh export).
+ANIM_OVERLAY_KEYS = ("hat", "jacket", "sleeve", "pant")
 # Dilate the light outward this many pixels beyond the player silhouettes before encoding.
 # The light is ONLY sampled by the player fragments (it is never composited over the
 # background), but mesh edges can sample 1-3 px outside the rendered silhouette (12fps key
 # lerp vs 24fps video + VP9 edge blur) -- padding prevents black fringes. 0 disables.
-ANIM_LIGHT_PAD = 8
+# 16 (not 8): overlay shells extend past the base silhouette and borrow its dilated light.
+ANIM_LIGHT_PAD = 16
 # Crop the foreground + light videos to the players' screen region (union over all frames +
 # this padding). Both only have content where the players are, so the rest of the frame is
 # wasted bytes (foreground is mostly transparent yet nearly as big as the background). The
@@ -2825,6 +2832,16 @@ def _anim_dilate_light(rgb, covered, W, H, passes=None):
     return img.reshape(-1, 3)
 
 
+def _anim_label_kind(lab):
+    """'base' | 'overlay' | None for an animated-export part label. Overlay = classic-only
+    2nd-layer part (hat/jacket/sleeve/pant); slim variants and basic-look duplicates -> None."""
+    if lab in ANIM_BASE_LABELS:
+        return 'base'
+    if lab and 'slim' not in lab and any(k in lab for k in ANIM_OVERLAY_KEYS):
+        return 'overlay'
+    return None
+
+
 def _anim_collect_static(players, W, H):
     """Build the static mesh buffers at the CURRENT frame: weld vertices by
     (part, vertex, uv) for the GPU buffers, and map each welded vert to a UNIQUE
@@ -2833,16 +2850,22 @@ def _anim_collect_static(players, W, H):
     (painter's order). Returns the dict used by _anim_frame_positions/_anim_write_mesh."""
     dg = bpy.context.evaluated_depsgraph_get()
     ordered = sorted(players, key=lambda p: _player_camera_depth(p) or 0.0, reverse=True)
-    base_set = set(ANIM_BASE_LABELS)
     st = {"parts": [], "uv": [], "src": [], "tris": [], "players": [],
           "uniq": []}                                  # uniq: list of (part_idx, vert_idx)
     weld, uniq_keys = {}, {}
     for p in ordered:
         labs = p.get("uv_labels") or _assign_part_labels(p["uv_parts"], label=p["label"])
-        parts = sorted([o for o in p["uv_parts"] if labs.get(o.name) in base_set],
-                       key=lambda o: o.name)
+        kind = {o.name: _anim_label_kind(labs.get(o.name)) for o in p["uv_parts"]}
+        # base parts first, then the overlay shell: the viewer draws the ranges in order, so
+        # the (alpha-discarded) overlay blends over its own base with the depth test deciding.
+        parts = (sorted([o for o in p["uv_parts"] if kind[o.name] == 'base'],
+                        key=lambda o: o.name)
+                 + sorted([o for o in p["uv_parts"] if kind[o.name] == 'overlay'],
+                          key=lambda o: o.name))
         w0, t0 = len(st["src"]), len(st["tris"]) // 3
+        parts_meta = []
         for o in parts:
+            pt0 = len(st["tris"]) // 3
             pi = len(st["parts"]); st["parts"].append(o.name)
             ev = o.evaluated_get(dg); me = ev.to_mesh(); me.calc_loop_triangles()
             uvl = me.uv_layers.active.data
@@ -2862,9 +2885,16 @@ def _anim_collect_static(players, W, H):
                         st["src"].append(ui)
                     st["tris"].append(j)
             ev.to_mesh_clear()
+            parts_meta.append({"label": labs.get(o.name),
+                               "tri_range": [pt0, len(st["tris"]) // 3],
+                               "overlay": kind[o.name] == 'overlay'})
+        ov_t0 = next((pm["tri_range"][0] for pm in parts_meta if pm["overlay"]),
+                     len(st["tris"]) // 3)
         st["players"].append({"label": p["label"],
                               "welded_range": [w0, len(st["src"])],
                               "tri_range": [t0, len(st["tris"]) // 3],
+                              "overlay_tri_start": ov_t0,
+                              "parts": parts_meta,
                               "camera_depth": round(_player_camera_depth(p) or 0.0, 3)})
     # per-part gather arrays: part_idx -> (vert indices, unique indices)
     gather = {}
@@ -2906,16 +2936,19 @@ def _anim_frame_positions(st, W, H):
 
 
 def _anim_write_mesh(path, st):
-    """mesh.bin: 'NSKM' header + zlib payload (uv u16 pairs, src u16, tris u16 triples).
+    """mesh.bin: 'NSKM' header + zlib payload (uv u16 pairs, src, tris). v1 = u16 src/tris;
+    v2 = u32 (auto, when the welded count overflows u16 -- same layout as the static export).
     Browser-side: DecompressionStream('deflate')."""
     import struct, zlib
     welded, unique, ntris = len(st["src"]), len(st["uniq"]), len(st["tris"]) // 3
+    wide = welded > 65535 or unique > 65535
+    idx = '<u4' if wide else '<u2'
     uv = np.round(np.asarray(st["uv"], np.float64) * 65535).astype('<u2')
-    src = np.asarray(st["src"], '<u2')
-    tris = np.asarray(st["tris"], '<u2')
+    src = np.asarray(st["src"], idx)
+    tris = np.asarray(st["tris"], idx)
     payload = zlib.compress(uv.tobytes() + src.tobytes() + tris.tobytes(), 9)
     with open(path, "wb") as f:
-        f.write(struct.pack('<4sIIII', b'NSKM', 1, welded, unique, ntris))
+        f.write(struct.pack('<4sIIII', b'NSKM', 2 if wide else 1, welded, unique, ntris))
         f.write(payload)
     return welded, unique, ntris
 
@@ -4336,13 +4369,16 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     for k in ("bg", "fg", "fg_matte", "light"):
         os.makedirs(os.path.join(adir, "seq", k), exist_ok=True)
 
-    base_set = set(ANIM_BASE_LABELS)
-    base_parts, other_char = [], []
+    # exported look = base + classic overlay shells; overlay_parts also tracked separately so
+    # the LIGHT pass can hide them (base light stays overlay-free; overlays borrow it).
+    base_parts, overlay_parts, other_char = [], [], []
     for p in players:
         p["uv_labels"] = _assign_part_labels(p["uv_parts"], label=p["label"])
         for o in p["char_all"]:
-            (base_parts if p["uv_labels"].get(o.name) in base_set
-             else other_char).append(o)
+            kind = _anim_label_kind(p["uv_labels"].get(o.name))
+            if kind == 'overlay':
+                overlay_parts.append(o)
+            (base_parts if kind is not None else other_char).append(o)
     base_names = {o.name for o in base_parts}
     char_names = {o.name for p in players for o in p["char_all"]}
 
@@ -4487,8 +4523,14 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             _save_image(cm, cW, cH, os.path.join(adir, "seq", "fg_matte", fn),
                         colorspace='Non-Color')
             yield prog(f"frame {i+1}/{nf} foreground")
-            # 3) LIGHT: base parts gray, scenery camera-invisible (still lighting)
+            # 3) LIGHT: base parts gray, scenery camera-invisible (still lighting). Overlay
+            # shells HIDDEN: the light must be the base's own, overlay-free (no phantom brim
+            # shadow -- mesh-export design); the viewer draws overlays sampling this same
+            # light at their screen position (~coincident shell, ~1% error). The next pass's
+            # setup() re-shows them.
             setup()
+            for o in overlay_parts:
+                o.hide_render = True
             sv = _swap_materials(base_parts, gray)
             sc = {o: o.visible_camera for o in scenery}
             for o in scenery:
@@ -4512,7 +4554,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), keys,
                                 ANIM_QUANT, fps / ANIM_KEYS_STEP)
         manifest = {
-            "animated_version": 2,   # 2: NSKA v2 depth, cropped fg/light, foreground matte
+            "animated_version": 3,   # 3: overlay parts (per-part tri ranges, borrowed base light)
             "addon_version": ADDON_VERSION,
             "fps": fps,
             "frames": nf,
