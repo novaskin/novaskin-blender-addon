@@ -138,14 +138,22 @@ const meshP = prog(
    precision highp float;
    uniform sampler2D uSkin; uniform sampler2D uLight; uniform vec2 uRes;
    uniform vec2 uLightOrigin; uniform vec2 uLightSize;
-   uniform bool uUseLight;
+   uniform bool uUseLight; uniform int uPass;
    in vec2 vUv; out vec4 frag;
+   // anti-aliased pixel-art sampling: snap UV to the texel CENTRE but ramp across the seam over ~1px.
+   vec4 texAA(sampler2D tx, vec2 uv){
+     vec2 ts=vec2(textureSize(tx,0)); vec2 p=uv*ts; vec2 seam=floor(p+0.5);
+     p=seam+clamp((p-seam)/max(fwidth(p),1e-5),-0.5,0.5); return texture(tx,p/ts);
+   }
    void main(){
-     vec4 s=texture(uSkin,vUv);
-     if(s.a<0.5) discard;
+     vec4 s=texAA(uSkin,vUv);              // skin, premultiplied
+     if(s.a<0.004) discard;                // outside the silhouette
+     if(uPass==0 && s.a<0.996) discard;    // opaque pass: solid texels (write depth)
+     if(uPass==1 && s.a>=0.996) discard;   // edge pass: anti-aliased skin edge (blend)
      vec2 luv=(gl_FragCoord.xy - uLightOrigin)/uLightSize;
      vec3 l=uUseLight ? texture(uLight,luv).rgb*2.0 : vec3(1.0);
-     frag=vec4(s.rgb*l,1.0);
+     vec3 base = s.a>1e-4 ? s.rgb/s.a : vec3(0.0);   // un-premultiply -> straight colour
+     frag=vec4(base*l*s.a, s.a);           // premultiplied relit entity, drawn COMPLETE
    }`);
 function tex(nearest) {
   const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
@@ -156,17 +164,17 @@ function tex(nearest) {
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   return t;
 }
-function upload(t, srcEl) {
+function upload(t, srcEl, premult) {
   gl.bindTexture(gl.TEXTURE_2D, t);
   gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
-  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !!premult);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcEl);
 }
 const tBg = tex(), tFg = tex(), tLight = tex(), tMatte = tex();
-const tSkins = skins.map((img) => { const t = tex(true); upload(t, img); return t; });
+const tSkins = skins.map((img) => { const t = tex(); upload(t, img, true); return t; });  // LINEAR + premult (texel-AA safe)
 
 // swap a player's skin at runtime (file input below, or __dbg.setSkin(i, src))
-function setSkin(i, source) { upload(tSkins[i], source); }
+function setSkin(i, source) { upload(tSkins[i], source, true); }
 {
   const box = document.getElementById('skins');
   manifest.mesh.players.forEach((p, i) => {
@@ -250,17 +258,24 @@ function draw() {
     gl.uniform2f(gl.getUniformLocation(meshP, 'uLightOrigin'), cropBL.x, cropBL.y);
     gl.uniform2f(gl.getUniformLocation(meshP, 'uLightSize'), cropBL.w, cropBL.h);
     gl.activeTexture(gl.TEXTURE0);
-    if (CH === 3) {         // v2: per-vertex camera depth -> correct self-occlusion
-      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
-      gl.clear(gl.DEPTH_BUFFER_BIT);
-    }
-    // players stored back-to-front; each draws its own triangle range with its own skin
+    const uPass = gl.getUniformLocation(meshP, 'uPass');
+    const useDepth = (CH === 3);   // v2+: per-vertex camera depth -> correct self / inter occlusion
+    if (useDepth) { gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.clear(gl.DEPTH_BUFFER_BIT); }
+    // players stored back-to-front; each draws its triangle range with its own skin in TWO passes:
+    // opaque texels write depth (no blend), then the anti-aliased edge blends over (premultiplied,
+    // no depth write) -- kills the dark seam fringe and keeps hard pixels crisp.
     manifest.mesh.players.forEach((p, i) => {
       gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
       const [t0, t1] = p.tri_range;
-      gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, gl.UNSIGNED_SHORT, t0 * 3 * 2);
+      const count = (t1 - t0) * 3, offset = t0 * 3 * 2;
+      gl.uniform1i(uPass, 0); gl.disable(gl.BLEND); gl.depthMask(true);
+      gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, offset);
+      gl.uniform1i(uPass, 1);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+      gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, offset);
+      gl.depthMask(true); gl.disable(gl.BLEND);
     });
-    gl.disable(gl.DEPTH_TEST);
+    if (useDepth) gl.disable(gl.DEPTH_TEST);
   }
   if (ck('ck_fg')) {
     gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
