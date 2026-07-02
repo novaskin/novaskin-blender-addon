@@ -59,12 +59,12 @@ Outputs go to <blend_dir>/novaskin/.
 """
 
 bl_info = {
-    "name": "NovaSkin Export (Thomas_Rig_Legacy)",
+    "name": "NovaSkin Export",
     "author": "saviski",
     "version": (1, 3, 0),
     "blender": (4, 2, 0),
     "location": "Top bar > Render > Render for NovaSkin",
-    "description": "Export per-part UV + occlusion mask + illum/shadow per player.",
+    "description": "Export Minecraft scenes as re-skinnable browser wallpapers",
     "category": "Render",
 }
 
@@ -4480,7 +4480,9 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             for o in base_parts:
                 o.visible_camera = False
             bpy.context.view_layer.update()
-            bg, rW, rH = _render_combined_array(sess, ILLUM_RES_PCT)
+            # ASYNC (modal runs the _RENDER non-blocking): single render after the scene settles,
+            # the same pattern as the static export's bg/shadow passes. UI stays live.
+            bg, rW, rH = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT)
             for o, v in sc.items():
                 o.visible_camera = v
             buf = np.ones((bg.shape[0], 4), 'float32')
@@ -4493,6 +4495,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             for o in base_parts:
                 o.is_holdout = True
             bpy.context.view_layer.update()
+            # SYNC (blocking) on purpose: C -> hide-scenery -> D is a back-to-back pair with a
+            # mid-sequence scene change, the exact pattern that RACED under the async modal in the
+            # static export (the INVOKE render did not reliably pick up the change) -- see
+            # _static_render_layers. Only bg + light run async.
             C, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
             for o, v in hold.items():
                 o.is_holdout = v
@@ -4536,7 +4542,9 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             for o in scenery:
                 o.visible_camera = False
             bpy.context.view_layer.update()
-            L, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+            # ASYNC: single render after the scene settles (gray swap + camera visibility), same
+            # pattern as the static export's async light pass.
+            L, _, _ = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT, transparent=True)
             for o, v in sc.items():
                 o.visible_camera = v
             _restore_materials(sv)
