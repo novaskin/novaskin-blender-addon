@@ -201,7 +201,7 @@ const meshP = prog(
    precision highp float;
    uniform sampler2D uSkin; uniform sampler2D uLight; uniform vec2 uRes;
    uniform vec2 uLightOrigin; uniform vec2 uLightSize;
-   uniform bool uUseLight; uniform int uPass;
+   uniform bool uUseLight; uniform bool uFlat; uniform int uPass;
    in vec2 vUv; out vec4 frag;
    // anti-aliased pixel-art sampling: snap UV to the texel CENTRE but ramp across the seam over ~1px.
    vec4 texAA(sampler2D tx, vec2 uv){
@@ -209,6 +209,7 @@ const meshP = prog(
      p=seam+clamp((p-seam)/max(fwidth(p),1e-5),-0.5,0.5); return texture(tx,p/ts);
    }
    void main(){
+     if(uFlat){ frag=vec4(0.1,1.0,0.5,1.0); return; }   // wireframe: flat green, no discards
      vec4 s=texAA(uSkin,vUv);              // skin, premultiplied
      if(s.a<0.004) discard;                // outside the silhouette
      if(uPass==0 && s.a<0.996) discard;    // opaque pass: solid texels (write depth)
@@ -284,11 +285,31 @@ const posArr = new Float32Array(welded * 3);
 gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
 gl.bufferData(gl.ARRAY_BUFFER, posArr.byteLength, gl.DYNAMIC_DRAW);
 gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+const uvBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
 gl.bufferData(gl.ARRAY_BUFFER, uv, gl.STATIC_DRAW);
 gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 0);
 gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
 gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, tris, gl.STATIC_DRAW);
+
+// wireframe VAO: SAME attribute buffers (animated positions update both), LINE indices in tri
+// order -- 6 entries per tri, so a part's tri_range maps to [t0*6, t1*6) directly.
+const wireIdx = new (wide ? Uint32Array : Uint16Array)(ntris * 6);
+for (let ti = 0; ti < ntris; ti++) {
+  const a = tris[ti * 3], b = tris[ti * 3 + 1], c = tris[ti * 3 + 2];
+  wireIdx[ti * 6] = a; wireIdx[ti * 6 + 1] = b;
+  wireIdx[ti * 6 + 2] = b; wireIdx[ti * 6 + 3] = c;
+  wireIdx[ti * 6 + 4] = c; wireIdx[ti * 6 + 5] = a;
+}
+const meshWireVao = gl.createVertexArray();
+gl.bindVertexArray(meshWireVao);
+gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 0);
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, wireIdx, gl.STATIC_DRAW);
+gl.bindVertexArray(null);
 
 const meshSpan = K / keysFps;           // mesh-key duration (s)
 function setPositions(time) {
@@ -308,8 +329,118 @@ function setPositions(time) {
 }
 
 const ck = (id) => document.getElementById(id).checked;
+
+// ---- draw steps, shared by the composite and the debug views (the "view" <select>) ----
+function blitVideo(t, rect) {
+  gl.useProgram(quadP); gl.bindVertexArray(quadVao);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.uniform1i(gl.getUniformLocation(quadP, 'uTex'), 0);
+  gl.uniform4fv(gl.getUniformLocation(quadP, 'uRect'), rect);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+function depthPrepass() {
+  // v4: seed the depth buffer with the scenery's depth over the crop rect; the depth-tested
+  // mesh below then loses exactly the pixels the scenery occludes. Replaces the fg quad.
+  gl.useProgram(depthP); gl.bindVertexArray(quadVao);
+  gl.colorMask(false, false, false, false);
+  gl.depthFunc(gl.ALWAYS);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tDepth);
+  gl.uniform1i(gl.getUniformLocation(depthP, 'uTex'), 0);
+  gl.uniform4fv(gl.getUniformLocation(depthP, 'uRect'), cropRectNDC);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.depthFunc(gl.LESS);
+  gl.colorMask(true, true, true, true);
+}
+// players: solid (two-pass alpha) or wireframe; optional per-pixel scenery occlusion (v4)
+function drawPlayers(o) {
+  const vao = o.wire ? meshWireVao : meshVao;
+  gl.useProgram(meshP); gl.bindVertexArray(vao);
+  gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), o.light ? 1 : 0);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uFlat'), o.wire ? 1 : 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLight);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
+  gl.uniform2f(gl.getUniformLocation(meshP, 'uLightOrigin'), cropBL.x, cropBL.y);
+  gl.uniform2f(gl.getUniformLocation(meshP, 'uLightSize'), cropBL.w, cropBL.h);
+  gl.activeTexture(gl.TEXTURE0);
+  const uPass = gl.getUniformLocation(meshP, 'uPass');
+  const useDepth = (CH === 3);   // v2+: per-vertex camera depth -> self / inter occlusion
+  if (useDepth) { gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.clear(gl.DEPTH_BUFFER_BIT); }
+  if (useDepth && vDepth && o.occlude) {
+    depthPrepass();
+    gl.useProgram(meshP); gl.bindVertexArray(vao);   // restore the players' state
+    gl.activeTexture(gl.TEXTURE0);
+  }
+  manifest.mesh.players.forEach((p, i) => {
+    gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
+    // base span + each ENABLED overlay part (v3+ manifests); older exports = whole range
+    const ranges = p.parts
+      ? [[p.tri_range[0], p.overlay_tri_start ?? p.tri_range[1]],
+         ...p.parts.filter(pm => pm.overlay && !partOff.has(`${p.label}::${pm.label}`))
+                   .map(pm => pm.tri_range)]
+      : [p.tri_range];
+    if (o.wire) {
+      gl.uniform1i(uPass, 0);
+      for (const [t0, t1] of ranges)
+        gl.drawElements(gl.LINES, (t1 - t0) * 6, IDX_TYPE, t0 * 6 * IDX_SIZE);
+      return;
+    }
+    // two passes: opaque texels write depth (no blend), then the anti-aliased edge blends
+    // over (premultiplied, no depth write) -- no dark seam fringe, hard pixels stay crisp.
+    const drawAll = () => { for (const [t0, t1] of ranges)
+      gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, IDX_TYPE, t0 * 3 * IDX_SIZE); };
+    gl.uniform1i(uPass, 0); gl.disable(gl.BLEND); gl.depthMask(true);
+    drawAll();
+    gl.uniform1i(uPass, 1);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+    drawAll();
+    gl.depthMask(true); gl.disable(gl.BLEND);
+  });
+  if (useDepth) gl.disable(gl.DEPTH_TEST);
+}
+function drawFgVideo() {
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(fgP); gl.bindVertexArray(quadVao);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tFg);
+  gl.uniform1i(gl.getUniformLocation(fgP, 'uRgb'), 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tMatte);
+  gl.uniform1i(gl.getUniformLocation(fgP, 'uMatte'), 1);
+  gl.uniform1i(gl.getUniformLocation(fgP, 'uHasMatte'), vMatte ? 1 : 0);
+  gl.uniform4fv(gl.getUniformLocation(fgP, 'uRect'), cropRectNDC);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.disable(gl.BLEND);
+}
+function drawComposite() {
+  if (ck('ck_bg')) blitVideo(tBg, FULLRECT);
+  if (ck('ck_pl')) drawPlayers({ occlude: ck('ck_fg'), light: ck('ck_li') });
+  if (ck('ck_fg') && !hasDepth) drawFgVideo();   // v4 occludes via the depth prepass instead
+}
+// grid: every stream/step side by side, all in sync -- what each one contributes
+function drawGrid() {
+  const tiles = [
+    () => blitVideo(tBg, FULLRECT),                          // background (shadows baked)
+    () => blitVideo(tLight, cropRectNDC),                    // light (base look, dilated)
+    () => drawFgVideo(),                                     // foreground + matte
+    () => { if (vDepth) blitVideo(tDepth, cropRectNDC); },   // scene depth (players' band)
+    () => drawPlayers({ wire: true, occlude: ck('ck_fg') }), // wireframe (occlusion applied)
+    () => drawComposite(),                                   // final composite
+  ];
+  const tw = Math.floor(W / 3), th = Math.floor(H / 2);
+  gl.enable(gl.SCISSOR_TEST);
+  tiles.forEach((fn, i) => {
+    const x = (i % 3) * tw, y = H - (Math.floor(i / 3) + 1) * th;   // viewport is bottom-up
+    gl.viewport(x, y, tw, th); gl.scissor(x, y, tw, th);
+    gl.clearColor(0.05, 0.05, 0.05, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    fn();
+  });
+  gl.disable(gl.SCISSOR_TEST);
+  gl.viewport(0, 0, W, H);
+}
+
 function draw() {
-  if (!vBg.paused) syncVideos();          // keep fg/light/matte locked to bg while playing
+  if (!vBg.paused) syncVideos();     // keep fg/light/matte/depth locked to bg while playing
   upload(tBg, vBg); upload(tFg, vFg); upload(tLight, vLight);
   if (vMatte) upload(tMatte, vMatte);
   if (vDepth) upload(tDepth, vDepth);
@@ -321,83 +452,33 @@ function draw() {
   gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   gl.clearColor(0.13, 0.13, 0.13, 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
-  if (ck('ck_bg')) {
-    gl.useProgram(quadP); gl.bindVertexArray(quadVao);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tBg);
-    gl.uniform1i(gl.getUniformLocation(quadP, 'uTex'), 0);
-    gl.uniform4fv(gl.getUniformLocation(quadP, 'uRect'), FULLRECT);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  const mode = (document.getElementById('dbgmode') || { value: 'composite' }).value;
+  if (mode === 'grid') drawGrid();
+  else if (mode === 'wire') {
+    if (ck('ck_bg')) blitVideo(tBg, FULLRECT);
+    drawPlayers({ wire: true, occlude: ck('ck_fg') });
   }
-  if (ck('ck_pl')) {
-    gl.useProgram(meshP); gl.bindVertexArray(meshVao);
-    gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
-    gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
-    gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), ck('ck_li') ? 1 : 0);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLight);
-    gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
-    gl.uniform2f(gl.getUniformLocation(meshP, 'uLightOrigin'), cropBL.x, cropBL.y);
-    gl.uniform2f(gl.getUniformLocation(meshP, 'uLightSize'), cropBL.w, cropBL.h);
-    gl.activeTexture(gl.TEXTURE0);
-    const uPass = gl.getUniformLocation(meshP, 'uPass');
-    const useDepth = (CH === 3);   // v2+: per-vertex camera depth -> correct self / inter occlusion
-    if (useDepth) { gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.clear(gl.DEPTH_BUFFER_BIT); }
-    if (useDepth && vDepth && ck('ck_fg')) {
-      // v4 prepass: seed the depth buffer with the scenery's depth (crop rect); the mesh
-      // below then loses exactly the pixels the scenery occludes. Replaces the fg quad.
-      gl.useProgram(depthP); gl.bindVertexArray(quadVao);
-      gl.colorMask(false, false, false, false);
-      gl.depthFunc(gl.ALWAYS);
-      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tDepth);
-      gl.uniform1i(gl.getUniformLocation(depthP, 'uTex'), 0);
-      gl.uniform4fv(gl.getUniformLocation(depthP, 'uRect'), cropRectNDC);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-      gl.depthFunc(gl.LESS);
-      gl.colorMask(true, true, true, true);
-      gl.useProgram(meshP); gl.bindVertexArray(meshVao);   // restore the players' state
-      gl.activeTexture(gl.TEXTURE0);
-    }
-    // players stored back-to-front; each draws its triangle range with its own skin in TWO passes:
-    // opaque texels write depth (no blend), then the anti-aliased edge blends over (premultiplied,
-    // no depth write) -- kills the dark seam fringe and keeps hard pixels crisp.
-    manifest.mesh.players.forEach((p, i) => {
-      gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
-      // base span + each ENABLED overlay part (v3 manifests); older exports = whole range
-      const ranges = p.parts
-        ? [[p.tri_range[0], p.overlay_tri_start ?? p.tri_range[1]],
-           ...p.parts.filter(pm => pm.overlay && !partOff.has(`${p.label}::${pm.label}`))
-                     .map(pm => pm.tri_range)]
-        : [p.tri_range];
-      const drawAll = () => { for (const [t0, t1] of ranges)
-        gl.drawElements(gl.TRIANGLES, (t1 - t0) * 3, IDX_TYPE, t0 * 3 * IDX_SIZE); };
-      gl.uniform1i(uPass, 0); gl.disable(gl.BLEND); gl.depthMask(true);
-      drawAll();
-      gl.uniform1i(uPass, 1);
-      gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
-      drawAll();
-      gl.depthMask(true); gl.disable(gl.BLEND);
-    });
-    if (useDepth) gl.disable(gl.DEPTH_TEST);
-  }
-  if (ck('ck_fg') && !hasDepth) {   // v4 exports occlude via the depth prepass instead
-    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    gl.useProgram(fgP); gl.bindVertexArray(quadVao);
-    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tFg);
-    gl.uniform1i(gl.getUniformLocation(fgP, 'uRgb'), 0);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tMatte);
-    gl.uniform1i(gl.getUniformLocation(fgP, 'uMatte'), 1);
-    gl.uniform1i(gl.getUniformLocation(fgP, 'uHasMatte'), vMatte ? 1 : 0);
-    gl.uniform4fv(gl.getUniformLocation(fgP, 'uRect'), cropRectNDC);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    gl.disable(gl.BLEND);
-  }
+  else if (mode === 'depth') { if (vDepth) blitVideo(tDepth, cropRectNDC); }
+  else if (mode === 'light') blitVideo(tLight, cropRectNDC);
+  else if (mode === 'fg') drawFgVideo();
+  else drawComposite();
   if (!scrubbing) scrub.value = Math.round(vBg.currentTime / duration() * 1000) || 0;
   timeEl.textContent = vBg.currentTime.toFixed(1) + 's';
   if (!dead) rafId = requestAnimationFrame(draw);
 }
 
-document.getElementById('stats').textContent =
+const statsText =
   `${uniqueN} unique / ${welded} welded verts, ${ntris} tris, ${K} keys @ ${keysFps} fps, ` +
   `${manifest.frames} frames @ ${manifest.fps} fps, ${W}x${H}`;
+document.getElementById('stats').textContent = statsText;
+{
+  const sel = document.getElementById('dbgmode');
+  if (sel) sel.onchange = () => {
+    document.getElementById('stats').textContent = sel.value === 'grid'
+      ? 'grid: background | light | foreground+matte / scene depth | wireframe | composite'
+      : statsText;
+  };
+}
 const vids = [vBg, vFg, vLight, ...(vMatte ? [vMatte] : []), ...(vDepth ? [vDepth] : [])];
 const playbtn = document.getElementById('playbtn');
 playbtn.onclick = () => {

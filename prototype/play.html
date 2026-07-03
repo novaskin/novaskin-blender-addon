@@ -26,6 +26,14 @@
   <label><input type="checkbox" id="ck_li" checked> light</label>
   <label><input type="checkbox" id="ck_fg" checked> foreground</label>
   <label title="sample the mesh at the video's frame grid instead of continuously — registers the player exactly with the fg/light frames (at the cost of 24fps-stepped motion)"><input type="checkbox" id="ck_snap"> snap</label>
+  <label>view <select id="dbgmode">
+    <option value="composite" selected>composite</option>
+    <option value="grid">grid (all steps)</option>
+    <option value="wire">wireframe</option>
+    <option value="depth">scene depth</option>
+    <option value="light">light</option>
+    <option value="fg">foreground</option>
+  </select></label>
   <span id="skins"></span>
   <span id="stats">loading…</span>
 </div>
