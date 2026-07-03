@@ -117,17 +117,20 @@ async function video(src) {
   return new Promise((ok) => { v.oncanplaythrough = () => ok(v); v.load(); });
 }
 const hasMatte = !!manifest.videos.foreground_matte;
+const hasDepth = !!manifest.videos.scene_depth;   // v4: per-pixel occlusion replaces the fg quad
 const vidList = [manifest.videos.background, manifest.videos.foreground, manifest.videos.light];
 if (hasMatte) vidList.push(manifest.videos.foreground_matte);
+if (hasDepth) vidList.push(manifest.videos.scene_depth);
 const loadedVids = await Promise.all(vidList.map(video));
 const [vBg, vFg, vLight] = loadedVids;
 const vMatte = hasMatte ? loadedVids[3] : null;
+const vDepth = hasDepth ? loadedVids[hasMatte ? 4 : 3] : null;
 // Frame-lock the secondary videos to the background's clock every drawn frame (independent
 // <video> elements drift, and start playing at slightly different times). The MATTE must be
 // in step too -- it is the occlusion shape; if it lags, the foreground freezes/misaligns.
 const SYNC_TOL = 1.5 / manifest.fps;   // re-seek if off by more than ~1.5 frames
 function syncVideos() {
-  for (const v of [vFg, vLight, vMatte]) {
+  for (const v of [vFg, vLight, vMatte, vDepth]) {
     if (v && Math.abs(v.currentTime - vBg.currentTime) > SYNC_TOL)
       v.currentTime = vBg.currentTime;
   }
@@ -173,6 +176,21 @@ const fgP = prog(
    }`);
 // crop rect in NDC (bottom-up px -> clip space)
 const cropRectNDC = [cropBL.x/W*2-1, cropBL.y/H*2-1, cropBL.w/W*2, cropBL.h/H*2];
+// scene-depth prepass (v4): writes the scenery's depth (players' band, SAME space as the mesh
+// z) into the depth buffer over the crop rect; the depth-tested mesh is then occluded per-pixel
+// wherever it is drawn -- registration with the old fg quad no longer matters. The +3/255 guard
+// biases ties toward "player visible" (absorbs the lossless yuv round-trip error).
+const depthP = prog(
+  `#version 300 es
+   layout(location=0) in vec2 aPos; uniform vec4 uRect; out vec2 vUv;
+   void main(){ vUv=aPos; gl_Position=vec4(uRect.xy + aPos*uRect.zw, 0., 1.); }`,
+  `#version 300 es
+   precision highp float;
+   uniform sampler2D uTex; in vec2 vUv; out vec4 frag;
+   void main(){
+     gl_FragDepth = clamp(texture(uTex,vUv).r + 3.0/255.0, 0.0, 1.0);
+     frag = vec4(0.0);
+   }`);
 const meshP = prog(
   `#version 300 es
    layout(location=0) in vec3 aPx; layout(location=1) in vec2 aUv;
@@ -216,6 +234,7 @@ function upload(t, srcEl, premult) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcEl);
 }
 const tBg = tex(), tFg = tex(), tLight = tex(), tMatte = tex();
+const tDepth = tex(true);   // NEAREST: depth is data -- interpolating across edges invents depths
 const tSkins = skins.map((img) => { const t = tex(); upload(t, img, true); return t; });  // LINEAR + premult (texel-AA safe)
 
 // swap a player's skin at runtime (file input below, or __dbg.setSkin(i, src))
@@ -293,6 +312,7 @@ function draw() {
   if (!vBg.paused) syncVideos();          // keep fg/light/matte locked to bg while playing
   upload(tBg, vBg); upload(tFg, vFg); upload(tLight, vLight);
   if (vMatte) upload(tMatte, vMatte);
+  if (vDepth) upload(tDepth, vDepth);
   // snap: sample the mesh at the video's frame grid (the pose the fg/light frames saw) instead
   // of continuously -- isolates the sub-frame component of mesh-vs-video misregistration.
   const t = vBg.currentTime;
@@ -321,6 +341,21 @@ function draw() {
     const uPass = gl.getUniformLocation(meshP, 'uPass');
     const useDepth = (CH === 3);   // v2+: per-vertex camera depth -> correct self / inter occlusion
     if (useDepth) { gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.clear(gl.DEPTH_BUFFER_BIT); }
+    if (useDepth && vDepth && ck('ck_fg')) {
+      // v4 prepass: seed the depth buffer with the scenery's depth (crop rect); the mesh
+      // below then loses exactly the pixels the scenery occludes. Replaces the fg quad.
+      gl.useProgram(depthP); gl.bindVertexArray(quadVao);
+      gl.colorMask(false, false, false, false);
+      gl.depthFunc(gl.ALWAYS);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tDepth);
+      gl.uniform1i(gl.getUniformLocation(depthP, 'uTex'), 0);
+      gl.uniform4fv(gl.getUniformLocation(depthP, 'uRect'), cropRectNDC);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.depthFunc(gl.LESS);
+      gl.colorMask(true, true, true, true);
+      gl.useProgram(meshP); gl.bindVertexArray(meshVao);   // restore the players' state
+      gl.activeTexture(gl.TEXTURE0);
+    }
     // players stored back-to-front; each draws its triangle range with its own skin in TWO passes:
     // opaque texels write depth (no blend), then the anti-aliased edge blends over (premultiplied,
     // no depth write) -- kills the dark seam fringe and keeps hard pixels crisp.
@@ -343,7 +378,7 @@ function draw() {
     });
     if (useDepth) gl.disable(gl.DEPTH_TEST);
   }
-  if (ck('ck_fg')) {
+  if (ck('ck_fg') && !hasDepth) {   // v4 exports occlude via the depth prepass instead
     gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(fgP); gl.bindVertexArray(quadVao);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tFg);
@@ -363,7 +398,7 @@ function draw() {
 document.getElementById('stats').textContent =
   `${uniqueN} unique / ${welded} welded verts, ${ntris} tris, ${K} keys @ ${keysFps} fps, ` +
   `${manifest.frames} frames @ ${manifest.fps} fps, ${W}x${H}`;
-const vids = [vBg, vFg, vLight, ...(vMatte ? [vMatte] : [])];
+const vids = [vBg, vFg, vLight, ...(vMatte ? [vMatte] : []), ...(vDepth ? [vDepth] : [])];
 const playbtn = document.getElementById('playbtn');
 playbtn.onclick = () => {
   if (vBg.paused) { vids.forEach(v => v.play()); playbtn.textContent = '❚❚'; }
@@ -382,7 +417,7 @@ scrub.oninput = () => {
 };
 // debug handle (pause/seek from the console): __dbg.seek(5.0)
 window.__dbg = {
-  vBg, vFg, vLight, vMatte, hasMatte, keys, K, keysFps, setSkin,
+  vBg, vFg, vLight, vMatte, vDepth, hasMatte, hasDepth, keys, K, keysFps, setSkin,
   seek(t) { for (const v of [vBg, vFg, vLight]) { v.pause(); v.currentTime = t; } },
 };
 let rafId = 0, dead = false;

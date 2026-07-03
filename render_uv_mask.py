@@ -2922,7 +2922,7 @@ def _anim_frame_cached(adir, i):
     fn = f"{i + 1:04d}.png"
     return all(os.path.exists(p) and os.path.getsize(p) > 0
                for p in (os.path.join(adir, "seq", k, fn)
-                         for k in ("bg", "fg", "fg_matte", "light")))
+                         for k in ("bg", "fg", "fg_matte", "light", "depth")))
 
 
 def _anim_dilate_light(rgb, covered, W, H, passes=None):
@@ -4474,7 +4474,11 @@ def _anim_encode(adir, fps):
     jobs = [("bg", "background.webm", ["-pix_fmt", "yuv420p"], "bg"),
             ("fg", "foreground.webm", ["-pix_fmt", "yuv420p"], "fg"),
             ("fg_matte", "foreground_matte.webm", ["-pix_fmt", "yuv420p"], "fg"),
-            ("light", "light.webm", ["-pix_fmt", "yuv420p"], "light")]
+            ("light", "light.webm", ["-pix_fmt", "yuv420p"], "light"),
+            # depth is DATA, not picture: lossy VP9 blurs its edges into wrong depths
+            # (measured p99 6+ levels at silhouettes), lossless stays within ~2 levels
+            # (yuv range conversion) which the viewer's guard band absorbs.
+            ("depth", "scene_depth.webm", ["-pix_fmt", "yuv420p"], None)]
     # GUI Blender doesn't inherit the shell PATH -- look in the usual per-OS spots too.
     cands = (["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
              if sys.platform != "win32" else
@@ -4482,9 +4486,11 @@ def _anim_encode(adir, fps):
               os.path.expandvars(r"%ProgramFiles%\ffmpeg\bin\ffmpeg.exe")])
     ff = _sh.which("ffmpeg") or next((p for p in cands if os.path.exists(p)), None)
     def cmd(name, out, extra, crf_key):
+        q = (["-lossless", "1"] if crf_key is None
+             else ["-crf", str(ANIM_CRF[crf_key]), "-b:v", "0"])
         return [ff or "ffmpeg", "-y", "-framerate", str(fps),
                 "-i", os.path.join(seq, name, "%04d.png"),
-                "-c:v", "libvpx-vp9", "-crf", str(ANIM_CRF[crf_key]), "-b:v", "0",
+                "-c:v", "libvpx-vp9", *q,
                 "-row-mt", "1", "-cpu-used", "4", *extra, os.path.join(adir, out)]
     if ff is None:
         import shlex
@@ -4523,7 +4529,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     W = s.render.resolution_x * MASK_RES_PCT // 100
     H = s.render.resolution_y * MASK_RES_PCT // 100
     adir = os.path.join(_abs(OUT_DIR), ANIM_OUT_SUBDIR)
-    for k in ("bg", "fg", "fg_matte", "light"):
+    for k in ("bg", "fg", "fg_matte", "light", "depth"):
         os.makedirs(os.path.join(adir, "seq", k), exist_ok=True)
 
     # exported look = base + classic overlay shells; overlay_parts also tracked separately so
@@ -4629,6 +4635,13 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
 
         print(f"[ANIM] crop rect (bottom-up px): x{cx0}-{cx1} y{cy0}-{cy1} "
               f"= {cx1-cx0}x{cy1-cy0} ({100*(cx1-cx0)*(cy1-cy0)/(W*H):.0f}% of frame)")
+        # players' camera-depth band over the whole clip (same formula as _anim_write_anim):
+        # ONE z space shared by the mesh (anim.bin z) and the scene-depth video, so the
+        # viewer's depth prepass compares them directly.
+        zb0 = float(min(k[:, 2].min() for k in keys))
+        zb1 = float(max(k[:, 2].max() for k in keys))
+        if zb1 - zb0 < 1e-6:
+            zb1 = zb0 + 1e-6
         gray = _gray_diffuse_material()
         scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in char_names]
         cached = sum(1 for i in range(nf) if ANIM_RESUME and _anim_frame_cached(adir, i))
@@ -4651,6 +4664,18 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             # ASYNC (modal runs the _RENDER non-blocking): single render after the scene settles,
             # the same pattern as the static export's bg/shadow passes. UI stays live.
             bg, rW, rH = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT)
+            # 1b) SCENE DEPTH: Z of the scenery alone (players still camera-invisible),
+            # quantized to the players' camera-depth band. The viewer's depth prepass
+            # occludes the mesh per-pixel WHEREVER it is drawn -- occlusion no longer
+            # depends on mesh-vs-video registration. 1 sample (Z needs none), SYNC (fast).
+            sess.vl.use_pass_z = True
+            zarr, _, _ = sess.render_pass('Depth', 'CYCLES', 1, ILLUM_RES_PCT)
+            dq = np.clip((zarr[:, 0] - zb0) / (zb1 - zb0), 0.0, 1.0)
+            dbuf = np.ones((dq.size, 4), 'float32')
+            dbuf[:, 0] = dbuf[:, 1] = dbuf[:, 2] = dq
+            cd, cdW, cdH = _crop(dbuf.reshape(-1))
+            _save_image(cd, cdW, cdH, os.path.join(adir, "seq", "depth", fn),
+                        colorspace='Non-Color')
             for o, v in sc.items():
                 o.visible_camera = v
             buf = np.ones((bg.shape[0], 4), 'float32')
@@ -4736,7 +4761,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), keys,
                                 ANIM_QUANT, fps / ANIM_KEYS_STEP)
         manifest = {
-            "animated_version": 3,   # 3: overlay parts (per-part tri ranges, borrowed base light)
+            "animated_version": 4,   # 4: scene_depth video (per-pixel occlusion, replaces fg use)
             "addon_version": ADDON_VERSION,
             "fps": fps,
             "frames": nf,
@@ -4748,7 +4773,14 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             "videos": {"background": "background.webm",
                        "foreground": "foreground.webm",
                        "foreground_matte": "foreground_matte.webm",
-                       "light": "light.webm"},
+                       "light": "light.webm",
+                       "scene_depth": "scene_depth.webm"},
+            # scenery-only camera depth, cropped like fg/light, normalized to the players'
+            # band (0 = zmin .. 1 = zmax, clamped; SAME space as anim.bin z). VP9 LOSSLESS.
+            # Viewer: fullscreen-crop prepass writes gl_FragDepth = luma + guard(~3/255),
+            # then the depth-tested mesh is occluded per-pixel; translucids (water tint over
+            # the player) are NOT represented -- binary occlusion only.
+            "scene_depth": {"zmin": round(zb0, 5), "zmax": round(zb1, 5)},
             "mesh": {"file": "mesh.bin", "welded": welded, "unique": unique,
                      "tris": ntris, "players": st["players"],
                      "layout": "NSKM u32x4 header + zlib(uv u16x2/65535, src u16, tris u16x3)"},
