@@ -472,15 +472,74 @@ def _mc_part_label(name):
     return re.sub(r"[^A-Za-z0-9]+", "_", base).strip("_").lower() or name
 
 
+# Canonical Minecraft 64x64 skin layout: part -> its net's bounding rect in TOP-LEFT skin
+# pixels (x0, y0, x1, y1). Arms/sleeves list the CLASSIC rect; the slim net occupies a
+# 14px-wide subset of the same rect, so the variant is decided by the measured bbox width.
+MC_UV_RECTS = {
+    "head":         (0, 0, 32, 16),
+    "hat":          (32, 0, 64, 16),
+    "leg_right":    (0, 16, 16, 32),
+    "body":         (16, 16, 40, 32),
+    "arm_right":    (40, 16, 56, 32),
+    "pant_right":   (0, 32, 16, 48),
+    "jacket":       (16, 32, 40, 48),
+    "sleeve_right": (40, 32, 56, 48),
+    "pant_left":    (0, 48, 16, 64),
+    "leg_left":     (16, 48, 32, 64),
+    "arm_left":     (32, 48, 48, 64),
+    "sleeve_left":  (48, 48, 64, 64),
+}
+_MC_UV_VARIANT = {"arm_right", "arm_left", "sleeve_right", "sleeve_left"}
+
+
+def _uv_part_label(o):
+    """Classify a mesh object by WHERE its render UVs live in the canonical Minecraft skin
+    layout -- the ground truth of what a part IS (names lie: the Thomas rig ships the left
+    pant as a never-renamed sleeve duplicate). Uses the active-RENDER UV layer (the rig's
+    appendable Mesh_Layers parts switch layer via `2nd_Layer`.active_render). Returns the
+    canonical label, or None when the object doesn't sit cleanly in one rect (multi-part or
+    non-skin mesh -> caller falls back to the name map)."""
+    me = getattr(o, 'data', None)
+    if me is None or not getattr(me, 'uv_layers', None) or not len(me.uv_layers):
+        return None
+    uvl = next((l for l in me.uv_layers if l.active_render), me.uv_layers.active)
+    if uvl is None or not len(uvl.data):
+        return None
+    buf = np.empty(len(uvl.data) * 2, np.float32)
+    uvl.data.foreach_get('uv', buf)
+    u = buf[0::2] * 64.0
+    v = buf[1::2]
+    x0, x1 = float(u.min()), float(u.max())
+    y0, y1 = 64.0 - float(v.max()) * 64.0, 64.0 - float(v.min()) * 64.0   # top-left px
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    TOL = 0.75                                     # allow the rigs' anti-bleed inset
+    for name, (rx0, ry0, rx1, ry1) in MC_UV_RECTS.items():
+        if not (rx0 <= cx <= rx1 and ry0 <= cy <= ry1):
+            continue
+        inside = (x0 >= rx0 - TOL and x1 <= rx1 + TOL and
+                  y0 >= ry0 - TOL and y1 <= ry1 + TOL)
+        # coverage: a real part's net fills most of its rect; a decorative mesh sampling a
+        # few skin pixels does not -> let it fall back to the name map instead.
+        covers = (x1 - x0) >= (rx1 - rx0) * 0.5 and (y1 - y0) >= (ry1 - ry0) * 0.5
+        if not (inside and covers):
+            return None
+        if name in _MC_UV_VARIANT:
+            return f"{name}_{'slim' if (x1 - x0) <= 14.5 else 'classic'}"
+        return name
+    return None
+
+
 def _assign_part_labels(parts, label=None):
     """Return {object_name: unique_label} for a player's parts, disambiguating collisions
     (e.g. duplicate meshes) with a "_2", "_3"... suffix. Deterministic (sorted by name).
+    The label comes from the part's UV rect in the skin layout (_uv_part_label -- robust to
+    the rig's naming inconsistencies), falling back to the MC_PART_MAP object-name mapping.
     Warns when two parts collide on the same Minecraft label -- a common sign of a stray or
     duplicate mesh (e.g. an arm sleeve weighted to the leg) that would otherwise slip in as
     a "<label>_2" file silently. The mapping still works; the warning just surfaces it."""
     used, out, first, collisions = {}, {}, {}, {}
     for o in sorted(parts, key=lambda x: x.name):
-        base = _mc_part_label(o.name)
+        base = _uv_part_label(o) or _mc_part_label(o.name)
         n = used.get(base, 0) + 1
         used[base] = n
         if n == 1:
