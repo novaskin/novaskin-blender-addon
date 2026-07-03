@@ -1,8 +1,6 @@
 # How to create Nova Skin wallpapers with Blender
 
-Ten years ago the only way to build a wallpaper template was by hand — placing every part in Cinema 4D or Mine-imator and lining up the UVs yourself (the old [Cinema 4D](https://forum.novaskin.me/t/how-to-create-wallpaper-templates-with-cinema-4d/50) and [Mine-imator](https://forum.novaskin.me/t/how-to-create-wallpapers-for-nova-skin-with-mine-imator/10304) guides). This is the modern way: build a scene in **Blender**, press one button, and get an **interactive wallpaper** that anyone can re-skin **right in the browser** — no re-rendering.
-
-You render the scene **once**. The exported wallpaper lets viewers:
+Build a scene in **Blender**, press one button, and get an **interactive wallpaper** that anyone can re-skin **right in the browser** — no re-rendering. You render the scene **once**; the exported wallpaper lets viewers:
 
 - drop in **any Minecraft skin** and see it relit instantly,
 - switch **classic (Steve) / slim (Alex)** arms,
@@ -10,11 +8,13 @@ You render the scene **once**. The exported wallpaper lets viewers:
 
 > 🎬 *[video: 10-second demo — swapping skins live on a finished wallpaper]*
 
+> 💡 **Everything lives in the sidebar.** Press **N** in the 3D viewport to open it — the add-on's **NovaSkin** tab and the rig's **Thomas Rig Legacy** tab both live there.
+
 ---
 
 ## What you'll need
 
-- **Blender 4.2 or newer**, running normally (with the interface — the exporter can't run in `--background` mode).
+- **Blender 4.2 or newer**.
 - The **NovaSkin Export** add-on (this guide — install below).
 - The **Thomas Rig Legacy** rig — the Minecraft character rig the exporter is built around.
 - A little Blender comfort: moving the camera, adding lights, placing blocks. You don't need to be an expert.
@@ -23,9 +23,9 @@ You render the scene **once**. The exported wallpaper lets viewers:
 
 ## Part 1 — Install the NovaSkin Export add-on
 
-The add-on is pending review on the Blender Extensions platform. Until it's approved, install it from GitHub:
+Install it from GitHub:
 
-1. Go to the **[releases page](https://github.com/novaskin/novaskin-blender-addon/releases)** and download the latest **`novaskin_export-1.3.0.zip`**.
+1. Go to the **[releases page](https://github.com/novaskin/novaskin-blender-addon/releases)** and download the latest **`novaskin_export-*.zip`**.
 2. Open Blender and **drag the `.zip` straight onto the Blender window**.
    *(Or: `Edit ▸ Preferences ▸ Get Extensions ▸ ⌄ ▸ Install from Disk…` and pick the zip.)*
 3. Make sure **“NovaSkin Export”** is enabled in the add-on list.
@@ -52,7 +52,7 @@ The NovaSkin panel will tell you (and link you) if it can't find the rig, so you
 Start a new file and set the stage. Nothing here is NovaSkin-specific — it's just a normal Blender scene:
 
 1. **Save your `.blend`** somewhere with room to spare. The export writes a `novaskin/` folder **right next to your saved file**, so an unsaved file can't export.
-2. **Add a camera** and frame your shot. Whatever the active camera sees is the wallpaper — set your resolution in `Output Properties` (e.g. 1920×1080 or 4K).
+2. **Add a camera** and frame your shot. Whatever the active camera sees is the wallpaper — set your resolution in `Output Properties`; **4K (3840×2160)** is the preferred wallpaper size.
 3. **Add lighting** — a Sun for direction plus some fill works well. The light and shadows you set here get baked into the wallpaper.
 4. **Build the environment** — blocks, terrain, water, foliage, mobs… whatever your scene needs. This becomes the background and the foreground around your characters.
 
@@ -75,16 +75,9 @@ This is where the Minecraft characters go in.
 
 > ℹ️ **You don't need to apply a skin in Blender.** The wallpaper tool re-skins each character in the browser, so whatever skin the rig has is ignored on export — a plain default rig is fine. (Both **classic and slim** arms are exported, so viewers can switch either way.)
 
-### ⚠️ Turn on “No Face” (disable the facial expressions)
+### The face is handled for you
 
-The Thomas rig has an animatable **3D face** (eyes, eyebrows, mouth) meant for animation. Those 3D features **don't re-texture correctly**: when a viewer drops their own skin onto the character in the browser, the skin's flat face can't wrap onto the rig's sculpted 3D face. Switching to the flat Minecraft skin head fixes it.
-
-- In the rig's **“Thomas Rig Legacy” sidebar tab → Design Settings**, enable **“No Face”**.
-- Do this on **every** player rig in the scene.
-
-> 📷 *[screenshot: the “No Face” toggle enabled in Design Settings]*
-
-This swaps the expressive head for the clean Minecraft skin head. It's the single most important setting for a good wallpaper.
+The Thomas rig has an animatable **3D face** (eyes, eyebrows, mouth) meant for animation. Those 3D features **can't re-texture** — a viewer's flat skin face has nowhere to wrap onto a sculpted 3D face. So the exporter **automatically ignores the facial expressions** and uses the flat Minecraft skin head instead. You don't have to touch the rig's face settings.
 
 ---
 
@@ -136,11 +129,12 @@ If it looks right here, it'll look right as a wallpaper. 🎉
 ## Troubleshooting & tips
 
 - **“No rig found.”** The character must be a **Thomas Rig Legacy** rig, and the rig add-on must be installed and enabled. The panel links you to the rig if it's missing.
-- **The face looks wrong / 3D-ish after re-skinning.** You forgot **“No Face”** on that player (Part 4).
-- **Export won't start.** Save your `.blend` first — the output folder is written next to it. You also need an **active camera** and to run Blender **with its interface** (not `--background`).
+- **Export won't start.** Save your `.blend` first — the output folder is written next to it, and make sure the scene has an **active camera**.
 - **The environment doesn't change when I re-skin.** That's expected — only the **characters** are re-skinnable; the scenery is baked. Use **optional layers** for anything you want toggleable.
 - **Cleaner result:** raise the render **samples** in the panel's Quality section before the final export.
 
 ---
+
+*This is the one-click successor to the old by-hand workflows — the [Cinema 4D](https://forum.novaskin.me/t/how-to-create-wallpaper-templates-with-cinema-4d/50) and [Mine-imator](https://forum.novaskin.me/t/how-to-create-wallpapers-for-nova-skin-with-mine-imator/10304) template guides.*
 
 *Built something? Post it in the thread — we'd love to see it.*
