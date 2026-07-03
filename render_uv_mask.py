@@ -123,13 +123,18 @@ SELECTION_FORCE_OFF = [
     ("L.Arm_Properties", "L.Arm_ Fingers+"),
 ]
 # Pose-bone toggles to force ON (truthy) so the parts they reveal are ALWAYS exported, even
-# when the artist left the toggle OFF in the rig UI. The "Second layer" toggle hides the
-# overlay meshes (jacket/sleeves/pants 2nd layer) via hide_render DRIVERS; with it off those
-# parts aren't selected and never exported (and reconciliation can't recover them -- they are
-# driver-hidden, not manually). Forced during part selection AND the whole render, then the
-# artist's original value is restored. Empty list = export exactly what is visible.
+# when the artist left the toggle OFF in the rig UI. Driven via hide_render DRIVERS, so with
+# the toggle off those parts aren't selected/rendered (and reconciliation can't recover them).
+# Forced during part selection AND the whole render, then the artist's value is restored.
+#   "Second layer" -> reveal the overlay meshes (jacket/sleeves/pants 2nd layer).
+#   "No face"      -> swap the rig's animatable 3D face for the flat Minecraft skin head
+#                     (NoFace_Head). The sculpted 3D face can't re-texture with an arbitrary
+#                     skin in the browser, so the wallpaper always exports the flat head --
+#                     the artist no longer has to enable "No Face" by hand.
+# Empty list = export exactly what is visible.
 SELECTION_FORCE_ON = [
     ("Main_Properties", "Second layer"),
+    ("Main_Properties", "No face"),
 ]
 # Opaque material override during the mask (the skin has alpha -> it would punch holes
 # in the mask). Object Index ignores color; it only needs to be opaque. Gray ~#808080.
@@ -4785,6 +4790,228 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     return {"frames": nf}
 
 
+# ---------------------------------------------------------------------------
+# Copy a Mixamo FBX animation onto the Thomas rig (Animation tab).
+#
+# Standalone -- uses only bpy + mathutils, NO external retarget add-on (the
+# extensions.blender.org "Retarget"/Expy Kit tool mis-handles Mixamo's 0.01
+# armature scale and collapses the character).  Body / legs / head / hips are
+# retargeted by world-space rotation delta; the ARMS by aim (Mixamo's arm rest
+# is a T-pose and its bone axes differ from the rig's, so a plain delta twists
+# them -- aiming the visual arm segment along the source's makes it match).
+# Everything is baked to a fresh Action; the source FBX is never modified.
+# ---------------------------------------------------------------------------
+_RETARGET_BODY = [                       # (mixamo_bone, thomas_fk_bone) -- rotation delta
+    ("mixamorig:Hips", "Lower_body"), ("mixamorig:Spine1", "Upper_Body"),
+    ("mixamorig:Head", "Head"),
+    ("mixamorig:LeftUpLeg", "Leg_FK.L"), ("mixamorig:LeftLeg", "Leg_knee_FK.L"),
+    ("mixamorig:RightUpLeg", "Leg_FK.R"), ("mixamorig:RightLeg", "Leg_knee_FK.R"),
+    ("mixamorig:LeftFoot", "Leg_foot.L"), ("mixamorig:RightFoot", "Leg_foot.R"),
+]
+_RETARGET_ARMS = [                       # (target, src_head, src_tip, target_child|None) -- aim
+    ("Arm_Upper_FK.L", "mixamorig:LeftArm", "mixamorig:LeftForeArm", "Arm_Lower_FK.L"),
+    ("Arm_Lower_FK.L", "mixamorig:LeftForeArm", "mixamorig:LeftHand", None),
+    ("Arm_Upper_FK.R", "mixamorig:RightArm", "mixamorig:RightForeArm", "Arm_Lower_FK.R"),
+    ("Arm_Lower_FK.R", "mixamorig:RightForeArm", "mixamorig:RightHand", None),
+]
+_RETARGET_FK_SWITCH = {                  # bone: (custom_prop, value that selects FK)
+    "L.Arm_Properties": ("L.Arm_FK/IK", 0), "R.Arm_Properties": ("R.Arm_FK/IK", 0),
+    "L.Leg_Properties": ("L.IK/FK", 1), "R.Leg_Properties": ("R.IK/FK", 1),
+}
+_RETARGET_HIPS = ("mixamorig:Hips", "Lower_body")
+
+
+def _poll_mixamo_src(self, obj):
+    """Object-picker filter: only armatures that look like a Mixamo FBX."""
+    return (obj is not None and obj.type == 'ARMATURE' and obj.data is not None
+            and any(b.name.startswith("mixamorig") for b in obj.data.bones))
+
+
+def _retarget_target(context):
+    """The rig to copy onto: the active player armature, else the first detected."""
+    players = _player_armatures()
+    ao = context.active_object
+    if ao is not None and ao in players:
+        return ao
+    return players[0] if players else None
+
+
+def _retarget_mixamo(src, trg, action_name="NovaSkin Retarget"):
+    """Bake ``src`` (Mixamo armature)'s action onto ``trg`` (Thomas rig) FK controls.
+
+    Raises ``RuntimeError(message)`` for any user-facing problem; on success returns
+    ``(action, n_frames)``.  No constraints are left behind."""
+    from mathutils import Vector  # noqa: F401  (rotation_difference lives on Vector)
+    scene = bpy.context.scene
+    if src is None or src.type != 'ARMATURE':
+        raise RuntimeError("Pick a source FBX (a Mixamo armature) first.")
+    if trg is None or trg.type != 'ARMATURE':
+        raise RuntimeError("No target rig -- select the Thomas rig, then try again.")
+    if src is trg:
+        raise RuntimeError("Source and target are the same armature.")
+    if not (src.animation_data and src.animation_data.action):
+        raise RuntimeError("'%s' has no animation to copy." % src.name)
+    for b in ("mixamorig:Hips", "mixamorig:LeftArm"):
+        if b not in src.pose.bones:
+            raise RuntimeError("'%s' is not a Mixamo skeleton (missing %s)." % (src.name, b))
+    for b in ("Lower_body", "Arm_Upper_FK.L", "Leg_FK.L"):
+        if b not in trg.pose.bones:
+            raise RuntimeError("'%s' is missing bone '%s' -- is it the Thomas rig?"
+                               % (trg.name, b))
+
+    Sw, Tw = src.matrix_world, trg.matrix_world
+    Twi = Tw.to_3x3().inverted()
+    rng = src.animation_data.action.frame_range
+    f0, f1 = int(rng[0]), int(rng[1])
+
+    for bone, (prop, val) in _RETARGET_FK_SWITCH.items():    # put the limbs in FK
+        pb = trg.pose.bones.get(bone)
+        if pb and prop in pb:
+            pb[prop] = val
+
+    body = [(s, t) for s, t in _RETARGET_BODY
+            if s in src.pose.bones and t in trg.pose.bones]
+    arms = [a for a in _RETARGET_ARMS
+            if a[0] in trg.pose.bones and a[1] in src.pose.bones and a[2] in src.pose.bones
+            and (a[3] is None or a[3] in trg.pose.bones)]
+    Srest = {s: (Sw @ src.pose.bones[s].bone.matrix_local).to_3x3() for s, _ in body}
+    Trest = {t: Tw @ trg.pose.bones[t].bone.matrix_local for _, t in body}
+    Trest_arm = {a[0]: Tw @ trg.pose.bones[a[0]].bone.matrix_local for a in arms}
+    body_map = {t: s for s, t in body}
+    arm_map = {a[0]: a for a in arms}
+    hips_src, hips_trg = _RETARGET_HIPS
+    hip_rest = (Sw @ src.pose.bones[hips_src].bone.matrix_local).translation
+    ratio = (Trest[hips_trg].translation.z / hip_rest.z
+             if hips_trg in Trest and abs(hip_rest.z) > 1e-6 else 1.0)
+
+    def _depth(b):
+        d, p = 0, trg.data.bones[b].parent
+        while p:
+            d, p = d + 1, p.parent
+        return d
+    targets = [t for _, t in body] + [a[0] for a in arms]
+    by_depth = {}
+    for t in targets:
+        by_depth.setdefault(_depth(t), []).append(t)
+    levels = [by_depth[d] for d in sorted(by_depth)]         # root -> leaf, update per level
+
+    def sh(b):
+        return (Sw @ src.pose.bones[b].matrix).translation
+    def thr(b):
+        return (Tw @ trg.data.bones[b].matrix_local).translation
+    def ttr(b):
+        return Tw @ trg.data.bones[b].tail_local
+
+    if trg.animation_data is None:
+        trg.animation_data_create()
+    trg.animation_data.action = None
+    act = bpy.data.actions.new(action_name)
+    trg.animation_data.action = act
+
+    update = bpy.context.view_layer.update
+    wm = bpy.context.window_manager
+    wm.progress_begin(f0, f1)
+    try:
+        for f in range(f0, f1 + 1):
+            scene.frame_set(f)
+            update()
+            for level in levels:
+                for tb in level:
+                    pb = trg.pose.bones[tb]
+                    cur = pb.matrix.copy()
+                    if tb in body_map:                       # --- rotation-delta ---
+                        s = body_map[tb]
+                        Swr = (Sw @ src.pose.bones[s].matrix).to_3x3()
+                        desired = (Swr @ Srest[s].inverted()) @ Trest[tb].to_3x3()
+                        m = (Twi @ desired).to_4x4()
+                        if tb == hips_trg:
+                            m.translation = (Trest[hips_trg].translation
+                                             + ratio * (sh(hips_src) - hip_rest))
+                        else:
+                            m.translation = cur.translation
+                    else:                                    # --- aim ---
+                        _, s_head, s_tip, tchild = arm_map[tb]
+                        d = (sh(s_tip) - sh(s_head)).normalized()
+                        drt = ((thr(tchild) - thr(tb)) if tchild
+                               else (ttr(tb) - thr(tb))).normalized()
+                        R = drt.rotation_difference(d).to_matrix()
+                        m = (Twi @ (R @ Trest_arm[tb].to_3x3())).to_4x4()
+                        m.translation = cur.translation
+                    pb.matrix = m
+                    rot = ("rotation_quaternion" if pb.rotation_mode == 'QUATERNION'
+                           else "rotation_euler")
+                    pb.keyframe_insert(data_path=rot, frame=f)
+                    if tb == hips_trg:
+                        pb.keyframe_insert(data_path="location", frame=f)
+                update()
+            wm.progress_update(f)
+    finally:
+        wm.progress_end()
+
+    scene.frame_start, scene.frame_end = f0, f1
+    scene.frame_set(f0)
+    return act, (f1 - f0 + 1)
+
+
+class OBJECT_OT_novaskin_retarget(bpy.types.Operator):
+    """Copy the selected Mixamo FBX's animation onto the Thomas rig (bakes FK keyframes)"""
+    bl_idname = "object.novaskin_retarget"
+    bl_label = "Copy FBX Animation to Rig"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        st = context.scene.novaskin
+        src = st.retarget_source
+        trg = _retarget_target(context)
+        try:
+            act, n = _retarget_mixamo(src, trg)
+        except RuntimeError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        except Exception as e:                      # unexpected -- surface it, don't crash the UI
+            self.report({'ERROR'}, "Retarget failed: %r" % e)
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Copied %d frames onto '%s' (action '%s')."
+                    % (n, trg.name, act.name))
+        return {'FINISHED'}
+
+
+class OBJECT_OT_novaskin_clear_anim(bpy.types.Operator):
+    """Remove the animation from the selected rig and return it to its rest pose"""
+    bl_idname = "object.novaskin_clear_anim"
+    bl_label = "Clear Rig Animation"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        trg = _retarget_target(context)
+        if trg is None:
+            self.report({'ERROR'}, "No target rig selected.")
+            return {'CANCELLED'}
+        ad = trg.animation_data
+        act = ad.action if ad else None
+        only_user = act is not None and act.users <= 1   # this rig is the only user
+        if ad:
+            ad.action = None
+        # tidy up our own auto-generated orphan actions (leave user-named / shared ones alone)
+        if (act is not None and only_user and not act.use_fake_user
+                and act.name.startswith("NovaSkin Retarget")):
+            bpy.data.actions.remove(act, do_unlink=True)
+        # reset every pose bone to rest so the rig no longer holds the last frame
+        for pb in trg.pose.bones:
+            pb.location = (0.0, 0.0, 0.0)
+            pb.scale = (1.0, 1.0, 1.0)
+            if pb.rotation_mode == 'QUATERNION':
+                pb.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+            elif pb.rotation_mode == 'AXIS_ANGLE':
+                pb.rotation_axis_angle = (0.0, 0.0, 1.0, 0.0)
+            else:
+                pb.rotation_euler = (0.0, 0.0, 0.0)
+        trg.update_tag()
+        context.view_layer.update()
+        self.report({'INFO'}, "Cleared animation on '%s'." % trg.name)
+        return {'FINISHED'}
+
+
 # ----------------------- UI: settings + panel -----------------------
 # The CONFIG constants at the top are the defaults/fallback. These scene properties mirror
 # the most-used ones so they can be edited in the N-panel; _apply_settings() copies them
@@ -4863,6 +5090,11 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         items=[('64', "64", ""), ('128', "128", ""), ('256', "256", ""),
                ('512', "512", ""), ('1024', "1024", "")],
         default='512')
+    retarget_source: PointerProperty(
+        name="Source FBX",
+        description="Mixamo FBX armature to copy the animation from (the one with "
+                    "mixamorig: bones). The animation is baked onto the selected Thomas rig",
+        type=bpy.types.Object, poll=_poll_mixamo_src)
     ui_tab: EnumProperty(
         name="Section",
         items=[('EXPORT', "Export", "Layer options, quality, output and the render buttons",
@@ -5517,6 +5749,21 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                 box.label(text="none marked", icon='LAYER_USED')
 
         elif tab == 'ANIM':
+            rbox = layout.box()
+            rbox.label(text="Copy FBX Animation (Mixamo → Rig)", icon='ARMATURE_DATA')
+            rbox.prop(st, "retarget_source", text="Source")
+            _tgt = _retarget_target(context)
+            rbox.label(text=(f"onto: {_tgt.name}" if _tgt else "no Thomas rig found"),
+                       icon='FORWARD' if _tgt else 'ERROR')
+            _r = rbox.row()
+            _r.scale_y = 1.3
+            _r.enabled = bool(st.retarget_source and _tgt and not running)
+            _r.operator("object.novaskin_retarget", icon='ANIM_DATA')
+            _c = rbox.row()
+            _c.enabled = bool(_tgt and not running)
+            _c.operator("object.novaskin_clear_anim", icon='TRASH')
+            rbox.label(text="Bakes onto the FK controls. Feet may need cleanup.", icon='INFO')
+
             box = layout.box()
             box.label(text="Animated (beta)", icon='RENDER_ANIMATION')
             if not running:               # while running, the top progress bar is the indicator
@@ -5533,6 +5780,7 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 _classes = (NovaSkinAddonPreferences, NovaSkinSettings, RENDER_OT_novaskin,
             RENDER_OT_novaskin_animated, RENDER_OT_novaskin_static, RENDER_OT_novaskin_cancel,
             OBJECT_OT_novaskin_layer_toggle, OBJECT_OT_novaskin_layer_remove,
+            OBJECT_OT_novaskin_retarget, OBJECT_OT_novaskin_clear_anim,
             VIEW3D_PT_novaskin)
 
 
