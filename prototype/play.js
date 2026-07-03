@@ -116,17 +116,24 @@ async function video(src) {
   v.preload = 'auto';
   return new Promise((ok) => { v.oncanplaythrough = () => ok(v); v.load(); });
 }
-// fg/matte are optional: v4 exports drop them (scene_depth occludes per-pixel instead)
+// every stream but the background is optional: v4 dropped fg/matte (scene_depth occludes
+// per-pixel), v5 replaces the screen-space light with the UV-space light_atlas tiles
+const hasLight = !!manifest.videos.light;
+const hasAtlas = !!manifest.videos.light_atlas;
 const hasFg = !!manifest.videos.foreground;
 const hasMatte = !!manifest.videos.foreground_matte;
 const hasDepth = !!manifest.videos.scene_depth;
-const vidList = [manifest.videos.background, manifest.videos.light];
+const vidList = [manifest.videos.background];
+if (hasLight) vidList.push(manifest.videos.light);
+if (hasAtlas) vidList.push(manifest.videos.light_atlas);
 if (hasFg) vidList.push(manifest.videos.foreground);
 if (hasMatte) vidList.push(manifest.videos.foreground_matte);
 if (hasDepth) vidList.push(manifest.videos.scene_depth);
 const loadedVids = await Promise.all(vidList.map(video));
 let _vi = 0;
-const vBg = loadedVids[_vi++], vLight = loadedVids[_vi++];
+const vBg = loadedVids[_vi++];
+const vLight = hasLight ? loadedVids[_vi++] : null;
+const vAtlas = hasAtlas ? loadedVids[_vi++] : null;
 const vFg = hasFg ? loadedVids[_vi++] : null;
 const vMatte = hasMatte ? loadedVids[_vi++] : null;
 const vDepth = hasDepth ? loadedVids[_vi++] : null;
@@ -135,7 +142,7 @@ const vDepth = hasDepth ? loadedVids[_vi++] : null;
 // in step too -- it is the occlusion shape; if it lags, the foreground freezes/misaligns.
 const SYNC_TOL = 1.5 / manifest.fps;   // re-seek if off by more than ~1.5 frames
 function syncVideos() {
-  for (const v of [vFg, vLight, vMatte, vDepth]) {
+  for (const v of [vFg, vLight, vAtlas, vMatte, vDepth]) {
     if (v && Math.abs(v.currentTime - vBg.currentTime) > SYNC_TOL)
       v.currentTime = vBg.currentTime;
   }
@@ -207,6 +214,7 @@ const meshP = prog(
    uniform sampler2D uSkin; uniform sampler2D uLight; uniform vec2 uRes;
    uniform vec2 uLightOrigin; uniform vec2 uLightSize;
    uniform bool uUseLight; uniform bool uFlat; uniform int uPass;
+   uniform bool uLightUV; uniform float uTile; uniform float uTiles;
    in vec2 vUv; out vec4 frag;
    // anti-aliased pixel-art sampling: snap UV to the texel CENTRE but ramp across the seam over ~1px.
    vec4 texAA(sampler2D tx, vec2 uv){
@@ -219,7 +227,10 @@ const meshP = prog(
      if(s.a<0.004) discard;                // outside the silhouette
      if(uPass==0 && s.a<0.996) discard;    // opaque pass: solid texels (write depth)
      if(uPass==1 && s.a>=0.996) discard;   // edge pass: anti-aliased skin edge (blend)
-     vec2 luv=(gl_FragCoord.xy - uLightOrigin)/uLightSize;
+     // v5: light lives in a per-player UV-space atlas tile (overlay rects pre-filled at
+     // export); older exports sample the screen-space light video at the fragment position.
+     vec2 luv = uLightUV ? vec2((vUv.x + uTile) / uTiles, vUv.y)
+                         : (gl_FragCoord.xy - uLightOrigin)/uLightSize;
      vec3 l=uUseLight ? texture(uLight,luv).rgb*2.0 : vec3(1.0);
      vec3 base = s.a>1e-4 ? s.rgb/s.a : vec3(0.0);   // un-premultiply -> straight colour
      frag=vec4(base*l*s.a, s.a);           // premultiplied relit entity, drawn COMPLETE
@@ -240,6 +251,7 @@ function upload(t, srcEl, premult) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcEl);
 }
 const tBg = tex(), tFg = tex(), tLight = tex(), tMatte = tex();
+const tAtlas = tex();       // v5 light tiles: LINEAR (smooth light, interpolation is right)
 const tDepth = tex(true);   // NEAREST: depth is data -- interpolating across edges invents depths
 const tSkins = skins.map((img) => { const t = tex(); upload(t, img, true); return t; });  // LINEAR + premult (texel-AA safe)
 
@@ -364,8 +376,10 @@ function drawPlayers(o) {
   gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), o.light ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uFlat'), o.wire ? 1 : 0);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLight);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, vAtlas ? tAtlas : tLight);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uLightUV'), vAtlas ? 1 : 0);
+  gl.uniform1f(gl.getUniformLocation(meshP, 'uTiles'), manifest.mesh.players.length);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uLightOrigin'), cropBL.x, cropBL.y);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uLightSize'), cropBL.w, cropBL.h);
   gl.activeTexture(gl.TEXTURE0);
@@ -379,6 +393,7 @@ function drawPlayers(o) {
   }
   manifest.mesh.players.forEach((p, i) => {
     gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
+    gl.uniform1f(gl.getUniformLocation(meshP, 'uTile'), i);   // v5: this player's atlas tile
     // base span + each ENABLED overlay part (v3+ manifests); older exports = whole range
     const ranges = p.parts
       ? [[p.tri_range[0], p.overlay_tri_start ?? p.tri_range[1]],
@@ -426,7 +441,8 @@ function drawComposite() {
 function drawGrid() {
   const tiles = [
     () => blitVideo(tBg, FULLRECT),                          // background (shadows baked)
-    () => blitVideo(tLight, cropRectNDC),                    // light (base look, dilated)
+    () => blitVideo(vAtlas ? tAtlas : tLight,                // light: v5 atlas tiles / old video
+                    vAtlas ? FULLRECT : cropRectNDC),
     () => drawFgVideo(),                                     // foreground + matte
     () => { if (vDepth) blitVideo(tDepth, cropRectNDC); },   // scene depth (players' band)
     () => drawPlayers({ wire: true, occlude: ck('ck_fg') }), // wireframe (occlusion applied)
@@ -447,7 +463,9 @@ function drawGrid() {
 
 function draw() {
   if (!vBg.paused) syncVideos();     // keep fg/light/matte/depth locked to bg while playing
-  upload(tBg, vBg); upload(tLight, vLight);
+  upload(tBg, vBg);
+  if (vLight) upload(tLight, vLight);
+  if (vAtlas) upload(tAtlas, vAtlas);
   if (vFg) upload(tFg, vFg);
   if (vMatte) upload(tMatte, vMatte);
   if (vDepth) upload(tDepth, vDepth);
@@ -486,8 +504,8 @@ document.getElementById('stats').textContent = statsText;
       : statsText;
   };
 }
-const vids = [vBg, vLight, ...(vFg ? [vFg] : []), ...(vMatte ? [vMatte] : []),
-              ...(vDepth ? [vDepth] : [])];
+const vids = [vBg, ...(vLight ? [vLight] : []), ...(vAtlas ? [vAtlas] : []),
+              ...(vFg ? [vFg] : []), ...(vMatte ? [vMatte] : []), ...(vDepth ? [vDepth] : [])];
 const playbtn = document.getElementById('playbtn');
 playbtn.onclick = () => {
   if (vBg.paused) { vids.forEach(v => v.play()); playbtn.textContent = '❚❚'; }
@@ -506,7 +524,7 @@ scrub.oninput = () => {
 };
 // debug handle (pause/seek from the console): __dbg.seek(5.0)
 window.__dbg = {
-  vBg, vFg, vLight, vMatte, vDepth, hasMatte, hasDepth, keys, K, keysFps, setSkin,
+  vBg, vFg, vLight, vAtlas, vMatte, vDepth, hasMatte, hasDepth, hasAtlas, keys, K, keysFps, setSkin,
   seek(t) { for (const v of vids) { v.pause(); v.currentTime = t; } },
 };
 let rafId = 0, dead = false;
