@@ -529,6 +529,58 @@ def _uv_part_label(o):
     return None
 
 
+def _uv_face_buckets(me):
+    """Per-face classification of an evaluated, loop-triangulated mesh against MC_UV_RECTS,
+    for meshes that pack SEVERAL skin parts into ONE object (generic single-mesh rigs):
+    {canonical_label: [loop_triangle index, ...]}. Each face goes to the rect containing its
+    UV centroid; faces outside every rect are dropped, and buckets that don't cover >= 50%
+    of their rect (decoration merely sampling skin pixels) are dropped too. Arm/sleeve
+    buckets resolve classic/slim by the bucket's UV width, like _uv_part_label."""
+    uvl = next((l for l in me.uv_layers if l.active_render),
+               me.uv_layers.active if len(me.uv_layers) else None)
+    n = len(me.loop_triangles)
+    if uvl is None or n == 0:
+        return {}
+    loops = np.empty(n * 3, np.int64)
+    me.loop_triangles.foreach_get('loops', loops)
+    buf = np.empty(len(uvl.data) * 2, np.float32)
+    uvl.data.foreach_get('uv', buf)
+    u = (buf[0::2] * 64.0)[loops].reshape(n, 3)
+    v = (64.0 - buf[1::2] * 64.0)[loops].reshape(n, 3)       # top-left px
+    cx, cy = u.mean(axis=1), v.mean(axis=1)
+    out = {}
+    for name, (rx0, ry0, rx1, ry1) in MC_UV_RECTS.items():
+        m = (cx >= rx0) & (cx <= rx1) & (cy >= ry0) & (cy <= ry1)
+        if not m.any():
+            continue
+        x0, x1 = float(u[m].min()), float(u[m].max())
+        y0, y1 = float(v[m].min()), float(v[m].max())
+        if (x1 - x0) < (rx1 - rx0) * 0.5 or (y1 - y0) < (ry1 - ry0) * 0.5:
+            continue
+        lab = (f"{name}_{'slim' if (x1 - x0) <= 14.5 else 'classic'}"
+               if name in _MC_UV_VARIANT else name)
+        out[lab] = np.nonzero(m)[0].tolist()
+    return out
+
+
+def _object_face_buckets(o, dg=None):
+    """_uv_face_buckets over the object's own evaluated mesh. Returns the buckets dict for a
+    MULTI-part object (or a single-bucket dict when whole-object classification failed but
+    one clean part remains after dropping junk faces); None for ordinary single-part objects
+    (fast path -- collectors weld the whole mesh as today). Loop-triangle order is
+    deterministic for an unchanged depsgraph, so the indices match the collector's own
+    to_mesh() of the same object."""
+    if _uv_part_label(o) is not None:
+        return None
+    dg = dg or bpy.context.evaluated_depsgraph_get()
+    ev = o.evaluated_get(dg)
+    me = ev.to_mesh()
+    me.calc_loop_triangles()
+    b = _uv_face_buckets(me)
+    ev.to_mesh_clear()
+    return b or None
+
+
 def _assign_part_labels(parts, label=None):
     """Return {object_name: unique_label} for a player's parts, disambiguating collisions
     (e.g. duplicate meshes) with a "_2", "_3"... suffix. Deterministic (sorted by name).
@@ -2915,20 +2967,25 @@ def _anim_collect_static(players, W, H):
     for p in ordered:
         labs = p.get("uv_labels") or _assign_part_labels(p["uv_parts"], label=p["label"])
         kind = {o.name: _anim_label_kind(labs.get(o.name)) for o in p["uv_parts"]}
-        # base parts first, then the overlay shell: the viewer draws the ranges in order, so
-        # the (alpha-discarded) overlay blends over its own base with the depth test deciding.
-        parts = (sorted([o for o in p["uv_parts"] if kind[o.name] == 'base'],
-                        key=lambda o: o.name)
-                 + sorted([o for o in p["uv_parts"] if kind[o.name] == 'overlay'],
-                          key=lambda o: o.name))
+        # Objects that don't classify as one part may be single-mesh generic rigs packing
+        # several skin parts: expand them per-face (skin buckets); junk-only meshes stay out.
+        mixed = {}
+        for o in p["uv_parts"]:
+            if kind[o.name] is None:
+                b = _object_face_buckets(o, dg)
+                if b:
+                    mixed[o.name] = b
         w0, t0 = len(st["src"]), len(st["tris"]) // 3
         parts_meta = []
-        for o in parts:
+
+        def emit(o, lab, subset, overlay):
             pt0 = len(st["tris"]) // 3
             pi = len(st["parts"]); st["parts"].append(o.name)
             ev = o.evaluated_get(dg); me = ev.to_mesh(); me.calc_loop_triangles()
             uvl = me.uv_layers.active.data
-            for lt in me.loop_triangles:
+            lts = (me.loop_triangles if subset is None
+                   else [me.loop_triangles[i] for i in subset])
+            for lt in lts:
                 for li, vi in zip(lt.loops, lt.vertices):
                     u, v = uvl[li].uv
                     k = (pi, vi, round(u * 4096), round(v * 4096))
@@ -2944,9 +3001,21 @@ def _anim_collect_static(players, W, H):
                         st["src"].append(ui)
                     st["tris"].append(j)
             ev.to_mesh_clear()
-            parts_meta.append({"label": labs.get(o.name),
+            parts_meta.append({"label": lab,
                                "tri_range": [pt0, len(st["tris"]) // 3],
-                               "overlay": kind[o.name] == 'overlay'})
+                               "overlay": overlay})
+
+        # ALL base tris first, then ALL overlay tris (the viewer's base span is
+        # [tri_range[0], overlay_tri_start]); mixed objects are visited once per phase.
+        for phase in ('base', 'overlay'):
+            for o in sorted([o for o in p["uv_parts"] if kind[o.name] == phase],
+                            key=lambda o: o.name):
+                emit(o, labs.get(o.name), None, phase == 'overlay')
+            for o in sorted([o for o in p["uv_parts"] if o.name in mixed],
+                            key=lambda o: o.name):
+                for lab in sorted(mixed[o.name]):
+                    if _anim_label_kind(lab) == phase:
+                        emit(o, lab, mixed[o.name][lab], phase == 'overlay')
         ov_t0 = next((pm["tri_range"][0] for pm in parts_meta if pm["overlay"]),
                      len(st["tris"]) // 3)
         st["players"].append({"label": p["label"],
@@ -3175,7 +3244,7 @@ def _static_collect(players, W, H, mesh_layers=None):
     st = {"parts": [], "uv": [], "src": [], "tris": [], "players": [], "uniq": [], "pos": []}
     weld, uniq_keys = {}, {}
 
-    def add_part(o):
+    def add_part(o, subset=None):
         pi = len(st["parts"]); st["parts"].append(o.name)
         dgl = bpy.context.evaluated_depsgraph_get()      # fresh: the arm-style switch re-evaluates
         ev = o.evaluated_get(dgl); me = ev.to_mesh(); me.calc_loop_triangles()
@@ -3188,7 +3257,9 @@ def _static_collect(players, W, H, mesh_layers=None):
         clip = wp @ P[:3, :3].T + P[:3, 3]
         wcl = wp @ P[3, :3] + P[3, 3]
         scr = (clip[:, :2] / wcl[:, None] * 0.5 + 0.5) * np.array([W, H], 'f')
-        for lt in me.loop_triangles:
+        lts = (me.loop_triangles if subset is None
+               else [me.loop_triangles[i] for i in subset])   # per-face bucket of a mixed mesh
+        for lt in lts:
             for li, vi in zip(lt.loops, lt.vertices):
                 u, v = uvl[li].uv
                 k = (pi, vi, round(u * 4096), round(v * 4096))
@@ -3211,23 +3282,45 @@ def _static_collect(players, W, H, mesh_layers=None):
         # Parts visible in the player's CURRENT arm style: base (head/body/legs + the active arm),
         # overlay (2nd layer). The other arm variant is collected separately below.
         vis = [o for o in p["uv_parts"] if not o.hide_render]
+        # single-mesh generic rigs: objects packing several skin parts expand per-face
+        mixed = {}
+        for o in vis:
+            if _uv_part_label(o) is None:
+                b = _object_face_buckets(o)
+                if b:
+                    mixed[o.name] = (o, b)
         def _is_ov(o, _labs=labs):
             return any(k in (_labs.get(o.name) or "").lower() for k in ATLAS_OVERLAY_LABELS)
-        base = sorted([o for o in vis if not _is_ov(o)], key=lambda o: o.name)
-        ov = sorted([o for o in vis if _is_ov(o)], key=lambda o: o.name)
+        def _is_ov_label(lab):
+            return any(k in lab.lower() for k in ATLAS_OVERLAY_LABELS)
+        base = sorted([o for o in vis if o.name not in mixed and not _is_ov(o)],
+                      key=lambda o: o.name)
+        ov = sorted([o for o in vis if o.name not in mixed and _is_ov(o)],
+                    key=lambda o: o.name)
         parts_meta = []
         w0, t0 = len(st["src"]), len(st["tris"]) // 3
 
-        def _emit(o, overlay):
+        def _emit(o, overlay, lab=None, subset=None):
             pt0 = len(st["tris"]) // 3
-            add_part(o)
-            parts_meta.append({"label": labs.get(o.name, o.name),
+            add_part(o, subset)
+            lab = lab if lab is not None else labs.get(o.name, o.name)
+            parts_meta.append({"label": lab,
                                "tri_range": [pt0, len(st["tris"]) // 3],
-                               "overlay": overlay, "variant": _part_variant(labs.get(o.name))})
+                               "overlay": overlay, "variant": _part_variant(lab)})
+        # ALL base tris before ALL overlay tris (the viewer's base span relies on it);
+        # mixed objects are visited once per phase with the matching buckets.
         for o in base:
             _emit(o, False)
+        for name in sorted(mixed):
+            o, b = mixed[name]
+            for lab in sorted(l for l in b if not _is_ov_label(l)):
+                _emit(o, False, lab, b[lab])
         for o in ov:
             _emit(o, True)
+        for name in sorted(mixed):
+            o, b = mixed[name]
+            for lab in sorted(l for l in b if _is_ov_label(l)):
+                _emit(o, True, lab, b[lab])
         # The OTHER arm variant (classic<->slim): flip the rig so its arm/sleeve parts pose at the
         # arm position, then collect them (positions captured here, while correct). Atlas is baked
         # from the default variant only -- the two UV regions differ ~1px so the bake margin covers
@@ -4433,8 +4526,19 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     base_parts, overlay_parts, other_char = [], [], []
     for p in players:
         p["uv_labels"] = _assign_part_labels(p["uv_parts"], label=p["label"])
+        uv_set = {o.name for o in p["uv_parts"]}
         for o in p["char_all"]:
             kind = _anim_label_kind(p["uv_labels"].get(o.name))
+            if kind is None and o.name in uv_set:
+                # single-mesh generic rig: the object packs several skin parts per-face --
+                # it must stay VISIBLE (the collector expands it into bucket parts).
+                b = _object_face_buckets(o)
+                if b:
+                    kind = 'base'
+                    if any(_anim_label_kind(l) == 'overlay' for l in b):
+                        print(f"[WARN] {o.name}: packs overlay faces in one mesh; they can't "
+                              f"be object-hidden for the LIGHT pass, so the base light under "
+                              f"them keeps their occlusion (single-mesh rig limitation).")
             if kind == 'overlay':
                 overlay_parts.append(o)
             (base_parts if kind is not None else other_char).append(o)
