@@ -116,15 +116,20 @@ async function video(src) {
   v.preload = 'auto';
   return new Promise((ok) => { v.oncanplaythrough = () => ok(v); v.load(); });
 }
+// fg/matte are optional: v4 exports drop them (scene_depth occludes per-pixel instead)
+const hasFg = !!manifest.videos.foreground;
 const hasMatte = !!manifest.videos.foreground_matte;
-const hasDepth = !!manifest.videos.scene_depth;   // v4: per-pixel occlusion replaces the fg quad
-const vidList = [manifest.videos.background, manifest.videos.foreground, manifest.videos.light];
+const hasDepth = !!manifest.videos.scene_depth;
+const vidList = [manifest.videos.background, manifest.videos.light];
+if (hasFg) vidList.push(manifest.videos.foreground);
 if (hasMatte) vidList.push(manifest.videos.foreground_matte);
 if (hasDepth) vidList.push(manifest.videos.scene_depth);
 const loadedVids = await Promise.all(vidList.map(video));
-const [vBg, vFg, vLight] = loadedVids;
-const vMatte = hasMatte ? loadedVids[3] : null;
-const vDepth = hasDepth ? loadedVids[hasMatte ? 4 : 3] : null;
+let _vi = 0;
+const vBg = loadedVids[_vi++], vLight = loadedVids[_vi++];
+const vFg = hasFg ? loadedVids[_vi++] : null;
+const vMatte = hasMatte ? loadedVids[_vi++] : null;
+const vDepth = hasDepth ? loadedVids[_vi++] : null;
 // Frame-lock the secondary videos to the background's clock every drawn frame (independent
 // <video> elements drift, and start playing at slightly different times). The MATTE must be
 // in step too -- it is the occlusion shape; if it lags, the foreground freezes/misaligns.
@@ -400,6 +405,7 @@ function drawPlayers(o) {
   if (useDepth) gl.disable(gl.DEPTH_TEST);
 }
 function drawFgVideo() {
+  if (!vFg) return;    // v4 exports have no fg streams (depth prepass occludes instead)
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   gl.useProgram(fgP); gl.bindVertexArray(quadVao);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tFg);
@@ -441,7 +447,8 @@ function drawGrid() {
 
 function draw() {
   if (!vBg.paused) syncVideos();     // keep fg/light/matte/depth locked to bg while playing
-  upload(tBg, vBg); upload(tFg, vFg); upload(tLight, vLight);
+  upload(tBg, vBg); upload(tLight, vLight);
+  if (vFg) upload(tFg, vFg);
   if (vMatte) upload(tMatte, vMatte);
   if (vDepth) upload(tDepth, vDepth);
   // snap: sample the mesh at the video's frame grid (the pose the fg/light frames saw) instead
@@ -479,7 +486,8 @@ document.getElementById('stats').textContent = statsText;
       : statsText;
   };
 }
-const vids = [vBg, vFg, vLight, ...(vMatte ? [vMatte] : []), ...(vDepth ? [vDepth] : [])];
+const vids = [vBg, vLight, ...(vFg ? [vFg] : []), ...(vMatte ? [vMatte] : []),
+              ...(vDepth ? [vDepth] : [])];
 const playbtn = document.getElementById('playbtn');
 playbtn.onclick = () => {
   if (vBg.paused) { vids.forEach(v => v.play()); playbtn.textContent = '❚❚'; }
@@ -499,7 +507,7 @@ scrub.oninput = () => {
 // debug handle (pause/seek from the console): __dbg.seek(5.0)
 window.__dbg = {
   vBg, vFg, vLight, vMatte, vDepth, hasMatte, hasDepth, keys, K, keysFps, setSkin,
-  seek(t) { for (const v of [vBg, vFg, vLight]) { v.pause(); v.currentTime = t; } },
+  seek(t) { for (const v of vids) { v.pause(); v.currentTime = t; } },
 };
 let rafId = 0, dead = false;
 // next boot (folder picked) stops this instance: rAF loop, videos, and its UI controls

@@ -2922,7 +2922,7 @@ def _anim_frame_cached(adir, i):
     fn = f"{i + 1:04d}.png"
     return all(os.path.exists(p) and os.path.getsize(p) > 0
                for p in (os.path.join(adir, "seq", k, fn)
-                         for k in ("bg", "fg", "fg_matte", "light", "depth")))
+                         for k in ("bg", "light", "depth")))
 
 
 def _anim_dilate_light(rgb, covered, W, H, passes=None):
@@ -4472,8 +4472,6 @@ def _anim_encode(adir, fps):
     import shutil as _sh, subprocess, sys
     seq = os.path.join(adir, "seq")
     jobs = [("bg", "background.webm", ["-pix_fmt", "yuv420p"], "bg"),
-            ("fg", "foreground.webm", ["-pix_fmt", "yuv420p"], "fg"),
-            ("fg_matte", "foreground_matte.webm", ["-pix_fmt", "yuv420p"], "fg"),
             ("light", "light.webm", ["-pix_fmt", "yuv420p"], "light"),
             # depth is DATA, not picture: lossy VP9 blurs its edges into wrong depths
             # (measured p99 6+ levels at silhouettes), lossless stays within ~2 levels
@@ -4510,13 +4508,13 @@ def _anim_encode(adir, fps):
         r = subprocess.run(cmd(name, out, extra, ck), capture_output=True, text=True)
         if r.returncode != 0:
             return False, f"ffmpeg failed on {out}: {r.stderr[-400:]}"
-    return True, "encoded bg / foreground (+ matte) / light .webm"
+    return True, "encoded bg / light / scene_depth .webm"
 
 
 def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     """Generator for the animated export (one yield per unit of work, like _render_steps).
-    Per frame: background (players camera-invisible, shadows baked), foreground (per-pixel:
-    scenery-holdout AND player silhouette), combined light; plus mesh keys every
+    Per frame: background (players camera-invisible, shadows baked) + scenery depth (1-sample
+    Z, per-pixel occlusion in the viewer), and the combined light; plus mesh keys every
     ANIM_KEYS_STEP frames. Writes mesh.bin/anim.bin/manifest.json and encodes the videos."""
     s = bpy.context.scene
     f0 = s.frame_start if frame_start is None else frame_start
@@ -4529,7 +4527,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     W = s.render.resolution_x * MASK_RES_PCT // 100
     H = s.render.resolution_y * MASK_RES_PCT // 100
     adir = os.path.join(_abs(OUT_DIR), ANIM_OUT_SUBDIR)
-    for k in ("bg", "fg", "fg_matte", "light", "depth"):
+    for k in ("bg", "light", "depth"):
         os.makedirs(os.path.join(adir, "seq", k), exist_ok=True)
 
     # exported look = base + classic overlay shells; overlay_parts also tracked separately so
@@ -4553,7 +4551,6 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             if kind == 'overlay':
                 overlay_parts.append(o)
             (base_parts if kind is not None else other_char).append(o)
-    base_names = {o.name for o in base_parts}
     char_names = {o.name for p in players for o in p["char_all"]}
 
     forced_props = _force_selection_props_on(players)   # not strictly needed (base only)
@@ -4567,7 +4564,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         if pb is not None:
             rig_snap[a.name] = (pb.get('AntiLag'), pb.get('Slim main'))
 
-    total = 1 + nf * 3 + 2
+    total = 1 + nf * 2 + 2
     state = {"done": 0}
     def prog(msg):
         state["done"] += 1
@@ -4651,7 +4648,6 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             fn = f"{i+1:04d}.png"
             if ANIM_RESUME and _anim_frame_cached(adir, i):   # resume: this frame is done
                 yield prog(f"frame {i+1}/{nf} background (cached)")
-                yield prog(f"frame {i+1}/{nf} foreground (cached)")
                 yield prog(f"frame {i+1}/{nf} light (cached)")
                 continue
             s.frame_set(f)
@@ -4682,52 +4678,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             buf[:, :3] = _to_display(bg)
             _save_image(buf.reshape(-1), rW, rH, os.path.join(adir, "seq", "bg", fn))
             yield prog(f"frame {i+1}/{nf} background")
-            # 2) FOREGROUND: scenery-with-players-holdout, masked to the silhouette. The player
-            # wears an OPAQUE override for BOTH renders: the silhouette must be skin-INDEPENDENT
-            # (the export-time skin's transparent 2nd-layer texels would punch the overlay shell
-            # out of the matte; in-front scenery occludes the pixel column no matter what the
-            # runtime skin puts there) -- same design as the static export's matte passes.
-            setup()
-            svfg = _swap_materials(base_parts, gray)
-            hold = {o: o.is_holdout for o in base_parts}
-            for o in base_parts:
-                o.is_holdout = True
-            bpy.context.view_layer.update()
-            # SYNC (blocking) on purpose: C -> hide-scenery -> D is a back-to-back pair with a
-            # mid-sequence scene change, the exact pattern that RACED under the async modal in the
-            # static export (the INVOKE render did not reliably pick up the change) -- see
-            # _static_render_layers. Only bg + light run async.
-            C, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
-            for o, v in hold.items():
-                o.is_holdout = v
-            setup()
-            for o in s.objects:
-                if o.type == 'MESH' and o.name not in base_names:
-                    o.hide_render = True
-            bpy.context.view_layer.update()
-            D, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
-            _restore_materials(svfg)
-            ca = np.clip(C[:, 3], 0.0, 1.0)
-            straight = np.where(ca[:, None] > 1e-4,
-                                C[:, :3] / np.maximum(ca[:, None], 1e-4), 0.0)
-            alpha = np.where(D[:, 3] > 0.5, ca, 0.0)
-            vis = alpha > 1e-4
-            # Foreground split into RGB + a grayscale matte (the alpha) -- two plain videos,
-            # no alpha channel, so it decodes on Safari (no VP9-alpha there). RGB is zeroed
-            # outside the silhouette (flat -> compresses to nothing).
-            fg_rgb = np.zeros((C.shape[0], 4), 'float32'); fg_rgb[:, 3] = 1.0
-            fg_rgb[vis, :3] = _to_display(straight[vis])
-            # dilate the color outward so the matte's soft/compressed edge blends with real
-            # scenery color instead of the zeroed black (which would fringe the silhouette)
-            fg_rgb[:, :3] = _anim_dilate_light(fg_rgb[:, :3], vis, rW, rH)
-            crgb, cW, cH = _crop(fg_rgb.reshape(-1))
-            _save_image(crgb, cW, cH, os.path.join(adir, "seq", "fg", fn))
-            matte = np.ones((C.shape[0], 4), 'float32')
-            matte[:, 0] = matte[:, 1] = matte[:, 2] = alpha
-            cm, _, _ = _crop(matte.reshape(-1))
-            _save_image(cm, cW, cH, os.path.join(adir, "seq", "fg_matte", fn),
-                        colorspace='Non-Color')
-            yield prog(f"frame {i+1}/{nf} foreground")
+            # (v4: no foreground pass -- the scene-depth video occludes the mesh per-pixel in
+            # the viewer, replacing the old scenery-holdout/silhouette pair. Translucids over
+            # the player -- water tint -- are not represented; a future material-specific
+            # translucent foreground can restore them.)
             # 3) LIGHT: base parts gray, scenery camera-invisible (still lighting). Overlay
             # shells HIDDEN: the light must be the base's own, overlay-free (no phantom brim
             # shadow -- mesh-export design); the viewer draws overlays sampling this same
@@ -4771,8 +4725,6 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             # (fragScreenTopLeft - crop.xy) / crop.wh.
             "crop": {"x": cx0, "y": H - cy1, "w": cx1 - cx0, "h": cy1 - cy0},
             "videos": {"background": "background.webm",
-                       "foreground": "foreground.webm",
-                       "foreground_matte": "foreground_matte.webm",
                        "light": "light.webm",
                        "scene_depth": "scene_depth.webm"},
             # scenery-only camera depth, cropped like fg/light, normalized to the players'
