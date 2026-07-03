@@ -4657,8 +4657,13 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             buf[:, :3] = _to_display(bg)
             _save_image(buf.reshape(-1), rW, rH, os.path.join(adir, "seq", "bg", fn))
             yield prog(f"frame {i+1}/{nf} background")
-            # 2) FOREGROUND: scenery-with-players-holdout, masked to the silhouette
+            # 2) FOREGROUND: scenery-with-players-holdout, masked to the silhouette. The player
+            # wears an OPAQUE override for BOTH renders: the silhouette must be skin-INDEPENDENT
+            # (the export-time skin's transparent 2nd-layer texels would punch the overlay shell
+            # out of the matte; in-front scenery occludes the pixel column no matter what the
+            # runtime skin puts there) -- same design as the static export's matte passes.
             setup()
+            svfg = _swap_materials(base_parts, gray)
             hold = {o: o.is_holdout for o in base_parts}
             for o in base_parts:
                 o.is_holdout = True
@@ -4676,6 +4681,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                     o.hide_render = True
             bpy.context.view_layer.update()
             D, _, _ = _render_combined_array(sess, ILLUM_RES_PCT, transparent=True)
+            _restore_materials(svfg)
             ca = np.clip(C[:, 3], 0.0, 1.0)
             straight = np.where(ca[:, None] > 1e-4,
                                 C[:, :3] / np.maximum(ca[:, None], 1e-4), 0.0)
