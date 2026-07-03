@@ -336,6 +336,9 @@ ANIM_OVERLAY_KEYS = ("hat", "jacket", "sleeve", "pant")
 # lerp vs 24fps video + VP9 edge blur) -- padding prevents black fringes. 0 disables.
 # 16 (not 8): overlay shells extend past the base silhouette and borrow its dilated light.
 ANIM_LIGHT_PAD = 16
+# v5: per-player UV-space light atlas resolution (the light video is replaced by a tiny tiled
+# atlas video reprojected from the render's UV pass; 64 = skin resolution, dense sampling).
+ANIM_ATLAS_RES = 64
 # Crop the foreground + light videos to the players' screen region (union over all frames +
 # this padding). Both only have content where the players are, so the rest of the frame is
 # wasted bytes (foreground is mostly transparent yet nearly as big as the background). The
@@ -2922,7 +2925,7 @@ def _anim_frame_cached(adir, i):
     fn = f"{i + 1:04d}.png"
     return all(os.path.exists(p) and os.path.getsize(p) > 0
                for p in (os.path.join(adir, "seq", k, fn)
-                         for k in ("bg", "light", "depth")))
+                         for k in ("bg", "atlas", "depth")))
 
 
 def _anim_dilate_light(rgb, covered, W, H, passes=None):
@@ -4464,6 +4467,53 @@ def _static_export(players, out_dir=None, op=None):
     return _drain_render(_static_export_steps(players, op=op, out_dir=out_dir))
 
 
+def _ffmpeg_path():
+    """ffmpeg binary, or None. GUI Blender doesn't inherit the shell PATH -- look in the
+    usual per-OS spots too."""
+    import shutil as _sh, sys
+    cands = (["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+             if sys.platform != "win32" else
+             [r"C:\ffmpeg\bin\ffmpeg.exe",
+              os.path.expandvars(r"%ProgramFiles%\ffmpeg\bin\ffmpeg.exe")])
+    return _sh.which("ffmpeg") or next((p for p in cands if os.path.exists(p)), None)
+
+
+def _anim_exr_read(ff, path, item, W, H, gray):
+    """Read one File Output EXR (v5 data passes) via ffmpeg -> float32 array, BOTTOM-UP rows
+    (the Viewer-array convention every consumer uses). gray -> (H*W,); else RGB -> (H*W, 3).
+    Values come back POSSIBLY limited-range-squeezed (ffmpeg maps them to 16-235/255); the
+    caller un-maps with the calibration taken from the index pass. bpy itself cannot read
+    these files back (the 5.x File Output writes multilayer containers)."""
+    import subprocess
+    raw = path + ".raw"
+    pix = "grayf32le" if gray else "gbrpf32le"
+    r = subprocess.run([ff, "-y", "-v", "error", "-layer", item, "-i", path,
+                        "-f", "rawvideo", "-pix_fmt", pix, raw],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed reading {os.path.basename(path)}: {r.stderr[-200:]}")
+    a = np.fromfile(raw, np.float32)
+    os.remove(raw)
+    if gray:
+        return a.reshape(H, W)[::-1].reshape(-1)
+    a = a.reshape(3, H, W)                      # planar G, B, R
+    rgb = np.stack([a[2], a[0], a[1]], axis=-1)
+    return rgb[::-1].reshape(-1, 3)
+
+
+# v5 atlas: each overlay rect copies its light from the base rect underneath (the shell is
+# ~coincident with the base, and overlays are hidden in the render). TOP-LEFT px64 rects:
+# (dst overlay rect, src base rect), same size.
+MC_OVERLAY_FROM_BASE = [
+    ((32, 0, 64, 16), (0, 0, 32, 16)),      # hat <- head
+    ((16, 32, 40, 48), (16, 16, 40, 32)),   # jacket <- body
+    ((0, 32, 16, 48), (0, 16, 16, 32)),     # pant_right <- leg_right
+    ((40, 32, 56, 48), (40, 16, 56, 32)),   # sleeve_right <- arm_right
+    ((0, 48, 16, 64), (16, 48, 32, 64)),    # pant_left <- leg_left
+    ((48, 48, 64, 64), (32, 48, 48, 64)),   # sleeve_left <- arm_left
+]
+
+
 def _anim_encode(adir, fps):
     """Encode the PNG sequences to WebM/VP9 with ffmpeg. The foreground is split into an RGB
     video + a grayscale MATTE video (its alpha) -- no alpha channel anywhere, so it decodes
@@ -4472,17 +4522,12 @@ def _anim_encode(adir, fps):
     import shutil as _sh, subprocess, sys
     seq = os.path.join(adir, "seq")
     jobs = [("bg", "background.webm", ["-pix_fmt", "yuv420p"], "bg"),
-            ("light", "light.webm", ["-pix_fmt", "yuv420p"], "light"),
+            ("atlas", "light_atlas.webm", ["-pix_fmt", "yuv420p"], "light"),
             # depth is DATA, not picture: lossy VP9 blurs its edges into wrong depths
             # (measured p99 6+ levels at silhouettes), lossless stays within ~2 levels
             # (yuv range conversion) which the viewer's guard band absorbs.
             ("depth", "scene_depth.webm", ["-pix_fmt", "yuv420p"], None)]
-    # GUI Blender doesn't inherit the shell PATH -- look in the usual per-OS spots too.
-    cands = (["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
-             if sys.platform != "win32" else
-             [r"C:\ffmpeg\bin\ffmpeg.exe",
-              os.path.expandvars(r"%ProgramFiles%\ffmpeg\bin\ffmpeg.exe")])
-    ff = _sh.which("ffmpeg") or next((p for p in cands if os.path.exists(p)), None)
+    ff = _ffmpeg_path()
     def cmd(name, out, extra, crf_key):
         q = (["-lossless", "1"] if crf_key is None
              else ["-crf", str(ANIM_CRF[crf_key]), "-b:v", "0"])
@@ -4508,7 +4553,7 @@ def _anim_encode(adir, fps):
         r = subprocess.run(cmd(name, out, extra, ck), capture_output=True, text=True)
         if r.returncode != 0:
             return False, f"ffmpeg failed on {out}: {r.stderr[-400:]}"
-    return True, "encoded bg / light / scene_depth .webm"
+    return True, "encoded bg / light_atlas / scene_depth .webm"
 
 
 def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
@@ -4527,7 +4572,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     W = s.render.resolution_x * MASK_RES_PCT // 100
     H = s.render.resolution_y * MASK_RES_PCT // 100
     adir = os.path.join(_abs(OUT_DIR), ANIM_OUT_SUBDIR)
-    for k in ("bg", "light", "depth"):
+    for k in ("bg", "atlas", "depth", "exr"):
         os.makedirs(os.path.join(adir, "seq", k), exist_ok=True)
 
     # exported look = base + classic overlay shells; overlay_parts also tracked separately so
@@ -4564,7 +4609,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         if pb is not None:
             rig_snap[a.name] = (pb.get('AntiLag'), pb.get('Slim main'))
 
-    total = 1 + nf * 2 + 2
+    total = 1 + nf + 2
     state = {"done": 0}
     def prog(msg):
         state["done"] += 1
@@ -4572,13 +4617,17 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         return (state["done"] / total, msg)
 
     def setup():
-        """players reduced to their base parts; scenery untouched."""
+        """players in the BASE-ONLY look (v5): base parts visible, overlay shells hidden --
+        overlays ship as geometry only, their light is copied from the base rects of the
+        atlas. Scenery untouched."""
         sess.restore_visibility()
         sess.mute_drivers(True)
         for o in other_char:
             o.hide_render = True
         for o in base_parts:
             o.hide_render = False
+        for o in overlay_parts:
+            o.hide_render = True
         bpy.context.view_layer.update()
 
     try:
@@ -4640,93 +4689,156 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         if zb1 - zb0 < 1e-6:
             zb1 = zb0 + 1e-6
         gray = _gray_diffuse_material()
-        scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in char_names]
+        # ---- v5 single-render pipeline setup ----
+        ff = _ffmpeg_path()
+        if ff is None:
+            raise RuntimeError("The animated export needs ffmpeg at RENDER time (v5 reads the "
+                               "UV/index/depth passes back through it). Install ffmpeg first.")
+        # players wear the gray light material for the WHOLE export: the bg render doubles as
+        # the light source (gray mannequin) -- restored in the finally
+        v5_mats = _swap_materials(base_parts, gray)
+        # per-player object index, in the SAME back-to-front order as the collected mesh
+        # players (the atlas tile order). Scenery zeroed so nothing pollutes a player's tile.
+        # (_Session snapshots pass_index and restores it.)
+        ordered_p = sorted(players, key=lambda p: _player_camera_depth(p) or 0.0, reverse=True)
+        for o in s.objects:
+            o.pass_index = 0
+        for pnum, p in enumerate(ordered_p, start=1):
+            for o in p["char_all"]:
+                o.pass_index = pnum
+        # UV / Object Index / Depth passes written by File Output nodes during the SAME render
+        # (items as RGBA: ffmpeg cannot decode single-channel EXR layers)
+        exr_dir = os.path.join(adir, "seq", "exr")
+        v5_vl = sess.vl
+        v5_passes = (v5_vl.use_pass_uv, v5_vl.use_pass_object_index, v5_vl.use_pass_z)
+        v5_vl.use_pass_uv = v5_vl.use_pass_object_index = v5_vl.use_pass_z = True
+        nt5 = s.compositing_node_group
+        rl5 = next(n for n in nt5.nodes if n.bl_idname == 'CompositorNodeRLayers')
+        v5_fos = []
+        for pname, sock in [('uv', 'UV'), ('idx', 'Object Index'), ('zz', 'Depth')]:
+            fo5 = nt5.nodes.new('CompositorNodeOutputFile')
+            fo5.name = f'__anim_fo_{pname}__'
+            fo5.directory = exr_dir
+            fo5.file_name = pname            # constant name: overwritten (and read) per frame
+            it5 = fo5.file_output_items.new('RGBA', pname)
+            it5.save_as_render = False
+            it5.override_node_format = True
+            it5.format.file_format = 'OPEN_EXR'
+            it5.format.color_depth = '32'
+            nt5.links.new(rl5.outputs[sock], fo5.inputs[pname])
+            v5_fos.append(fo5.name)
+        NP = len(players)
+        A = ANIM_ATLAS_RES
+        atlas_prev = np.zeros((A, A * NP, 3), np.float32)
+        atlas_prev_cov = np.zeros((A, A * NP), bool)
+        v5_cal = [16.0 / 255.0, 219.0 / 255.0]   # ffmpeg range squeeze (LO, SC), self-calibrated
         cached = sum(1 for i in range(nf) if ANIM_RESUME and _anim_frame_cached(adir, i))
         if cached:
             print(f"[ANIM] resume: {cached}/{nf} frames already rendered -- skipping them")
         for i, f in enumerate(range(f0, f1 + 1)):
             fn = f"{i+1:04d}.png"
             if ANIM_RESUME and _anim_frame_cached(adir, i):   # resume: this frame is done
-                yield prog(f"frame {i+1}/{nf} background (cached)")
-                yield prog(f"frame {i+1}/{nf} light (cached)")
+                yield prog(f"frame {i+1}/{nf} (cached)")
                 continue
             s.frame_set(f)
             # 1) BACKGROUND: players camera-invisible (still casting -> shadows baked in)
             setup()
-            sc = {o: o.visible_camera for o in base_parts}
-            for o in base_parts:
-                o.visible_camera = False
-            bpy.context.view_layer.update()
-            # ASYNC (modal runs the _RENDER non-blocking): single render after the scene settles,
-            # the same pattern as the static export's bg/shadow passes. UI stays live.
+            # v5: ONE full render per frame. The gray players are VISIBLE: the bg doubles as
+            # mannequin (never seen -- the mesh draws over it) AND light source; the File
+            # Output nodes write this same render's UV / index / depth passes. ASYNC (the
+            # modal runs the _RENDER non-blocking) -- the UI stays live the whole frame.
             bg, rW, rH = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT)
-            # 1b) SCENE DEPTH: Z of the scenery alone (players still camera-invisible),
-            # quantized to the players' camera-depth band. The viewer's depth prepass
-            # occludes the mesh per-pixel WHEREVER it is drawn -- occlusion no longer
-            # depends on mesh-vs-video registration. 1 sample (Z needs none), SYNC (fast).
-            sess.vl.use_pass_z = True
-            zarr, _, _ = sess.render_pass('Depth', 'CYCLES', 1, ILLUM_RES_PCT)
-            dq = np.clip((zarr[:, 0] - zb0) / (zb1 - zb0), 0.0, 1.0)
+            buf = np.ones((bg.shape[0], 4), 'float32')
+            buf[:, :3] = _to_display(bg)
+            _save_image(buf.reshape(-1), rW, rH, os.path.join(adir, "seq", "bg", fn))
+            # data passes of the SAME render (returned bottom-up, the bg convention)
+            uvr = _anim_exr_read(ff, os.path.join(exr_dir, "uv.exr"), 'uv', rW, rH, gray=False)
+            idr = _anim_exr_read(ff, os.path.join(exr_dir, "idx.exr"), 'idx', rW, rH, gray=True)
+            zr = _anim_exr_read(ff, os.path.join(exr_dir, "zz.exr"), 'zz', rW, rH, gray=True)
+            # self-calibrate ffmpeg's range squeeze from the index pass: the background
+            # plateau maps to 0, the smallest visible player plateau to an integer index
+            vals, cnts = np.unique(np.round(idr, 3), return_counts=True)
+            lo = float(vals[np.argmax(cnts)])
+            ks = [float(v) for v, c in zip(vals, cnts) if c > 200 and v > lo + 0.05]
+            if ks:
+                k = min(ks) - lo
+                v5_cal = [lo, k / max(1, int(round(k / v5_cal[1])))]
+            else:
+                v5_cal[0] = lo
+            idc = (idr - v5_cal[0]) / v5_cal[1]
+            uvc = (uvr - v5_cal[0]) / v5_cal[1]
+            zc = (zr - v5_cal[0]) / v5_cal[1]
+            # scene-depth video (players' band) straight from the render's Z pass. NOTE: the
+            # gray players are IN this Z -- their own depth matches the mesh (same band), so
+            # the viewer's +guard bias keeps the mesh winning its own pixels.
+            dq = np.clip((zc - zb0) / (zb1 - zb0), 0.0, 1.0)
             dbuf = np.ones((dq.size, 4), 'float32')
             dbuf[:, 0] = dbuf[:, 1] = dbuf[:, 2] = dq
             cd, cdW, cdH = _crop(dbuf.reshape(-1))
             _save_image(cd, cdW, cdH, os.path.join(adir, "seq", "depth", fn),
                         colorspace='Non-Color')
-            for o, v in sc.items():
-                o.visible_camera = v
-            buf = np.ones((bg.shape[0], 4), 'float32')
-            buf[:, :3] = _to_display(bg)
-            _save_image(buf.reshape(-1), rW, rH, os.path.join(adir, "seq", "bg", fn))
-            yield prog(f"frame {i+1}/{nf} background")
-            # (v4: no foreground pass -- the scene-depth video occludes the mesh per-pixel in
-            # the viewer, replacing the old scenery-holdout/silhouette pair. Translucids over
-            # the player -- water tint -- are not represented; a future material-specific
-            # translucent foreground can restore them.)
-            # 3) LIGHT: base parts gray, scenery camera-invisible (still lighting). Overlay
-            # shells HIDDEN: the light must be the base's own, overlay-free (no phantom brim
-            # shadow -- mesh-export design); the viewer draws overlays sampling this same
-            # light at their screen position (~coincident shell, ~1% error). The next pass's
-            # setup() re-shows them.
-            setup()
-            for o in overlay_parts:
-                o.hide_render = True
-            sv = _swap_materials(base_parts, gray)
-            sc = {o: o.visible_camera for o in scenery}
-            for o in scenery:
-                o.visible_camera = False
-            bpy.context.view_layer.update()
-            # ASYNC: single render after the scene settles (gray swap + camera visibility), same
-            # pattern as the static export's async light pass.
-            L, _, _ = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT, transparent=True)
-            for o, v in sc.items():
-                o.visible_camera = v
-            _restore_materials(sv)
-            la = np.clip(L[:, 3], 0.0, 1.0)
-            lst = np.where(la[:, None] > 1e-4,
-                           L[:, :3] / np.maximum(la[:, None], 1e-4), 0.0)
-            lst = _anim_dilate_light(lst, la > 0.01, rW, rH)
-            lbuf = np.ones((L.shape[0], 4), 'float32')
-            lbuf[:, :3] = _lin_to_srgb(lst)
-            cflat, cW, cH = _crop(lbuf.reshape(-1))
-            _save_image(cflat, cW, cH, os.path.join(adir, "seq", "light", fn))
-            yield prog(f"frame {i+1}/{nf} light")
+            # per-player UV-space light atlas: scatter each player's gray-lit LINEAR pixels
+            # into its tile by the skin UV of that pixel. AA-edge pixels have fractional
+            # index values, so the strict mask keeps island bleed out.
+            acc = np.zeros((A, A * NP, 3), np.float64)
+            cnt = np.zeros((A, A * NP), np.float64)
+            lin = bg[:, :3]
+            for pnum in range(1, NP + 1):
+                m = np.abs(idc - pnum) < 0.05
+                if not m.any():
+                    continue
+                u = np.clip(uvc[m, 0], 0.0, 1.0)
+                v = np.clip(uvc[m, 1], 0.0, 1.0)
+                ui = np.clip((u * A).astype(np.int64), 0, A - 1) + (pnum - 1) * A
+                vi = np.clip(((1.0 - v) * A).astype(np.int64), 0, A - 1)
+                np.add.at(acc, (vi, ui), lin[m])
+                np.add.at(cnt, (vi, ui), 1.0)
+            tcov = cnt > 0
+            tiles = np.zeros((A, A * NP, 3), np.float32)
+            tiles[tcov] = (acc[tcov] / cnt[tcov, None]).astype(np.float32)
+            # temporal fill (texels keep their last known light while unseen), then dilate the
+            # rest so the codec gets stable, hole-free tiles
+            keep = atlas_prev_cov & ~tcov
+            tiles[keep] = atlas_prev[keep]
+            allcov = tcov | atlas_prev_cov
+            tiles = _anim_dilate_light(tiles.reshape(-1, 3), allcov.reshape(-1),
+                                       A * NP, A, passes=A).reshape(A, A * NP, 3)
+            atlas_prev, atlas_prev_cov = tiles.astype(np.float32).copy(), allcov
+            # overlays borrow the base light: copy each base rect into its overlay rect
+            f64 = A / 64.0
+            for pnum in range(NP):
+                ox = pnum * A
+                for (dx0, dy0, dx1, dy1), (sx0, sy0, sx1, sy1) in MC_OVERLAY_FROM_BASE:
+                    tiles[int(dy0 * f64):int(dy1 * f64), ox + int(dx0 * f64):ox + int(dx1 * f64)] = \
+                        tiles[int(sy0 * f64):int(sy1 * f64), ox + int(sx0 * f64):ox + int(sx1 * f64)]
+            # encode with the light.webm convention (built from LINEAR pass data, so the bg's
+            # AgX view transform never touches the light): viewer relights skin * atlas * 2
+            ab = np.ones((A * A * NP, 4), 'float32')
+            ab[:, :3] = _lin_to_srgb(np.clip(np.asarray(tiles)[::-1].reshape(-1, 3), 0.0, 1.0))
+            _save_image(ab.reshape(-1), A * NP, A, os.path.join(adir, "seq", "atlas", fn))
+            yield prog(f"frame {i+1}/{nf} render + atlas")
 
         welded, unique, ntris = _anim_write_mesh(os.path.join(adir, "mesh.bin"), st)
         K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), keys,
                                 ANIM_QUANT, fps / ANIM_KEYS_STEP)
         manifest = {
-            "animated_version": 4,   # 4: scene_depth video (per-pixel occlusion, replaces fg use)
+            "animated_version": 5,   # 5: UV-space light_atlas video (replaces the light video)
             "addon_version": ADDON_VERSION,
             "fps": fps,
             "frames": nf,
             "resolution": [W, H],
-            # crop rect for the foreground+light videos, in TOP-LEFT pixels (background is
+            # crop rect for the scene_depth video, in TOP-LEFT pixels (background is
             # full-frame). The fg quad covers this rect; light is sampled at
             # (fragScreenTopLeft - crop.xy) / crop.wh.
             "crop": {"x": cx0, "y": H - cy1, "w": cx1 - cx0, "h": cy1 - cy0},
             "videos": {"background": "background.webm",
-                       "light": "light.webm",
+                       "light_atlas": "light_atlas.webm",
                        "scene_depth": "scene_depth.webm"},
+            # per-player UV-space light tiles (back-to-front player order, side by side),
+            # built from the render's LINEAR light values (bg view transform never touches
+            # them) and encoded like the old light.webm: viewer relights skin(uv)*atlas(uv)*2.
+            # Overlay rects are pre-filled from their base rects (borrowed light).
+            "light_atlas": {"res": ANIM_ATLAS_RES, "tiles": len(players)},
             # scenery-only camera depth, cropped like fg/light, normalized to the players'
             # band (0 = zmin .. 1 = zmax, clamped; SAME space as anim.bin z). VP9 LOSSLESS.
             # Viewer: fullscreen-crop prepass writes gl_FragDepth = luma + guard(~3/255),
@@ -4763,6 +4875,19 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                 _sh.rmtree(os.path.join(adir, "seq"), ignore_errors=True)
         yield prog("encode")
     finally:
+        try:   # v5 plumbing (may not exist if the export failed before its setup)
+            _restore_materials(v5_mats)
+        except NameError:
+            pass
+        try:
+            nt5 = s.compositing_node_group
+            for n in v5_fos:
+                nd = nt5.nodes.get(n)
+                if nd:
+                    nt5.nodes.remove(nd)
+            v5_vl.use_pass_uv, v5_vl.use_pass_object_index, v5_vl.use_pass_z = v5_passes
+        except NameError:
+            pass
         sess.restore()
         s.render.use_simplify, s.render.simplify_subdivision_render = simp
         for a in arms:
