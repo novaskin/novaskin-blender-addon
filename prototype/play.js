@@ -293,7 +293,10 @@ function draw() {
   if (!vBg.paused) syncVideos();          // keep fg/light/matte locked to bg while playing
   upload(tBg, vBg); upload(tFg, vFg); upload(tLight, vLight);
   if (vMatte) upload(tMatte, vMatte);
-  setPositions(vBg.currentTime);
+  // snap: sample the mesh at the video's frame grid (the pose the fg/light frames saw) instead
+  // of continuously -- isolates the sub-frame component of mesh-vs-video misregistration.
+  const t = vBg.currentTime;
+  setPositions(ck('ck_snap') ? Math.floor(t * manifest.fps) / manifest.fps : t);
   gl.viewport(0, 0, W, H);
   gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   gl.clearColor(0.13, 0.13, 0.13, 1);
