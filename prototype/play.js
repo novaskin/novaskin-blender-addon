@@ -4,9 +4,48 @@
 // painter's order, positions lerped between mesh keys) -> foreground video (alpha).
 const DIR = 'animated/';
 
-async function bin(url) {
-  const buf = await (await fetch(url + _cb)).arrayBuffer();
-  return buf;
+// --- source + re-boot plumbing: picking a folder (any export with a manifest.json) stashes its
+// files on window and re-imports this module cache-busted; the new instance tears the old down.
+// The picker binds BEFORE any await so it stays alive even when animated/ is absent (404 boot).
+if (window.__nskTeardown) { try { window.__nskTeardown(); } catch (e) { } }
+const FILES = window.__nskFiles || null;   // Map(relPath -> File) when a folder was picked
+{
+  const inp = document.getElementById('dir');
+  if (inp) inp.onchange = () => {
+    const all = [...inp.files];
+    let base = null;
+    for (const f of all) {                 // shallowest manifest.json = the export root
+      const p = f.webkitRelativePath || f.name;
+      if (p === 'manifest.json' || p.endsWith('/manifest.json')) {
+        const b = p.slice(0, p.length - 'manifest.json'.length);
+        if (base === null || b.length < base.length) base = b;
+      }
+    }
+    if (base === null) {
+      document.getElementById('stats').textContent = 'manifest.json not found in that folder';
+      return;
+    }
+    const files = new Map();
+    for (const f of all) {
+      const p = f.webkitRelativePath || f.name;
+      if (p.startsWith(base)) files.set(p.slice(base.length), f);
+    }
+    window.__nskFiles = files;
+    import('./play.js?v=' + Date.now());
+  };
+}
+
+const _cb = '?v=' + Date.now();
+async function loadBlob(name) {
+  if (FILES) {
+    const f = FILES.get(name);
+    if (!f) throw 'missing file in the picked folder: ' + name;
+    return f;
+  }
+  return (await fetch(DIR + name + _cb)).blob();
+}
+async function bin(name) {
+  return (await loadBlob(name)).arrayBuffer();
 }
 async function inflate(bytes) {
   const ds = new DecompressionStream('deflate');           // zlib stream
@@ -14,15 +53,15 @@ async function inflate(bytes) {
   return new Uint8Array(await out.arrayBuffer());
 }
 
-const _cb = '?v=' + Date.now();
-const manifest = await (await fetch(DIR + 'manifest.json' + _cb)).json();
+const manifest = FILES ? JSON.parse(await (await loadBlob('manifest.json')).text())
+                       : await (await fetch(DIR + 'manifest.json' + _cb)).json();
 const [W, H] = manifest.resolution;
 // foreground+light crop (top-left px); default = full frame (older exports)
 const crop = manifest.crop || { x: 0, y: 0, w: W, h: H };
 const cropBL = { x: crop.x, y: H - crop.y - crop.h, w: crop.w, h: crop.h };  // bottom-up
 
 // --- mesh.bin: NSKM | u32 version, welded, unique, ntris | zlib(uv u16x2, src u16, tris u16x3)
-const mb = await bin(DIR + manifest.mesh.file);
+const mb = await bin(manifest.mesh.file);
 const mh = new DataView(mb, 0, 20);
 if (new TextDecoder().decode(new Uint8Array(mb, 0, 4)) !== 'NSKM') throw 'bad mesh.bin';
 const mVer = mh.getUint32(4, true);
@@ -41,7 +80,7 @@ const IDX_SIZE = wide ? 4 : 2;
 const uv = Float32Array.from(uvQ, v => v / 65535);
 
 // --- anim.bin: NSKA | u32 version, V, K, f32 quant, keys_fps | zlib(int16 abs/delta/ddelta)
-const ab = await bin(DIR + manifest.anim.file);
+const ab = await bin(manifest.anim.file);
 const ah = new DataView(ab, 0, 36);
 if (new TextDecoder().decode(new Uint8Array(ab, 0, 4)) !== 'NSKA') throw 'bad anim.bin';
 const aVer = ah.getUint32(4, true);
@@ -69,9 +108,9 @@ const keys = [];
 
 // --- videos
 async function video(src) {
-  // fetch the whole file as a blob: python http.server lacks Range support, which makes
-  // a streamed <video> unseekable -- a blob URL is fully buffered and fully seekable
-  const blob = await (await fetch(DIR + src + _cb)).blob();
+  // whole file as a blob: python http.server lacks Range support (unseekable streamed
+  // <video>), and picked-folder Files are Blobs already -- a blob URL is fully seekable
+  const blob = await loadBlob(src);
   const v = document.createElement('video');
   v.src = URL.createObjectURL(blob); v.muted = true; v.loop = true; v.playsInline = true;
   v.preload = 'auto';
@@ -184,6 +223,7 @@ function setSkin(i, source) { upload(tSkins[i], source, true); }
 const partOff = new Set();    // disabled overlay parts, as "playerLabel::partLabel"
 {
   const box = document.getElementById('skins');
+  box.innerHTML = '';                       // re-boot: drop the previous instance's controls
   manifest.mesh.players.forEach((p, i) => {
     const lab = document.createElement('label');
     lab.textContent = ` ${p.label}: `;
@@ -314,7 +354,7 @@ function draw() {
   }
   if (!scrubbing) scrub.value = Math.round(vBg.currentTime / duration() * 1000) || 0;
   timeEl.textContent = vBg.currentTime.toFixed(1) + 's';
-  requestAnimationFrame(draw);
+  if (!dead) rafId = requestAnimationFrame(draw);
 }
 
 document.getElementById('stats').textContent =
@@ -341,5 +381,13 @@ scrub.oninput = () => {
 window.__dbg = {
   vBg, vFg, vLight, vMatte, hasMatte, keys, K, keysFps, setSkin,
   seek(t) { for (const v of [vBg, vFg, vLight]) { v.pause(); v.currentTime = t; } },
+};
+let rafId = 0, dead = false;
+// next boot (folder picked) stops this instance: rAF loop, videos, and its UI controls
+window.__nskTeardown = () => {
+  dead = true;
+  cancelAnimationFrame(rafId);
+  for (const v of vids) { v.pause(); URL.revokeObjectURL(v.src); }
+  document.getElementById('skins').innerHTML = '';
 };
 draw();
