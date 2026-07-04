@@ -341,7 +341,7 @@ ANIM_LIGHT_PAD = 16
 # pixel covers a large screen area, so shadow boundaries land INSIDE skin texels -- the extra
 # resolution keeps them sharp. Sparse texels are filled by bilinear splatting + pull-push
 # interpolation, so any power of two works (512 gets real detail only from full-res exports).
-ANIM_ATLAS_RES = 256
+ANIM_ATLAS_RES = 512
 # Crop the foreground + light videos to the players' screen region (union over all frames +
 # this padding). Both only have content where the players are, so the rest of the frame is
 # wasted bytes (foreground is mostly transparent yet nearly as big as the background). The
@@ -4872,10 +4872,12 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                 for (dx0, dy0, dx1, dy1), (sx0, sy0, sx1, sy1) in MC_OVERLAY_FROM_BASE:
                     tiles[int(dy0 * f64):int(dy1 * f64), ox + int(dx0 * f64):ox + int(dx1 * f64)] = \
                         tiles[int(sy0 * f64):int(sy1 * f64), ox + int(sx0 * f64):ox + int(sx1 * f64)]
-            # encode with the light.webm convention (built from LINEAR pass data, so the bg's
-            # AgX view transform never touches the light): viewer relights skin * atlas * 2
+            # encode with the SCENE's view transform (_to_display, like the static atlas bake):
+            # the relit player must blend with the AgX-encoded bg -- plain sRGB here made the
+            # player visibly brighter/more saturated than its gray reference in the bg
+            # (measured 10-22% display delta). The viewer still relights skin * atlas * 2.
             ab = np.ones((A * A * NP, 4), 'float32')
-            ab[:, :3] = _lin_to_srgb(np.clip(np.asarray(tiles)[::-1].reshape(-1, 3), 0.0, 1.0))
+            ab[:, :3] = _to_display(np.asarray(tiles)[::-1].reshape(-1, 3))
             _save_image(ab.reshape(-1), A * NP, A, os.path.join(adir, "seq", "atlas", fn))
             yield prog(f"frame {i+1}/{nf} render + atlas")
 
