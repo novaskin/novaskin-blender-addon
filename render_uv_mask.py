@@ -4663,6 +4663,14 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         bpy.context.view_layer.update()
 
     try:
+        # Expand the rig's inset per-pixel UVs to fill their skin-pixel cells, like the static
+        # export: the render's UV pass then spreads the atlas samples across each cell's WHOLE
+        # 8x8 block at 512 (inset UVs only feed the central ~25% -- half the effective atlas
+        # detail wasted), and HD skins sample the full pixel in the viewer. mesh.bin collects
+        # the same expanded UVs, so both sides stay consistent. Restored in the finally.
+        anim_restore_uv = _expand_pixel_uvs(
+            [o for p in players for o in (p.get("uv_parts") or [])])
+        bpy.context.view_layer.update()
         # AntiLag (viewport mesh) + classic arms + render geometry == viewport geometry
         for a in arms:
             pb = a.pose.bones.get('Main_Properties')
@@ -4939,6 +4947,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         yield prog("encode")
     finally:
         try:   # v5 plumbing (may not exist if the export failed before its setup)
+            anim_restore_uv()
+        except NameError:
+            pass
+        try:
             _restore_materials(v5_mats)
         except NameError:
             pass
