@@ -336,9 +336,12 @@ ANIM_OVERLAY_KEYS = ("hat", "jacket", "sleeve", "pant")
 # lerp vs 24fps video + VP9 edge blur) -- padding prevents black fringes. 0 disables.
 # 16 (not 8): overlay shells extend past the base silhouette and borrow its dilated light.
 ANIM_LIGHT_PAD = 16
-# v5: per-player UV-space light atlas resolution (the light video is replaced by a tiny tiled
-# atlas video reprojected from the render's UV pass; 64 = skin resolution, dense sampling).
-ANIM_ATLAS_RES = 64
+# v5: per-player UV-space light atlas resolution (the light video is replaced by a tiled atlas
+# video reprojected from the render's UV pass). BIGGER than the 64px skin on purpose: one skin
+# pixel covers a large screen area, so shadow boundaries land INSIDE skin texels -- the extra
+# resolution keeps them sharp. Sparse texels are filled by bilinear splatting + pull-push
+# interpolation, so any power of two works (512 gets real detail only from full-res exports).
+ANIM_ATLAS_RES = 256
 # Crop the foreground + light videos to the players' screen region (union over all frames +
 # this padding). Both only have content where the players are, so the rest of the frame is
 # wasted bytes (foreground is mostly transparent yet nearly as big as the background). The
@@ -4467,6 +4470,35 @@ def _static_export(players, out_dir=None, op=None):
     return _drain_render(_static_export_steps(players, op=op, out_dir=out_dir))
 
 
+def _anim_pull_push(rgb, w):
+    """Fill the holes of a scattered image by PULL-PUSH interpolation (the standard lightmap /
+    texture-space trick): downsample weight-aware until everything is covered, then push the
+    coarse values back up into the empty texels. Smooth fills across holes of any size, O(N).
+    rgb (H, W, 3) float, w (H, W) weights (0 = hole). Even dims per level (power-of-two res)."""
+    H, W = w.shape
+    if H <= 1 or W <= 1 or (w > 0).all():
+        out = rgb.copy()
+        if not (w > 0).all():
+            tot = float(w.sum())
+            avg = (rgb * w[..., None]).sum((0, 1)) / max(tot, 1e-9)
+            out[w <= 0] = avg
+        return out
+    He, We = H // 2 * 2, W // 2 * 2
+    rw = rgb * w[..., None]
+    rw2 = (rw[0:He:2, 0:We:2] + rw[1:He:2, 0:We:2]
+           + rw[0:He:2, 1:We:2] + rw[1:He:2, 1:We:2])
+    w2 = (w[0:He:2, 0:We:2] + w[1:He:2, 0:We:2]
+          + w[0:He:2, 1:We:2] + w[1:He:2, 1:We:2])
+    rgb2 = rw2 / np.maximum(w2[..., None], 1e-9)
+    filled2 = _anim_pull_push(rgb2, np.minimum(w2, 1.0))   # cap: coarse levels don't dominate
+    up = np.repeat(np.repeat(filled2, 2, axis=0), 2, axis=1)
+    if up.shape[0] < H:
+        up = np.concatenate([up, up[-1:]], axis=0)
+    if up.shape[1] < W:
+        up = np.concatenate([up, up[:, -1:]], axis=1)
+    return np.where((w > 0)[..., None], rgb, up[:H, :W])
+
+
 def _ffmpeg_path():
     """ffmpeg binary, or None. GUI Blender doesn't inherit the shell PATH -- look in the
     usual per-OS spots too."""
@@ -4795,9 +4827,11 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             cd, cdW, cdH = _crop(dbuf.reshape(-1))
             _save_image(cd, cdW, cdH, os.path.join(adir, "seq", "depth", fn),
                         colorspace='Non-Color')
-            # per-player UV-space light atlas: scatter each player's gray-lit LINEAR pixels
-            # into its tile by the skin UV of that pixel. AA-edge pixels have fractional
-            # index values, so the strict mask keeps island bleed out.
+            # per-player UV-space light atlas: BILINEAR-splat each player's gray-lit LINEAR
+            # pixels into its tile by the skin UV of that pixel (each sample feeds its 4
+            # neighbouring texels -- at super-skin resolutions the scatter is sparse and the
+            # footprint matters). AA-edge pixels have fractional index values, so the strict
+            # mask keeps island bleed out.
             acc = np.zeros((A, A * NP, 3), np.float64)
             cnt = np.zeros((A, A * NP), np.float64)
             lin = bg[:, :3]
@@ -4807,21 +4841,30 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                     continue
                 u = np.clip(uvc[m, 0], 0.0, 1.0)
                 v = np.clip(uvc[m, 1], 0.0, 1.0)
-                ui = np.clip((u * A).astype(np.int64), 0, A - 1) + (pnum - 1) * A
-                vi = np.clip(((1.0 - v) * A).astype(np.int64), 0, A - 1)
-                np.add.at(acc, (vi, ui), lin[m])
-                np.add.at(cnt, (vi, ui), 1.0)
-            tcov = cnt > 0
+                c = lin[m]
+                ox = (pnum - 1) * A
+                x = u * A - 0.5
+                y = (1.0 - v) * A - 0.5
+                x0 = np.floor(x)
+                y0 = np.floor(y)
+                fx = x - x0
+                fy = y - y0
+                for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+                    wgt = (fx if dx else 1.0 - fx) * (fy if dy else 1.0 - fy)
+                    xi = np.clip(x0 + dx, 0, A - 1).astype(np.int64) + ox
+                    yi = np.clip(y0 + dy, 0, A - 1).astype(np.int64)
+                    np.add.at(acc, (yi, xi), c * wgt[:, None])
+                    np.add.at(cnt, (yi, xi), wgt)
+            tcov = cnt > 1e-4
             tiles = np.zeros((A, A * NP, 3), np.float32)
             tiles[tcov] = (acc[tcov] / cnt[tcov, None]).astype(np.float32)
-            # temporal fill (texels keep their last known light while unseen), then dilate the
-            # rest so the codec gets stable, hole-free tiles
-            keep = atlas_prev_cov & ~tcov
-            tiles[keep] = atlas_prev[keep]
-            allcov = tcov | atlas_prev_cov
-            tiles = _anim_dilate_light(tiles.reshape(-1, 3), allcov.reshape(-1),
-                                       A * NP, A, passes=A).reshape(A, A * NP, 3)
-            atlas_prev, atlas_prev_cov = tiles.astype(np.float32).copy(), allcov
+            # temporal memory (unseen texels keep their last light, at LOW weight so fresh
+            # samples dominate), then PULL-PUSH interpolation fills every remaining hole
+            wgt_all = np.where(tcov, np.minimum(cnt, 1.0),
+                               np.where(atlas_prev_cov, 0.25, 0.0))
+            rgb_all = np.where(tcov[:, :, None], tiles, atlas_prev)
+            tiles = _anim_pull_push(rgb_all.astype(np.float64), wgt_all).astype(np.float32)
+            atlas_prev, atlas_prev_cov = tiles.copy(), tcov | atlas_prev_cov
             # overlays borrow the base light: copy each base rect into its overlay rect
             f64 = A / 64.0
             for pnum in range(NP):
