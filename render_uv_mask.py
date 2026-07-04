@@ -4715,7 +4715,23 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         nt5 = s.compositing_node_group
         rl5 = next(n for n in nt5.nodes if n.bl_idname == 'CompositorNodeRLayers')
         v5_fos = []
-        for pname, sock in [('uv', 'UV'), ('idx', 'Object Index'), ('zz', 'Depth')]:
+        # ffmpeg's EXR decode CLAMPS values to [0,1], so everything written must be
+        # pre-normalized in the compositor: Z -> the players' band fraction (raw camera
+        # depths / the sky's 1e10 would flatten to black), Object Index -> index/10 (an
+        # index >= 2 would clamp; /10 keeps up to 10 players).
+        def _fo_math(op, in_sock, value, clamp=False):
+            mn = nt5.nodes.new('ShaderNodeMath')
+            mn.name = f'__anim_fo_m{len(v5_fos)}_{op}__'
+            mn.operation = op
+            mn.inputs[1].default_value = value
+            mn.use_clamp = clamp
+            nt5.links.new(in_sock, mn.inputs[0])
+            v5_fos.append(mn.name)
+            return mn.outputs[0]
+        z_sub = _fo_math('SUBTRACT', rl5.outputs['Depth'], zb0)
+        z_out = _fo_math('DIVIDE', z_sub, max(zb1 - zb0, 1e-6), clamp=True)
+        idx_out = _fo_math('MULTIPLY', rl5.outputs['Object Index'], 0.1)
+        for pname, src in [('uv', rl5.outputs['UV']), ('idx', idx_out), ('zz', z_out)]:
             fo5 = nt5.nodes.new('CompositorNodeOutputFile')
             fo5.name = f'__anim_fo_{pname}__'
             fo5.directory = exr_dir
@@ -4725,7 +4741,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             it5.override_node_format = True
             it5.format.file_format = 'OPEN_EXR'
             it5.format.color_depth = '32'
-            nt5.links.new(rl5.outputs[sock], fo5.inputs[pname])
+            nt5.links.new(src, fo5.inputs[pname])
             v5_fos.append(fo5.name)
         NP = len(players)
         A = ANIM_ATLAS_RES
@@ -4757,21 +4773,23 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             zr = _anim_exr_read(ff, os.path.join(exr_dir, "zz.exr"), 'zz', rW, rH, gray=True)
             # self-calibrate ffmpeg's range squeeze from the index pass: the background
             # plateau maps to 0, the smallest visible player plateau to an integer index
+            # (the compositor wrote index/10 -- plateaus every SC/10; z is already the band
+            # fraction, clamped in-compositor before ffmpeg can flatten it)
             vals, cnts = np.unique(np.round(idr, 3), return_counts=True)
             lo = float(vals[np.argmax(cnts)])
-            ks = [float(v) for v, c in zip(vals, cnts) if c > 200 and v > lo + 0.05]
+            ks = [float(v) for v, c in zip(vals, cnts) if c > 200 and v > lo + 0.005]
             if ks:
-                k = min(ks) - lo
-                v5_cal = [lo, k / max(1, int(round(k / v5_cal[1])))]
+                k = min(ks) - lo                      # = SC * (smallest visible index / 10)
+                n = max(1, int(round(10.0 * k / v5_cal[1])))
+                v5_cal = [lo, 10.0 * k / n]
             else:
                 v5_cal[0] = lo
-            idc = (idr - v5_cal[0]) / v5_cal[1]
+            idc = (idr - v5_cal[0]) / v5_cal[1] * 10.0
             uvc = (uvr - v5_cal[0]) / v5_cal[1]
-            zc = (zr - v5_cal[0]) / v5_cal[1]
             # scene-depth video (players' band) straight from the render's Z pass. NOTE: the
             # gray players are IN this Z -- their own depth matches the mesh (same band), so
             # the viewer's +guard bias keeps the mesh winning its own pixels.
-            dq = np.clip((zc - zb0) / (zb1 - zb0), 0.0, 1.0)
+            dq = np.clip((zr - v5_cal[0]) / v5_cal[1], 0.0, 1.0)
             dbuf = np.ones((dq.size, 4), 'float32')
             dbuf[:, 0] = dbuf[:, 1] = dbuf[:, 2] = dq
             cd, cdW, cdH = _crop(dbuf.reshape(-1))
