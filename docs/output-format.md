@@ -155,7 +155,7 @@ of `K` keys of `V × i16×3` (x, y, z):
 
 ## CONFIG reference
 
-Constants at the top of `render_uv_mask.py` (the panel overrides the common ones at run
+Constants at the top of `novaskin_export.py` (the panel overrides the common ones at run
 time):
 
 | Key | Purpose |

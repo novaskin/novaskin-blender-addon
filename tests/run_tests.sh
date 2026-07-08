@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the render_uv_mask.py unit tests with a Python that has numpy.
+# Run the novaskin_export.py unit tests with a Python that has numpy.
 #
 # The add-on's pure helpers need numpy; the system python3 usually doesn't have it, so we prefer
 # Blender's bundled Python (which matches the runtime). Override with:  BLENDER_PYTHON=/path ./run_tests.sh

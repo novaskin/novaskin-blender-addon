@@ -1,4 +1,4 @@
-"""Import render_uv_mask.py OUTSIDE Blender by installing a minimal fake `bpy`.
+"""Import novaskin_export.py OUTSIDE Blender by installing a minimal fake `bpy`.
 
 The add-on does `import bpy` and `from bpy.props import (...)` at module top, and defines
 operator/panel/property-group classes whose bases are `bpy.types.*` and whose bodies call
@@ -81,14 +81,14 @@ def _install_fake_bpy():
 
 
 def load_module():
-    """Import (once) and return the render_uv_mask module with the fake bpy installed."""
-    if "render_uv_mask" in sys.modules:
-        return sys.modules["render_uv_mask"]
+    """Import (once) and return the novaskin_export module with the fake bpy installed."""
+    if "novaskin_export" in sys.modules:
+        return sys.modules["novaskin_export"]
     _install_fake_bpy()
     here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.normpath(os.path.join(here, "..", "render_uv_mask.py"))
-    spec = importlib.util.spec_from_file_location("render_uv_mask", path)
+    path = os.path.normpath(os.path.join(here, "..", "novaskin_export.py"))
+    spec = importlib.util.spec_from_file_location("novaskin_export", path)
     mod = importlib.util.module_from_spec(spec)
-    sys.modules["render_uv_mask"] = mod
+    sys.modules["novaskin_export"] = mod
     spec.loader.exec_module(mod)
     return mod

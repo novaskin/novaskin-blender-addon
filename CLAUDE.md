@@ -4,7 +4,7 @@ Guidance for Claude Code when working in this repository.
 
 ## What this is
 
-**NovaSkin Export** — a single-file Blender add-on (`render_uv_mask.py`, "NovaSkin Export",
+**NovaSkin Export** — a single-file Blender add-on (`novaskin_export.py`, "NovaSkin Export",
 add-on id `novaskin`) that exports Minecraft-style player characters (the *Thomas Legacy Rig*)
 plus their scene into web wallpaper assets. A browser renderer (in `prototype/`) loads those
 assets and **relights swappable skins** in real time, so a user can drop in a new skin PNG and
@@ -20,10 +20,10 @@ The git repo is rooted at `novaskin-blender-addon/`.
 
 ```
 novaskin-blender-addon/
-  render_uv_mask.py        THE deliverable — the whole add-on in one file
+  novaskin_export.py        THE deliverable — the whole add-on in one file
   blender_manifest.toml    extension manifest (version lives here too)
-  build_addon.py           packages render_uv_mask.py -> dist/<id>-<version>.zip
-  bl_info / ADDON_VERSION  in render_uv_mask.py
+  build_addon.py           packages novaskin_export.py -> dist/<id>-<version>.zip
+  bl_info / ADDON_VERSION  in novaskin_export.py
   docs/
     static-mesh-plan.md    design of the "static mesh v2" pipeline
     animated-export-plan.md
@@ -40,7 +40,7 @@ novaskin-blender-addon/
 
 ## Two export pipelines
 
-`render_uv_mask.py` contains two related exporters:
+`novaskin_export.py` contains two related exporters:
 
 1. **Per-part legacy export** (`bpy.ops.render.novaskin`) — one PNG/EXR per body part
    (`<part>_UV.png`: R=U G=V B=depth A=coverage) + masks + background + optional layers. The
@@ -138,7 +138,7 @@ To inspect the export without a full render, you can `exec` the file in a throwa
 `tests/` holds unit tests for the **pure** (no live-Blender) helpers — the binary-format writers
 (`_anim_write_anim` round-trip), colour math (`_lin_to_srgb`), label mapping (`_mc_part_label` /
 `_assign_part_labels`, incl. the duplicate-mesh collision case), filename sanitation, and the light
-dilation. They use `unittest` (stdlib, no pytest) and import `render_uv_mask.py` via
+dilation. They use `unittest` (stdlib, no pytest) and import `novaskin_export.py` via
 `tests/_loader.py`, which installs a **minimal fake `bpy`** so the module imports outside Blender
 (the bpy-touching functions just aren't called).
 
@@ -178,9 +178,9 @@ needs a mesh, add an in-Blender check.
   `blender_manifest.toml` `version`, `bl_info["version"]` (keep it a literal — Blender parses it
   via `ast`), and `ADDON_VERSION`. `v1.0.0` stays.
 - Keep comments in the surrounding density/idiom. The file is large and dense; match it.
-- `python3 -m py_compile render_uv_mask.py` is the cheap sanity check after edits.
+- `python3 -m py_compile novaskin_export.py` is the cheap sanity check after edits.
 
-## Map of key functions (`render_uv_mask.py`)
+## Map of key functions (`novaskin_export.py`)
 
 - `discover_players()` / `_select_uv_parts()` — find player armatures (Rig_ID) and their part meshes
   by visibility (robust to Blender's non-uniform `.NNN` dup suffixes).

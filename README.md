@@ -33,7 +33,7 @@ failing midway.
   onto the Blender window** (or `Edit > Preferences > Get Extensions > ⌄ > Install from
   Disk…`).
 - **Classic add-on:** `Edit > Preferences > Add-ons > Install…` → pick
-  `render_uv_mask.py`.
+  `novaskin_export.py`.
 
 Then enable **“NovaSkin Export”**. Reinstall the same way to update (Install from Disk
 copies the file — editing the original does not update it).
@@ -117,7 +117,7 @@ Load that folder in the wallpaper tool and swap skins freely.
 
 ## For developers
 
-- The whole add-on is a single file, [render_uv_mask.py](render_uv_mask.py); defaults
+- The whole add-on is a single file, [novaskin_export.py](novaskin_export.py); defaults
   live in its `CONFIG` block (the panel overrides the common ones).
 - For heavy iteration, symlink the repo file into Blender's add-ons folder and use
   **F3 → Reload Scripts** after editing; or open it in the *Scripting* workspace and run

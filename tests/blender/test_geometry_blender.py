@@ -19,7 +19,7 @@ import numpy as np
 # import the add-on module by path (real bpy; no registration needed to call helpers)
 _REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 sys.path.insert(0, _REPO)
-import render_uv_mask as R   # noqa: E402
+import novaskin_export as R   # noqa: E402
 
 _FAILURES = []
 

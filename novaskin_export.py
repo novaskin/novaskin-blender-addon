@@ -2901,7 +2901,7 @@ def render_all(op=None, draft=False):
     errors = _preflight(players)
     if errors:
         print("\n" + "=" * 64)
-        print("render_uv_mask: ABORTED -- preflight checks failed:")
+        print("novaskin_export: ABORTED -- preflight checks failed:")
         for e in errors:
             print("  * " + e)
         print("=" * 64 + "\n")
@@ -2919,7 +2919,7 @@ def render_all(op=None, draft=False):
     except Exception as ex:
         # an abort (e.g. depth range unavailable) -- the generator's finally already
         # restored the scene; report cleanly instead of a raw Python traceback.
-        print(f"\nrender_uv_mask: ABORTED -- {ex}\n")
+        print(f"\nnovaskin_export: ABORTED -- {ex}\n")
         if op is not None:
             op.report({'ERROR'}, str(ex))
         return None

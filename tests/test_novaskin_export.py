@@ -1,4 +1,4 @@
-"""Unit tests for the PURE (no live-Blender) helpers in render_uv_mask.py.
+"""Unit tests for the PURE (no live-Blender) helpers in novaskin_export.py.
 
 Run with Blender's bundled Python (has numpy):  tests/run_tests.sh
 or:  <blender-python> -m unittest discover -s tests
