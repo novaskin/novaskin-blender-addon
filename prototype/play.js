@@ -198,11 +198,17 @@ const depthP = prog(
    void main(){ vUv=aPos; gl_Position=vec4(uRect.xy + aPos*uRect.zw, 0., 1.); }`,
   `#version 300 es
    precision highp float;
-   uniform sampler2D uTex; in vec2 vUv; out vec4 frag;
+   uniform sampler2D uTex; uniform bool uInvert; in vec2 vUv; out vec4 frag;
    void main(){
-     gl_FragDepth = clamp(texture(uTex,vUv).r + 3.0/255.0, 0.0, 1.0);
+     float v = texture(uTex,vUv).r;
+     // inverted-masked encoding: 0 = black = no occluder -> 1-v = far depth, no branch
+     float d = uInvert ? (1.0 - v) : v;
+     gl_FragDepth = clamp(d + 3.0/255.0, 0.0, 1.0);
      frag = vec4(0.0);
    }`);
+// v6 depth encoding: black = no occluder, brightness = nearness (masked to the players)
+const depthInverted = !!(manifest.scene_depth
+                         && manifest.scene_depth.encoding === 'inverted-masked');
 const meshP = prog(
   `#version 300 es
    layout(location=0) in vec3 aPx; layout(location=1) in vec2 aUv;
@@ -363,6 +369,7 @@ function depthPrepass() {
   gl.depthFunc(gl.ALWAYS);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tDepth);
   gl.uniform1i(gl.getUniformLocation(depthP, 'uTex'), 0);
+  gl.uniform1i(gl.getUniformLocation(depthP, 'uInvert'), depthInverted ? 1 : 0);
   gl.uniform4fv(gl.getUniformLocation(depthP, 'uRect'), cropRectNDC);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   gl.depthFunc(gl.LESS);
@@ -491,6 +498,10 @@ function draw() {
   timeEl.textContent = vBg.currentTime.toFixed(1) + 's';
   if (!dead) rafId = requestAnimationFrame(draw);
 }
+
+// keys at the video rate -> default to SNAP (the pose every render saw; the depth mask is
+// tight around it). The checkbox stays available to compare with lerp.
+document.getElementById('ck_snap').checked = keysFps >= manifest.fps - 0.01;
 
 const statsText =
   `${uniqueN} unique / ${welded} welded verts, ${ntris} tris, ${K} keys @ ${keysFps} fps, ` +

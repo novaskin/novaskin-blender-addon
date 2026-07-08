@@ -307,7 +307,9 @@ COMPOSITE_BASE_LABELS = ["head", "body",
 # Base layer only, no per-player toggles, players always drawn; optional-layer marks are
 # IGNORED here (marked objects render as plain scenery). Frame range = the scene's.
 ANIM_OUT_SUBDIR = "animated"
-ANIM_KEYS_STEP = 2          # store mesh keys every Nth video frame (24fps video -> 12fps keys)
+ANIM_KEYS_STEP = 1          # mesh keys every Nth video frame. 1 = keys AT the video rate: the
+                            # viewer snaps the pose to the exact one every render saw (no lerp
+                            # drift), and the scene-depth mask can hug the players tightly.
 ANIM_QUANT = 8.0            # vertex x/y quantization: 1/8 px (int16)
 ANIM_Z_BITS = 12            # depth quantization: 12 bits = 4095 levels (plenty for the depth
                             # test; smaller than the x/y range -> better delta compression)
@@ -4788,6 +4790,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             v5_fos.append(fo5.name)
         NP = len(players)
         A = ANIM_ATLAS_RES
+        srcarr5 = np.asarray(st["src"], np.int64)   # welded -> unique map (per-player masks)
         cached = sum(1 for i in range(nf) if ANIM_RESUME and _anim_frame_cached(adir, i))
         if cached:
             print(f"[ANIM] resume: {cached}/{nf} frames already rendered -- skipping them")
@@ -4819,8 +4822,39 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             zfar = float(zvals[np.argmax(zcnts)])
             zlo, zsc = (0.0, 1.0) if zfar > 0.99 else (16.0 / 255.0, 219.0 / 255.0)
             dq = np.clip((zr - zlo) / zsc, 0.0, 1.0)
-            dbuf = np.ones((dq.size, 4), 'float32')
-            dbuf[:, 0] = dbuf[:, 1] = dbuf[:, 2] = dq
+            # MASK + INVERT: depth is only ever compared where player fragments draw, so keep
+            # just the scenery that can actually occlude someone -- inside a player's padded
+            # bbox AND nearer than that player's farthest vertex this frame (keys are at the
+            # video rate, so the pose is exact). Stored INVERTED: 0 = black = "no occluder"
+            # (the viewer's 1-v maps it to far depth with no branch), occluders = bright.
+            # Everything else stays flat black -> the lossless VP9 shrinks dramatically.
+            dq_inv = np.zeros_like(dq)
+            # the pose(s) bounding this frame: with ANIM_KEYS_STEP > 1 the union of the two
+            # surrounding keys contains every lerped position (lerp is convex), so the mask
+            # stays a superset of the drawn pose either way.
+            k0 = min(i // ANIM_KEYS_STEP, len(keys) - 1)
+            k1 = min(k0 + 1, len(keys) - 1)
+            pad = 6.0
+            for pl5 in st["players"]:
+                w0p, w1p = pl5["welded_range"]
+                ui5 = np.unique(srcarr5[w0p:w1p])
+                if ui5.size == 0:
+                    continue
+                pp5 = (keys[k0][ui5] if k1 == k0
+                       else np.concatenate([keys[k0][ui5], keys[k1][ui5]]))
+                bx0 = max(0, int(pp5[:, 0].min() - pad))
+                bx1 = min(W, int(pp5[:, 0].max() + pad) + 1)
+                by0 = max(0, int(pp5[:, 1].min() - pad))
+                by1 = min(H, int(pp5[:, 1].max() + pad) + 1)
+                if bx1 <= bx0 or by1 <= by0:
+                    continue                     # player off-camera: nothing to occlude
+                zmax_b = (pp5[:, 2].max() - zb0) / max(zb1 - zb0, 1e-6) + 0.02
+                reg = dq.reshape(H, W)[by0:by1, bx0:bx1]
+                regi = dq_inv.reshape(H, W)[by0:by1, bx0:bx1]
+                sel = reg <= zmax_b
+                regi[sel] = np.maximum(regi[sel], 1.0 - reg[sel])
+            dbuf = np.ones((dq_inv.size, 4), 'float32')
+            dbuf[:, 0] = dbuf[:, 1] = dbuf[:, 2] = dq_inv
             cd, cdW, cdH = _crop(dbuf.reshape(-1))
             _save_image(cd, cdW, cdH, os.path.join(adir, "seq", "depth", fn),
                         colorspace='Non-Color')
@@ -4896,7 +4930,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             # Viewer: fullscreen-crop prepass writes gl_FragDepth = luma + guard(~3/255),
             # then the depth-tested mesh is occluded per-pixel; translucids (water tint over
             # the player) are NOT represented -- binary occlusion only.
-            "scene_depth": {"zmin": round(zb0, 5), "zmax": round(zb1, 5)},
+            "scene_depth": {"zmin": round(zb0, 5), "zmax": round(zb1, 5),
+                            # inverted-masked: 0 = no occluder (viewer depth = far), else
+                            # value = 1 - band fraction, kept only around/ahead of players
+                            "encoding": "inverted-masked"},
             "mesh": {"file": "mesh.bin", "welded": welded, "unique": unique,
                      "tris": ntris, "players": st["players"],
                      "layout": "NSKM u32x4 header + zlib(uv u16x2/65535, src u16, tris u16x3)"},
