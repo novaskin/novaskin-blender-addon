@@ -350,7 +350,7 @@ ANIM_ATLAS_RES = 512
 #               the screen sampling density);
 #   'BAKE'      true per-player Cycles bake per frame (~20 s/player/frame on top; the quality
 #               ceiling, same look as the static export's atlas).
-ANIM_LIGHT_MODE = 'BAKE'
+ANIM_LIGHT_MODE = 'REPROJECT'
 # Crop the foreground + light videos to the players' screen region (union over all frames +
 # this padding). Both only have content where the players are, so the rest of the frame is
 # wasted bytes (foreground is mostly transparent yet nearly as big as the background). The
@@ -4767,8 +4767,17 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         v5_vl = sess.vl
         v5_passes = (v5_vl.use_pass_uv, v5_vl.use_pass_object_index, v5_vl.use_pass_z)
         v5_vl.use_pass_uv = v5_vl.use_pass_object_index = v5_vl.use_pass_z = True
+        bpy.context.view_layer.update()
         nt5 = s.compositing_node_group
         rl5 = next(n for n in nt5.nodes if n.bl_idname == 'CompositorNodeRLayers')
+        # the Render Layers node only grows the pass sockets ('UV', 'Object Index', ...)
+        # when it re-syncs with the view layer -- on a freshly opened file they don't exist
+        # yet. Re-assigning its layer forces the socket rebuild.
+        rl5.layer = rl5.layer
+        if 'Depth' not in rl5.outputs or (ANIM_LIGHT_MODE == 'REPROJECT'
+                                          and 'Object Index' not in rl5.outputs):
+            raise RuntimeError("Render Layers node did not expose the pass sockets "
+                               "(Depth/UV/Object Index); save and re-run the export.")
         v5_fos = []
         # ffmpeg's EXR decode CLAMPS values to [0,1], so everything written must be
         # pre-normalized in the compositor: Z -> the players' band fraction (raw camera
