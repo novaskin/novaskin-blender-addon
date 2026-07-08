@@ -201,10 +201,17 @@ const depthP = prog(
    uniform sampler2D uTex; uniform bool uInvert; in vec2 vUv; out vec4 frag;
    void main(){
      float v = texture(uTex,vUv).r;
-     // inverted-masked encoding: 0 = black = no occluder -> 1-v = far depth, no branch
-     float d = uInvert ? (1.0 - v) : v;
-     gl_FragDepth = clamp(d + 3.0/255.0, 0.0, 1.0);
      frag = vec4(0.0);
+     if (uInvert) {
+       // inverted-masked: black = NO occluder. The video decode can leave black a hair
+       // above 0 (limited-range YUV), so anything near black is "no data" -- write far
+       // depth instead of becoming a phantom far occluder that culls the players' own
+       // farthest fragments.
+       if (v <= 0.08) { gl_FragDepth = 1.0; return; }
+       gl_FragDepth = clamp((1.0 - v) + 3.0/255.0, 0.0, 1.0);
+       return;
+     }
+     gl_FragDepth = clamp(v + 3.0/255.0, 0.0, 1.0);
    }`);
 // v6 depth encoding: black = no occluder, brightness = nearness (masked to the players)
 const depthInverted = !!(manifest.scene_depth
