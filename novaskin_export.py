@@ -344,13 +344,12 @@ ANIM_LIGHT_PAD = 16
 ANIM_ATLAS_RES = 512
 # How the animated light is produced (the bg always renders players CAMERA-INVISIBLE, still
 # casting -- a visible gray mannequin leaks a rim wherever the lerped mesh drifts off the video):
-#   'SCREEN'    v4-style screen-space light video (2 renders/frame; fast, known-good look);
-#   'REPROJECT' UV atlas rebuilt from the LIGHT render's UV/index passes (2 renders/frame;
-#               clean edges -- scenery is camera-invisible there -- but detail is limited by
-#               the screen sampling density);
-#   'BAKE'      true per-player Cycles bake per frame (~20 s/player/frame on top; the quality
-#               ceiling, same look as the static export's atlas).
-ANIM_LIGHT_MODE = 'REPROJECT'
+#   'SCREEN'  screen-space light video (2 renders/frame; fast -- the draft/iteration mode);
+#   'BAKE'    per-player Cycles bake per frame into a UV atlas (~10-20 s/player/frame on top;
+#             full texel coverage, the static-atlas look -- the final-quality mode).
+# (A cheaper REPROJECT mode -- rebuilding the atlas from the light render's UV pass -- was
+# tried and DROPPED: the screen-sampling density made the atlas quality unsatisfactory.)
+ANIM_LIGHT_MODE = 'BAKE'
 # Crop the foreground + light videos to the players' screen region (union over all frames +
 # this padding). Both only have content where the players are, so the rest of the frame is
 # wasted bytes (foreground is mostly transparent yet nearly as big as the background). The
@@ -4480,33 +4479,6 @@ def _static_export(players, out_dir=None, op=None):
     return _drain_render(_static_export_steps(players, op=op, out_dir=out_dir))
 
 
-def _anim_pull_push(rgb, w):
-    """Fill the holes of a scattered image by PULL-PUSH interpolation (the standard lightmap /
-    texture-space trick): downsample weight-aware until everything is covered, then push the
-    coarse values back up into the empty texels. Smooth fills across holes of any size, O(N).
-    rgb (H, W, 3) float, w (H, W) weights (0 = hole). Even dims per level (power-of-two res)."""
-    H, W = w.shape
-    if H <= 1 or W <= 1 or (w > 0).all():
-        out = rgb.copy()
-        if not (w > 0).all():
-            tot = float(w.sum())
-            avg = (rgb * w[..., None]).sum((0, 1)) / max(tot, 1e-9)
-            out[w <= 0] = avg
-        return out
-    He, We = H // 2 * 2, W // 2 * 2
-    rw = rgb * w[..., None]
-    rw2 = (rw[0:He:2, 0:We:2] + rw[1:He:2, 0:We:2]
-           + rw[0:He:2, 1:We:2] + rw[1:He:2, 1:We:2])
-    w2 = (w[0:He:2, 0:We:2] + w[1:He:2, 0:We:2]
-          + w[0:He:2, 1:We:2] + w[1:He:2, 1:We:2])
-    rgb2 = rw2 / np.maximum(w2[..., None], 1e-9)
-    filled2 = _anim_pull_push(rgb2, np.minimum(w2, 1.0))   # cap: coarse levels don't dominate
-    up = np.repeat(np.repeat(filled2, 2, axis=0), 2, axis=1)
-    if up.shape[0] < H:
-        up = np.concatenate([up, up[-1:]], axis=0)
-    if up.shape[1] < W:
-        up = np.concatenate([up, up[:, -1:]], axis=1)
-    return np.where((w > 0)[..., None], rgb, up[:H, :W])
 
 
 def _ffmpeg_path():
@@ -4770,23 +4742,23 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         # never grows their sockets. Force Cycles for the whole export, like the static path.
         v5_engine = s.render.engine
         s.render.engine = 'CYCLES'
-        v5_vl.use_pass_uv = v5_vl.use_pass_object_index = v5_vl.use_pass_z = True
+        if ANIM_LIGHT_MODE not in ('SCREEN', 'BAKE'):
+            raise RuntimeError(f"ANIM_LIGHT_MODE {ANIM_LIGHT_MODE!r}: use 'SCREEN' or 'BAKE'.")
+        v5_vl.use_pass_z = True
         bpy.context.view_layer.update()
         nt5 = s.compositing_node_group
         rl5 = next(n for n in nt5.nodes if n.bl_idname == 'CompositorNodeRLayers')
-        # the Render Layers node only grows the pass sockets ('UV', 'Object Index', ...)
-        # when it re-syncs with the view layer -- on a freshly opened file they don't exist
-        # yet. Re-assigning its layer forces the socket rebuild.
+        # the Render Layers node only grows the pass sockets when it re-syncs with the view
+        # layer -- on a freshly opened file 'Depth' doesn't exist yet. Re-assigning its layer
+        # forces the socket rebuild.
         rl5.layer = rl5.layer
-        if 'Depth' not in rl5.outputs or (ANIM_LIGHT_MODE == 'REPROJECT'
-                                          and 'Object Index' not in rl5.outputs):
-            raise RuntimeError("Render Layers node did not expose the pass sockets "
-                               "(Depth/UV/Object Index); save and re-run the export.")
+        if 'Depth' not in rl5.outputs:
+            raise RuntimeError("Render Layers node did not expose the Depth pass socket; "
+                               "save and re-run the export.")
         v5_fos = []
-        # ffmpeg's EXR decode CLAMPS values to [0,1], so everything written must be
-        # pre-normalized in the compositor: Z -> the players' band fraction (raw camera
-        # depths / the sky's 1e10 would flatten to black), Object Index -> index/10 (an
-        # index >= 2 would clamp; /10 keeps up to 10 players).
+        # ffmpeg's EXR decode CLAMPS values to [0,1], so Z is pre-normalized in the
+        # compositor to the players' band fraction (raw camera depths / the sky's 1e10
+        # would flatten to black).
         def _fo_math(op, in_sock, value, clamp=False):
             mn = nt5.nodes.new('ShaderNodeMath')
             mn.name = f'__anim_fo_m{len(v5_fos)}_{op}__'
@@ -4798,11 +4770,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             return mn.outputs[0]
         z_sub = _fo_math('SUBTRACT', rl5.outputs['Depth'], zb0)
         z_out = _fo_math('DIVIDE', z_sub, max(zb1 - zb0, 1e-6), clamp=True)
-        fo_streams = [('zz', z_out)]
-        if ANIM_LIGHT_MODE == 'REPROJECT':      # uv/idx only feed the reprojection
-            idx_out = _fo_math('MULTIPLY', rl5.outputs['Object Index'], 0.1)
-            fo_streams += [('uv', rl5.outputs['UV']), ('idx', idx_out)]
-        for pname, src in fo_streams:
+        for pname, src in [('zz', z_out)]:
             fo5 = nt5.nodes.new('CompositorNodeOutputFile')
             fo5.name = f'__anim_fo_{pname}__'
             fo5.directory = exr_dir
@@ -4816,9 +4784,6 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             v5_fos.append(fo5.name)
         NP = len(players)
         A = ANIM_ATLAS_RES
-        atlas_prev = np.zeros((A, A * NP, 3), np.float32)
-        atlas_prev_cov = np.zeros((A, A * NP), bool)
-        v5_cal = [16.0 / 255.0, 219.0 / 255.0]   # ffmpeg range squeeze (LO, SC), self-calibrated
         cached = sum(1 for i in range(nf) if ANIM_RESUME and _anim_frame_cached(adir, i))
         if cached:
             print(f"[ANIM] resume: {cached}/{nf} frames already rendered -- skipping them")
@@ -4879,10 +4844,8 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                     bpy.data.images.remove(img5)
                     tiles_out[:, (pnum - 1) * A:pnum * A] = px5   # bake files: display-encoded
             else:
-                # 2) LIGHT render (v4 pass): players gray VISIBLE, scenery camera-invisible
-                # (still lighting/shadowing). SCREEN ships it as the light video; REPROJECT
-                # rebuilds the UV atlas from THIS render's UV/index passes -- edges blend to
-                # transparent here, so no scenery colour bleeds into the atlas.
+                # 2) SCREEN: the light render -- players gray VISIBLE, scenery
+                # camera-invisible (still lighting/shadowing) -- shipped as the light video.
                 setup()
                 sc = {o: o.visible_camera for o in scenery}
                 for o in scenery:
@@ -4897,66 +4860,11 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                 la = np.clip(L[:, 3], 0.0, 1.0)
                 lst = np.where(la[:, None] > 1e-4,
                                L[:, :3] / np.maximum(la[:, None], 1e-4), 0.0)
-                if ANIM_LIGHT_MODE == 'SCREEN':
-                    lsd = _anim_dilate_light(lst, la > 0.01, rW, rH)
-                    lbuf = np.ones((L.shape[0], 4), 'float32')
-                    lbuf[:, :3] = _lin_to_srgb(lsd)
-                    cflat, cW2, cH2 = _crop(lbuf.reshape(-1))
-                    _save_image(cflat, cW2, cH2, os.path.join(adir, "seq", "light", fn))
-                else:                            # REPROJECT
-                    uvr = _anim_exr_read(ff, os.path.join(exr_dir, "uv.exr"), 'uv',
-                                         rW, rH, gray=False)
-                    idr = _anim_exr_read(ff, os.path.join(exr_dir, "idx.exr"), 'idx',
-                                         rW, rH, gray=True)
-                    # self-calibrate ffmpeg's range squeeze from the index plateaus (the
-                    # compositor wrote index/10, so plateaus sit every SC/10 above LO)
-                    vals, cnts = np.unique(np.round(idr, 3), return_counts=True)
-                    lo = float(vals[np.argmax(cnts)])
-                    ks = [float(v) for v, c in zip(vals, cnts) if c > 200 and v > lo + 0.005]
-                    if ks:
-                        k = min(ks) - lo
-                        n = max(1, int(round(10.0 * k / v5_cal[1])))
-                        v5_cal = [lo, 10.0 * k / n]
-                    else:
-                        v5_cal[0] = lo
-                    idc = (idr - v5_cal[0]) / v5_cal[1] * 10.0
-                    uvc = (uvr - v5_cal[0]) / v5_cal[1]
-                    # BILINEAR-splat the straight LINEAR light by skin UV into the tiles
-                    acc = np.zeros((A, A * NP, 3), np.float64)
-                    cnt = np.zeros((A, A * NP), np.float64)
-                    for pnum in range(1, NP + 1):
-                        m = (np.abs(idc - pnum) < 0.05) & (la > 0.5)
-                        if not m.any():
-                            continue
-                        u = np.clip(uvc[m, 0], 0.0, 1.0)
-                        v = np.clip(uvc[m, 1], 0.0, 1.0)
-                        c = lst[m]
-                        ox = (pnum - 1) * A
-                        x = u * A - 0.5
-                        y = (1.0 - v) * A - 0.5
-                        x0 = np.floor(x)
-                        y0 = np.floor(y)
-                        fx = x - x0
-                        fy = y - y0
-                        for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
-                            wgt = (fx if dx else 1.0 - fx) * (fy if dy else 1.0 - fy)
-                            xi = np.clip(x0 + dx, 0, A - 1).astype(np.int64) + ox
-                            yi = np.clip(y0 + dy, 0, A - 1).astype(np.int64)
-                            np.add.at(acc, (yi, xi), c * wgt[:, None])
-                            np.add.at(cnt, (yi, xi), wgt)
-                    tcov = cnt > 1e-4
-                    tiles = np.zeros((A, A * NP, 3), np.float32)
-                    tiles[tcov] = (acc[tcov] / cnt[tcov, None]).astype(np.float32)
-                    # temporal memory at LOW weight, then PULL-PUSH fills every hole
-                    wgt_all = np.where(tcov, np.minimum(cnt, 1.0),
-                                       np.where(atlas_prev_cov, 0.25, 0.0))
-                    rgb_all = np.where(tcov[:, :, None], tiles, atlas_prev)
-                    tiles = _anim_pull_push(rgb_all.astype(np.float64),
-                                            wgt_all).astype(np.float32)
-                    atlas_prev, atlas_prev_cov = tiles.copy(), tcov | atlas_prev_cov
-                    # display-encode like the static bake (must blend with the AgX bg)
-                    tiles_out = np.asarray(
-                        _to_display(tiles.reshape(-1, 3))).reshape(A, A * NP, 3)
+                lsd = _anim_dilate_light(lst, la > 0.01, rW, rH)
+                lbuf = np.ones((L.shape[0], 4), 'float32')
+                lbuf[:, :3] = _lin_to_srgb(lsd)
+                cflat, cW2, cH2 = _crop(lbuf.reshape(-1))
+                _save_image(cflat, cW2, cH2, os.path.join(adir, "seq", "light", fn))
             if tiles_out is not None:
                 # overlays borrow the base light: copy each base rect into its overlay rect
                 f64 = A / 64.0
