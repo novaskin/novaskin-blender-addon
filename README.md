@@ -90,11 +90,16 @@ Two extra export modes are **off by default**; enable them under
 - **Legacy Texture UV export** — the classic per-part UV / occlusion-mask / light / shadow
   image export (flat images instead of a mesh). Enabling it adds a **Format** selector
   (Texture UV / Mesh) to the sidebar plus a **Render Draft** button for quick previews.
-- **Animated export (experimental)** — exports the scene's frame range as an animated
-  wallpaper: video passes plus the players' animated geometry (~1 MB for 15 s), re-textured
-  live in the browser. Base layer only, classic arms. Needs `ffmpeg` (without it, PNG
-  sequences and an `encode.sh` are left for you to run). Enabling it shows an **Animation**
-  tab. ⚠️ A full export renders several passes per frame — expect it to take a while.
+- **Animated export** — exports the scene's frame range as an animated wallpaper that is
+  re-skinned live in the browser: a background video (player shadows baked in), a
+  scene-depth video (per-pixel occlusion — scenery correctly covers the moving players), a
+  light stream, and the players' animated geometry (a compact mesh stream, ~1 MB for 15 s).
+  Players ship with the 2nd layer (hat/jacket/sleeves/pants, toggleable per part; classic
+  arms only). Two buttons in the **Animation** tab: **Export Draft** renders the first few
+  seconds with a fast screen-space light, **Export Animation (full quality)** renders the
+  whole range and bakes a per-frame UV light atlas per player (the static-atlas look —
+  slow: expect a couple of hours for a full clip). Requires `ffmpeg` at render time. The
+  tab also carries the Mixamo FBX → rig animation retarget.
 
 ## What you get
 

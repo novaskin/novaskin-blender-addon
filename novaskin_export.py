@@ -236,7 +236,6 @@ MC_PART_MAP = {
     "l.leg":                "leg_left",
     "r.leg":                "leg_right",
     "r.leg_2ndlayer":       "pant_right",
-    "leggings":             "pant_left",
     "l.steve_arm":          "arm_left_classic",
     "r.steve_arm":          "arm_right_classic",
     "l.steve_arm_2ndlayer": "sleeve_left_classic",
@@ -896,9 +895,7 @@ def discover_players():
         if mesh_coll is None:
             print(f"[discover] {arm.name}: Mesh collection not found, skipping.")
             continue
-        extras = [o for o in rig_coll.objects
-                  if o.type == 'MESH' and 'leggings' in o.name.lower()]
-        char_all = [o for o in mesh_coll.objects if o.type == 'MESH'] + extras
+        char_all = [o for o in mesh_coll.objects if o.type == 'MESH']
         # Selection by visibility in the basic look (robustly filters fingers/3x3).
         uv_parts = _select_uv_parts(arm, char_all)
         label = ("%s%d" % (PLAYER_FOLDER_PREFIX, len(players) + 1)
@@ -4804,15 +4801,12 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             # 1) BACKGROUND: players CAMERA-INVISIBLE (still casting -> shadows baked in).
             # The visible-mannequin experiment is gone: any lerped-mesh drift exposed a gray
             # rim; with invisible players the same drift exposes scenery -- correct content.
-            import time as _t
-            _t0 = _t.time()
             setup()
             sc = {o: o.visible_camera for o in base_parts}
             for o in base_parts:
                 o.visible_camera = False
             bpy.context.view_layer.update()
             bg, rW, rH = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT)
-            _t_bg = _t.time() - _t0
             for o, v in sc.items():
                 o.visible_camera = v
             buf = np.ones((bg.shape[0], 4), 'float32')
@@ -4820,7 +4814,6 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             _save_image(buf.reshape(-1), rW, rH, os.path.join(adir, "seq", "bg", fn))
             # scene depth from THIS render's Z (scenery only), read BEFORE the light render
             # overwrites the File Output EXR. Range: the far plateau tells full vs limited.
-            _t1 = _t.time()
             zr = _anim_exr_read(ff, os.path.join(exr_dir, "zz.exr"), 'zz', rW, rH, gray=True)
             zvals, zcnts = np.unique(np.round(zr, 3), return_counts=True)
             zfar = float(zvals[np.argmax(zcnts)])
@@ -4832,8 +4825,6 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             _save_image(cd, cdW, cdH, os.path.join(adir, "seq", "depth", fn),
                         colorspace='Non-Color')
 
-            _tm = {'bg_render': _t_bg, 'z_read+depth': _t.time() - _t1}
-            _t2 = _t.time()
             tiles_out = None                     # display-encoded (A, A*NP, 3) when atlas mode
             if _anim_light_mode() == 'BAKE':
                 # 2) true per-player Cycles bakes: the quality-ceiling reference (~20 s each,
@@ -4860,8 +4851,6 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                 bpy.context.view_layer.update()
                 L, _, _ = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT,
                                                                 transparent=True)
-                _tm['light_render'] = _t.time() - _t2
-                _t2 = _t.time()
                 for o, v in sc.items():
                     o.visible_camera = v
                 la = np.clip(L[:, 3], 0.0, 1.0)
@@ -4885,8 +4874,6 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                 ab = np.ones((A * A * NP, 4), 'float32')
                 ab[:, :3] = np.asarray(tiles_out)[::-1].reshape(-1, 3)
                 _save_image(ab.reshape(-1), A * NP, A, os.path.join(adir, "seq", "atlas", fn))
-            _tm['post'] = _t.time() - _t2
-            print("[ANIM t] " + "  ".join(f"{k}={v:.1f}s" for k, v in _tm.items()))
             yield prog(f"frame {i+1}/{nf} render + light ({_anim_light_mode().lower()})")
 
         welded, unique, ntris = _anim_write_mesh(os.path.join(adir, "mesh.bin"), st)

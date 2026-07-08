@@ -1,7 +1,34 @@
 # Animated Export — Planning Doc
 
-Status: **planning** (no implementation yet). Owner decisions are marked ✅; open questions
-are at the end.
+Status: **SHIPPED — format v5** (this doc is the original plan plus phase notes; the
+sections below describe versions 1-2 and are kept as history. Summary of what actually
+ships as of 2026-07):
+
+- **Streams per export**: `background.webm` (players camera-invisible, shadows baked),
+  `scene_depth.webm` (scenery Z quantized to the players' camera-depth band, VP9
+  lossless — the viewer seeds the depth buffer from it and the depth-tested mesh is
+  occluded per-pixel, replacing the old foreground+matte videos entirely), a light stream
+  (below), `mesh.bin` (NSKM, u16/u32 auto) + `anim.bin` (NSKA v3, 12-bit z) and
+  `manifest.json` (`animated_version: 5`).
+- **Light, two modes** (`_anim_light_mode()`): DRAFT exports use `light.webm`, the
+  screen-space gray-player render sampled at the fragment position; FULL-QUALITY exports
+  bake a per-player **UV light atlas per frame** (`light_atlas.webm`, `ANIM_ATLAS_RES`
+  tiles side by side, display-encoded like the static atlas; overlay rects copy their base
+  rects). A cheaper REPROJECT mode (atlas rebuilt from the light render's UV pass) was
+  tried and dropped — screen-sampling density gave an unsatisfactory atlas.
+- **Players**: base + classic 2nd layer (per-part `parts[]` tri ranges in the manifest,
+  toggleable in the viewer; labels come from UV-rect classification, not object names).
+  Classic arms only. The rig's inset per-pixel UVs are expanded for the export.
+- **Viewer** (`prototype/play.js`): texAA + premultiplied two-pass alpha, depth prepass,
+  UV- or screen-light per manifest, per-part toggles, folder picker, debug views
+  (wireframe / depth / light / grid).
+- **Costs** (reference scene, 2 players, 960×540 draft): draft ≈ 5 s/frame; full quality
+  ≈ 30 s/frame (per-player bakes) — a 210-frame full export ≈ 2 h. `ffmpeg` is required
+  at render time (the depth pass is read back through it).
+
+---
+
+Original planning document follows (historical):
 
 ## Goal
 
