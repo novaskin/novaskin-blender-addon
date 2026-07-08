@@ -4766,6 +4766,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         exr_dir = os.path.join(adir, "seq", "exr")
         v5_vl = sess.vl
         v5_passes = (v5_vl.use_pass_uv, v5_vl.use_pass_object_index, v5_vl.use_pass_z)
+        # the UV / Object Index passes are CYCLES-only: with EEVEE the Render Layers node
+        # never grows their sockets. Force Cycles for the whole export, like the static path.
+        v5_engine = s.render.engine
+        s.render.engine = 'CYCLES'
         v5_vl.use_pass_uv = v5_vl.use_pass_object_index = v5_vl.use_pass_z = True
         bpy.context.view_layer.update()
         nt5 = s.compositing_node_group
@@ -5036,6 +5040,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                 if nd:
                     nt5.nodes.remove(nd)
             v5_vl.use_pass_uv, v5_vl.use_pass_object_index, v5_vl.use_pass_z = v5_passes
+        except NameError:
+            pass
+        try:
+            s.render.engine = v5_engine
         except NameError:
             pass
         sess.restore()
