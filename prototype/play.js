@@ -244,9 +244,15 @@ const meshP = prog(
      // export); older exports sample the screen-space light video at the fragment position.
      vec2 luv = uLightUV ? vec2((vUv.x + uTile) / uTiles, vUv.y)
                          : (gl_FragCoord.xy - uLightOrigin)/uLightSize;
-     vec3 l=uUseLight ? texture(uLight,luv).rgb*2.0 : vec3(1.0);
      vec3 base = s.a>1e-4 ? s.rgb/s.a : vec3(0.0);   // un-premultiply -> straight colour
-     frag=vec4(base*l*s.a, s.a);           // premultiplied relit entity, drawn COMPLETE
+     // relight in LINEAR space: the stream stores display-encoded 0.5*L and the skin is
+     // sRGB -- multiplying them in GAMMA space with a x2 overexposes everything above the
+     // mids (x2 linear is only x1.37 in gamma: white skin used to clip at L~0.43). Decode,
+     // undo the 0.5 gray where it belongs, re-encode.
+     vec3 Llin = uUseLight ? pow(texture(uLight,luv).rgb, vec3(2.2)) * 2.0 : vec3(1.0);
+     vec3 lin = pow(base, vec3(2.2)) * Llin;
+     vec3 outc = pow(clamp(lin, 0.0, 1.0), vec3(1.0/2.2));
+     frag=vec4(outc*s.a, s.a);             // premultiplied relit entity, drawn COMPLETE
    }`);
 function tex(nearest) {
   const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
