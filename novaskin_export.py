@@ -5552,9 +5552,14 @@ class _NovaSkinModalMixin:
                         # OLD scene (the back-to-back sprite passes then render the whole scenery, so
                         # the silhouette never cuts the mob). Wait a short grace for the depsgraph /
                         # Viewer to settle. render_complete, when it fires, is immediate + correct.
-                        # never ran: a silent INVOKE that started nothing -- give up after a long idle.
-                        grace = 2.0 if getattr(self, "_render_was_running", False) else 120.0
+                        # never ran: a silent INVOKE that started nothing. Do NOT fake
+                        # completion (the gen would read a STALE Viewer); render blocking.
+                        grace = 2.0 if getattr(self, "_render_was_running", False) else 8.0
                         if idle > grace:
+                            if not getattr(self, "_render_was_running", False):
+                                print("[NovaSkin] INVOKE render never started -- "
+                                      "running it blocking")
+                                bpy.ops.render.render(write_still=False)
                             self._render_done = True
                 if not self._render_done:
                     if _PROGRESS.get("cancel"):
@@ -5618,7 +5623,14 @@ class _NovaSkinModalMixin:
         self._render_was_running = False    # is_job_running() fallback state (see modal())
         self._render_idle_since = None
         try:
-            bpy.ops.render.render('INVOKE_DEFAULT', write_still=False)
+            ret = bpy.ops.render.render('INVOKE_DEFAULT', write_still=False)
+            if 'CANCELLED' in ret:
+                # Blender refuses a second INVOKE fired right on the heels of the previous
+                # job (back-to-back renders in one frame, e.g. bg -> light) -- SILENTLY.
+                # Without this check the modal waited the full never-ran grace and then
+                # read a STALE Viewer (black atlas, 2 min/frame).
+                print("[NovaSkin] INVOKE render refused; blocking this render")
+                bpy.ops.render.render(write_still=False)
         except Exception as ex:
             print(f"[NovaSkin] INVOKE render unavailable ({ex!r}); blocking this render")
             bpy.ops.render.render(write_still=False)   # _on_done fires during this blocking call
