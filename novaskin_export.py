@@ -342,14 +342,21 @@ ANIM_LIGHT_PAD = 16
 # resolution keeps them sharp. Sparse texels are filled by bilinear splatting + pull-push
 # interpolation, so any power of two works (512 gets real detail only from full-res exports).
 ANIM_ATLAS_RES = 512
-# How the animated light is produced (the bg always renders players CAMERA-INVISIBLE, still
-# casting -- a visible gray mannequin leaks a rim wherever the lerped mesh drifts off the video):
-#   'SCREEN'  screen-space light video (2 renders/frame; fast -- the draft/iteration mode);
+# How the FULL-QUALITY animated light is produced; DRAFT exports always use 'SCREEN' (the bg
+# always renders players CAMERA-INVISIBLE, still casting -- a visible gray mannequin leaks a
+# rim wherever the lerped mesh drifts off the video):
+#   'SCREEN'  screen-space light video (2 renders/frame; fast -- what drafts use);
 #   'BAKE'    per-player Cycles bake per frame into a UV atlas (~10-20 s/player/frame on top;
-#             full texel coverage, the static-atlas look -- the final-quality mode).
+#             full texel coverage, the static-atlas look -- the shipping quality).
 # (A cheaper REPROJECT mode -- rebuilding the atlas from the light render's UV pass -- was
 # tried and DROPPED: the screen-sampling density made the atlas quality unsatisfactory.)
 ANIM_LIGHT_MODE = 'BAKE'
+
+
+def _anim_light_mode():
+    """The light mode of the CURRENT export: drafts iterate with the fast SCREEN light, full
+    exports use ANIM_LIGHT_MODE (BAKE)."""
+    return 'SCREEN' if DRAFT_MODE else ANIM_LIGHT_MODE
 # Crop the foreground + light videos to the players' screen region (union over all frames +
 # this padding). Both only have content where the players are, so the rest of the frame is
 # wasted bytes (foreground is mostly transparent yet nearly as big as the background). The
@@ -2937,7 +2944,7 @@ def _anim_frame_cached(adir, i):
     return all(os.path.exists(p) and os.path.getsize(p) > 0
                for p in (os.path.join(adir, "seq", k, fn)
                          for k in ("bg", "depth",
-                                   "light" if ANIM_LIGHT_MODE == 'SCREEN' else "atlas")))
+                                   "light" if _anim_light_mode() == 'SCREEN' else "atlas")))
 
 
 def _anim_dilate_light(rgb, covered, W, H, passes=None):
@@ -4828,7 +4835,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             _tm = {'bg_render': _t_bg, 'z_read+depth': _t.time() - _t1}
             _t2 = _t.time()
             tiles_out = None                     # display-encoded (A, A*NP, 3) when atlas mode
-            if ANIM_LIGHT_MODE == 'BAKE':
+            if _anim_light_mode() == 'BAKE':
                 # 2) true per-player Cycles bakes: the quality-ceiling reference (~20 s each,
                 # SYNC). Base look (setup): overlays stay out of the bake; their rects are
                 # copied from the base below, like the other atlas modes.
@@ -4880,7 +4887,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                 _save_image(ab.reshape(-1), A * NP, A, os.path.join(adir, "seq", "atlas", fn))
             _tm['post'] = _t.time() - _t2
             print("[ANIM t] " + "  ".join(f"{k}={v:.1f}s" for k, v in _tm.items()))
-            yield prog(f"frame {i+1}/{nf} render + light ({ANIM_LIGHT_MODE.lower()})")
+            yield prog(f"frame {i+1}/{nf} render + light ({_anim_light_mode().lower()})")
 
         welded, unique, ntris = _anim_write_mesh(os.path.join(adir, "mesh.bin"), st)
         K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), keys,
@@ -4919,7 +4926,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                             "per-player atlas tile (uv) or the light video (screen). "
                             "Interpolate positions between mesh keys."),
         }
-        if ANIM_LIGHT_MODE == 'SCREEN':
+        if _anim_light_mode() == 'SCREEN':
             manifest["videos"]["light"] = "light.webm"
         else:
             # per-player UV-space light tiles (back-to-front player order, side by side);
@@ -4927,7 +4934,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             # relights skin(uv) * atlas(uv) * 2.
             manifest["videos"]["light_atlas"] = "light_atlas.webm"
             manifest["light_atlas"] = {"res": ANIM_ATLAS_RES, "tiles": len(players),
-                                       "mode": ANIM_LIGHT_MODE}
+                                       "mode": _anim_light_mode()}
         with open(os.path.join(adir, "manifest.json"), "w") as fh:
             json.dump(manifest, fh, indent=2)
         yield prog("mesh.bin / anim.bin / manifest.json")
@@ -5292,7 +5299,7 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
                 'FILE_FOLDER', 0),
                ('LAYERS', "Layers", "Detected rig + optional toggleable layers",
                 'RENDERLAYERS', 1),
-               ('ANIM', "Animation", "Animated wallpaper export (beta)",
+               ('ANIM', "Animation", "Animated wallpaper export",
                 'RENDER_ANIMATION', 2)],
         default='EXPORT')
 
@@ -5769,11 +5776,11 @@ class NovaSkinAddonPreferences(bpy.types.AddonPreferences):
                     "offered; the legacy per-part UV export still works, for advanced or "
                     "backward-compatible use")
     enable_animated_export: BoolProperty(
-        name="Enable animated export (experimental)",
+        name="Enable animated export",
         default=False,
-        description="Show the Animation tab in the NovaSkin sidebar. The animated wallpaper export "
-                    "is a work-in-progress / beta feature; its operator stays registered either "
-                    "way, for advanced use")
+        description="Show the Animation tab in the NovaSkin sidebar (animated wallpaper "
+                    "export + FBX retarget). Its operators stay registered either way, "
+                    "for advanced use")
 
     def draw(self, context):
         col = self.layout.column()
@@ -5968,16 +5975,22 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             rbox.label(text="Bakes onto the FK controls. Feet may need cleanup.", icon='INFO')
 
             box = layout.box()
-            box.label(text="Animated (beta)", icon='RENDER_ANIMATION')
+            box.label(text="Animated", icon='RENDER_ANIMATION')
             if not running:               # while running, the top progress bar is the indicator
-                box.operator("render.novaskin_animated", icon='RENDER_ANIMATION').draft = False
+                # draft: first ~N s, fast SCREEN light -- the iteration button
                 box.operator("render.novaskin_animated",
-                             text=f"Export Animation Draft (~{ANIM_DRAFT_SECONDS}s)",
+                             text=f"Export Draft (~{ANIM_DRAFT_SECONDS}s)",
                              icon='MOD_FLUID').draft = True
+                # full: whole range, per-frame BAKED light atlas -- the shipping button
+                col = box.column()
+                col.scale_y = 1.4
+                col.operator("render.novaskin_animated",
+                             text="Export Animation (full quality)",
+                             icon='RENDER_ANIMATION').draft = False
             box.label(text=f"frames {context.scene.frame_start}-{context.scene.frame_end}"
-                           f" @ {context.scene.render.fps} fps, base layer only")
-            box.label(text=f"(draft renders only the first ~{ANIM_DRAFT_SECONDS}s)",
-                      icon='INFO')
+                           f" @ {context.scene.render.fps} fps, base + 2nd layer")
+            box.label(text=f"(draft: first ~{ANIM_DRAFT_SECONDS}s, fast screen light; "
+                           f"full: baked light atlas, slower)", icon='INFO')
 
 
 _classes = (NovaSkinAddonPreferences, NovaSkinSettings, RENDER_OT_novaskin,
