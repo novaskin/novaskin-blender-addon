@@ -23,16 +23,14 @@ Build a scene in **Blender**, press one button, and get an **interactive wallpap
 
 ## Part 1 — Install the NovaSkin Export add-on
 
-Install it from GitHub:
+The easy way — from the Blender Extensions platform:
 
-1. Go to the **[releases page](https://github.com/novaskin/novaskin-blender-addon/releases)** and download the latest **`novaskin_export-*.zip`**.
-2. Open Blender and **drag the `.zip` straight onto the Blender window**.
-   *(Or: `Edit ▸ Preferences ▸ Get Extensions ▸ ⌄ ▸ Install from Disk…` and pick the zip.)*
-3. Make sure **“NovaSkin Export”** is enabled in the add-on list.
+1. Open **`Edit ▸ Preferences ▸ Get Extensions`**, search for **“NovaSkin Export”**, and install it — or grab it from its [extension page](https://extensions.blender.org/add-ons/novaskin-export/).
+2. Make sure **“NovaSkin Export”** is enabled in the add-on list.
+
+Or from GitHub: download the latest **`novaskin_export-*.zip`** from the **[releases page](https://github.com/novaskin/novaskin-blender-addon/releases)** and **drag the `.zip` straight onto the Blender window** *(or: `Edit ▸ Preferences ▸ Get Extensions ▸ ⌄ ▸ Install from Disk…`)*. To update later, just install the newer zip the same way.
 
 > 📷 *[screenshot: dragging the zip onto Blender + the enabled add-on]*
-
-To update later, just install the newer zip the same way.
 
 ---
 

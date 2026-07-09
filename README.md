@@ -28,7 +28,10 @@ failing midway.
 
 ## Install
 
-- **Extension zip (recommended):** download `novaskin_export-<version>.zip` from the
+- **Blender Extensions (recommended):** install straight from
+  [extensions.blender.org/add-ons/novaskin-export](https://extensions.blender.org/add-ons/novaskin-export/)
+  — or search for **“NovaSkin Export”** in `Edit > Preferences > Get Extensions`.
+- **Extension zip:** download `novaskin_export-<version>.zip` from the
   [releases](https://github.com/novaskin/novaskin-blender-addon/releases) and **drag it
   onto the Blender window** (or `Edit > Preferences > Get Extensions > ⌄ > Install from
   Disk…`).
