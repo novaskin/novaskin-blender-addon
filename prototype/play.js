@@ -534,7 +534,8 @@ function draw() {
   else if (mode === 'fg') drawFgVideo();
   else drawComposite();
   if (!scrubbing) scrub.value = Math.round(vBg.currentTime / duration() * 1000) || 0;
-  timeEl.textContent = vBg.currentTime.toFixed(1) + 's';
+  const fr = Math.min(manifest.frames - 1, Math.round(vBg.currentTime * manifest.fps));
+  timeEl.textContent = `f${fr}/${manifest.frames - 1} · ${vBg.currentTime.toFixed(1)}s`;
   if (recTrack) recTrack.requestFrame();   // recording: push THIS frame into the capture
   if (!dead) rafId = requestAnimationFrame(draw);
 }
