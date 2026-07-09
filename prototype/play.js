@@ -528,6 +528,7 @@ function draw() {
   else drawComposite();
   if (!scrubbing) scrub.value = Math.round(vBg.currentTime / duration() * 1000) || 0;
   timeEl.textContent = vBg.currentTime.toFixed(1) + 's';
+  if (recTrack) recTrack.requestFrame();   // recording: push THIS frame into the capture
   if (!dead) rafId = requestAnimationFrame(draw);
 }
 
@@ -565,6 +566,62 @@ scrub.oninput = () => {
   const t = (scrub.value / 1000) * duration();
   vids.forEach(v => { v.currentTime = t; });
 };
+// --- record: capture the composited canvas over exactly one loop and download it as a
+// shareable video. MediaRecorder over canvas.captureStream -- realtime capture, so the tab
+// must stay visible (a hidden tab throttles rAF and starves the stream). MP4 where the
+// browser can mux it, else WebM.
+const recbtn = document.getElementById('recbtn');
+let recStop = null;           // active recording's finalizer (also used by teardown/re-click)
+let recTrack = null;          // capture track; draw() pushes each rendered frame into it
+if (recbtn) recbtn.onclick = () => {
+  if (recStop) { recStop(); return; }                    // click again = stop + save early
+  const mime = ['video/mp4;codecs=avc1', 'video/webm;codecs=vp9', 'video/webm']
+    .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+  if (!mime) { recbtn.textContent = 'rec unsupported'; return; }
+  recbtn.disabled = true;                                // no re-entry while restarting at 0
+  vids.forEach(v => { v.currentTime = 0; });
+  const startRec = () => {
+    // captureStream(0) = manual frame delivery: draw() calls requestFrame() per rendered
+    // frame, so the capture is frame-exact instead of timer-sampled
+    const stream = canvas.captureStream(0);
+    const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 16e6 });
+    const chunks = [];
+    rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    rec.onstop = () => {
+      const blob = new Blob(chunks, { type: mime.split(';')[0] });
+      if (blob.size) {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'novaskin-wallpaper.' + (mime.startsWith('video/mp4') ? 'mp4' : 'webm');
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+      }
+    };
+    let prevT = 0;
+    const watch = setInterval(() => {                    // stop at the loop wrap
+      recbtn.textContent = '■ ' + vBg.currentTime.toFixed(1) + 's';
+      if (vBg.currentTime < prevT - 0.25) recStop();
+      else prevT = vBg.currentTime;
+    }, 100);
+    const safety = setTimeout(() => recStop(), duration() * 1000 + 3000);
+    recStop = (discard) => {
+      clearInterval(watch); clearTimeout(safety);
+      recStop = null; recTrack = null;
+      recbtn.textContent = '⏺ rec'; recbtn.disabled = false;
+      if (discard) { rec.ondataavailable = null; rec.onstop = null; }
+      try { rec.stop(); } catch (e) { }
+    };
+    vids.forEach(v => v.play());
+    playbtn.textContent = '❚❚';
+    rec.start();
+    recTrack = stream.getVideoTracks()[0];
+    recbtn.disabled = false;
+  };
+  // a same-position seek may complete synchronously (no 'seeked' coming) -- start right away
+  if (vBg.seeking) vBg.addEventListener('seeked', startRec, { once: true });
+  else startRec();
+};
+
 // debug handle (pause/seek from the console): __dbg.seek(5.0)
 window.__dbg = {
   vBg, vFg, vLight, vAtlas, vMatte, vDepth, hasMatte, hasDepth, hasAtlas, keys, K, keysFps, setSkin,
@@ -574,6 +631,7 @@ let rafId = 0, dead = false;
 // next boot (folder picked) stops this instance: rAF loop, videos, and its UI controls
 window.__nskTeardown = () => {
   dead = true;
+  if (recStop) recStop(true);   // discard a recording in progress
   cancelAnimationFrame(rafId);
   for (const v of vids) { v.pause(); URL.revokeObjectURL(v.src); }
   document.getElementById('skins').innerHTML = '';

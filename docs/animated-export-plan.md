@@ -26,7 +26,8 @@ ships as of 2026-07):
   expanded for the export.
 - **Viewer** (`prototype/play.js`): texAA + premultiplied two-pass alpha, depth prepass,
   UV- or screen-light per manifest, per-part toggles + per-player classic/slim arm toggle,
-  folder picker, debug views (wireframe / depth / light / grid).
+  folder picker, debug views (wireframe / depth / light / grid), one-loop composite
+  recording (⏺ rec → shareable MP4/WebM; the tab must stay visible while it records).
 - **Costs** (reference scene, 2 players, 960×540 draft): draft ≈ 5 s/frame; full quality
   ≈ 30 s/frame (per-player bakes) — a 210-frame full export ≈ 2 h. `ffmpeg` is required
   at render time (the depth pass is read back through it).
