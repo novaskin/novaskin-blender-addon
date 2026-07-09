@@ -275,8 +275,9 @@ const tSkins = skins.map((img) => { const t = tex(); upload(t, img, true); retur
 
 // swap a player's skin at runtime (file input below, or __dbg.setSkin(i, src))
 function setSkin(i, source) { upload(tSkins[i], source, true); }
-const partOff = new Set();    // disabled overlay parts, as "playerLabel::partLabel"
+const partOff = new Set();    // disabled overlays, keyed "playerLabel::variantStrippedLabel"
 const variantSel = {};        // arm style per player label: 'classic' (Steve) | 'slim' (Alex)
+const baseLabel = (lab) => lab.replace(/_(classic|slim)$/, '');   // drop the arm-style suffix
 {
   const box = document.getElementById('skins');
   box.innerHTML = '';                       // re-boot: drop the previous instance's controls
@@ -295,14 +296,21 @@ const variantSel = {};        // arm style per player label: 'classic' (Steve) |
     };
     lab.appendChild(inp);
     box.appendChild(lab);
-    // per-part toggles for the 2nd layer (manifests with parts[]; overlays borrow the base light)
+    // per-part toggles for the 2nd layer (manifests with parts[]; overlays borrow the base
+    // light). Variant-specific overlays (classic/slim sleeves) collapse to ONE checkbox per
+    // side, keyed by the variant-stripped label -- so the panel shows "sleeve_left" once
+    // rather than a live and a dead checkbox for the two arm styles.
+    const ovSeen = new Set();
     for (const pm of (p.parts || []).filter(pm => pm.overlay)) {
-      const key = `${p.label}::${pm.label}`;
+      const base = baseLabel(pm.label);
+      if (ovSeen.has(base)) continue;
+      ovSeen.add(base);
+      const key = `${p.label}::${base}`;
       const pl = document.createElement('label');
       const cb = document.createElement('input');
       cb.type = 'checkbox'; cb.checked = true;
       cb.onchange = () => { cb.checked ? partOff.delete(key) : partOff.add(key); };
-      pl.appendChild(cb); pl.appendChild(document.createTextNode(pm.label + ' '));
+      pl.appendChild(cb); pl.appendChild(document.createTextNode(base + ' '));
       box.appendChild(pl);
     }
     // arm-style toggle -- only for manifests that ship both variants (parts[] with variant)
@@ -432,7 +440,7 @@ function drawPlayers(o) {
       ranges = [];
       for (const pm of p.parts) {
         if (pm.variant && pm.variant !== sel) continue;
-        if (pm.overlay && partOff.has(`${p.label}::${pm.label}`)) continue;
+        if (pm.overlay && partOff.has(`${p.label}::${baseLabel(pm.label)}`)) continue;
         const [t0, t1] = pm.tri_range;
         if (ranges.length && ranges[ranges.length - 1][1] === t0) ranges[ranges.length - 1][1] = t1;
         else ranges.push([t0, t1]);
