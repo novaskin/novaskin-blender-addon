@@ -480,8 +480,8 @@ function drawFgVideo() {
 }
 function drawComposite() {
   if (ck('ck_bg')) blitVideo(tBg, FULLRECT);
-  if (ck('ck_pl')) drawPlayers({ occlude: ck('ck_fg'), light: ck('ck_li') });
-  if (ck('ck_fg') && !hasDepth) drawFgVideo();   // v4 occludes via the depth prepass instead
+  if (ck('ck_pl')) drawPlayers({ occlude: ck('ck_occ'), light: ck('ck_li') });
+  if (ck('ck_occ') && !hasDepth) drawFgVideo();   // v4 occludes via the depth prepass instead
 }
 // grid: every stream/step side by side, all in sync -- what each one contributes
 function drawGrid() {
@@ -491,7 +491,7 @@ function drawGrid() {
                     vAtlas ? FULLRECT : cropRectNDC),
     () => drawFgVideo(),                                     // foreground + matte
     () => { if (vDepth) blitVideo(tDepth, cropRectNDC); },   // scene depth (players' band)
-    () => drawPlayers({ wire: true, occlude: ck('ck_fg') }), // wireframe (occlusion applied)
+    () => drawPlayers({ wire: true, occlude: ck('ck_occ') }), // wireframe (occlusion applied)
     () => drawComposite(),                                   // final composite
   ];
   const tw = Math.floor(W / 3), th = Math.floor(H / 2);
@@ -527,7 +527,7 @@ function draw() {
   if (mode === 'grid') drawGrid();
   else if (mode === 'wire') {
     if (ck('ck_bg')) blitVideo(tBg, FULLRECT);
-    drawPlayers({ wire: true, occlude: ck('ck_fg') });
+    drawPlayers({ wire: true, occlude: ck('ck_occ') });
   }
   else if (mode === 'depth') { if (vDepth) blitVideo(tDepth, cropRectNDC); }
   else if (mode === 'light') blitVideo(tLight, cropRectNDC);
