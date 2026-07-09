@@ -155,8 +155,7 @@ const skins = await Promise.all(manifest.mesh.players.map(() => loadImage('data/
 
 // --- GL setup (same shaders as the one-frame prototype)
 const canvas = document.getElementById('gl');
-canvas.width = W; canvas.height = H;
-canvas.style.height = (960 * H / W) + 'px';
+canvas.width = W; canvas.height = H;   // buffer size = intrinsic aspect; CSS fits it to #stage
 const gl = canvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true });
 function sh(t, s) { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o);
   if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(o); return o; }
