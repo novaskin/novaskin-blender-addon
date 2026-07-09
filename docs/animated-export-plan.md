@@ -18,10 +18,15 @@ ships as of 2026-07):
   tried and dropped — screen-sampling density gave an unsatisfactory atlas.
 - **Players**: base + classic 2nd layer (per-part `parts[]` tri ranges in the manifest,
   toggleable in the viewer; labels come from UV-rect classification, not object names).
-  Classic arms only. The rig's inset per-pixel UVs are expanded for the export.
+  BOTH arm styles ship (same design as the static export): the inactive variant's parts are
+  emitted after the overlays with a `variant` field (`classic`/`slim`), and their per-frame
+  key positions are captured with the rig style flipped (the parked variant poses at the
+  arm). `default_variant` records the style the atlas/light was rendered for — the other
+  borrows its rects (the two UV nets differ ~1px). The rig's inset per-pixel UVs are
+  expanded for the export.
 - **Viewer** (`prototype/play.js`): texAA + premultiplied two-pass alpha, depth prepass,
-  UV- or screen-light per manifest, per-part toggles, folder picker, debug views
-  (wireframe / depth / light / grid).
+  UV- or screen-light per manifest, per-part toggles + per-player classic/slim arm toggle,
+  folder picker, debug views (wireframe / depth / light / grid).
 - **Costs** (reference scene, 2 players, 960×540 draft): draft ≈ 5 s/frame; full quality
   ≈ 30 s/frame (per-player bakes) — a 210-frame full export ≈ 2 h. `ffmpeg` is required
   at render time (the depth pass is read back through it).

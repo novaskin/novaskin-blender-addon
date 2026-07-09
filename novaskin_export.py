@@ -2988,7 +2988,8 @@ def _anim_collect_static(players, W, H):
     dg = bpy.context.evaluated_depsgraph_get()
     ordered = sorted(players, key=lambda p: _player_camera_depth(p) or 0.0, reverse=True)
     st = {"parts": [], "uv": [], "src": [], "tris": [], "players": [],
-          "uniq": []}                                  # uniq: list of (part_idx, vert_idx)
+          "uniq": [],                                  # uniq: list of (part_idx, vert_idx)
+          "flip": []}       # inactive arm-variant parts: positions need the rig style flipped
     weld, uniq_keys = {}, {}
     for p in ordered:
         labs = p.get("uv_labels") or _assign_part_labels(p["uv_parts"], label=p["label"])
@@ -3002,11 +3003,12 @@ def _anim_collect_static(players, W, H):
                 if b:
                     mixed[o.name] = b
         w0, t0 = len(st["src"]), len(st["tris"]) // 3
-        parts_meta = []
+        parts_meta, pis_meta = [], []
 
         def emit(o, lab, subset, overlay):
             pt0 = len(st["tris"]) // 3
             pi = len(st["parts"]); st["parts"].append(o.name)
+            pis_meta.append(pi)
             ev = o.evaluated_get(dg); me = ev.to_mesh(); me.calc_loop_triangles()
             uvl = me.uv_layers.active.data
             lts = (me.loop_triangles if subset is None
@@ -3029,7 +3031,8 @@ def _anim_collect_static(players, W, H):
             ev.to_mesh_clear()
             parts_meta.append({"label": lab,
                                "tri_range": [pt0, len(st["tris"]) // 3],
-                               "overlay": overlay})
+                               "overlay": overlay,
+                               "variant": _part_variant(lab)})
 
         # ALL base tris first, then ALL overlay tris (the viewer's base span is
         # [tri_range[0], overlay_tri_start]); mixed objects are visited once per phase.
@@ -3044,11 +3047,33 @@ def _anim_collect_static(players, W, H):
                         emit(o, lab, mixed[o.name][lab], phase == 'overlay')
         ov_t0 = next((pm["tri_range"][0] for pm in parts_meta if pm["overlay"]),
                      len(st["tris"]) // 3)
+        # The OTHER arm style (classic <-> slim, same design as the static export): topology
+        # and UVs are pose-independent, so the parked variant collects in place -- only its
+        # per-frame POSITIONS need the rig flipped (see _anim_frame_positions; the inactive
+        # variant is parked away from the body). Emitted AFTER the overlays so the classic
+        # base span [tri_range[0], overlay_tri_start] stays intact; the viewer picks parts by
+        # their `variant` field. Object-level only: single-mesh generic rigs have no variant
+        # duplicates to add. The atlas bakes the ACTIVE style; the other borrows its rects
+        # (the two UV nets differ ~1px, the bake margin covers it).
+        default_variant = next((v for o in p["uv_parts"] if not o.hide_render
+                                and (v := _part_variant(labs.get(o.name)))), 'classic')
+        other = 'slim' if default_variant == 'classic' else 'classic'
+        for o in sorted([o for o in p["uv_parts"]
+                         if _part_variant(labs.get(o.name)) == 'slim'],
+                        key=lambda o: o.name):
+            lab = labs.get(o.name)
+            emit(o, lab, None, any(k in lab for k in ANIM_OVERLAY_KEYS))
+        flip_pis = [pi for pi, pm in zip(pis_meta, parts_meta)
+                    if pm["variant"] == other]
+        if flip_pis:
+            st["flip"].append({"player": p, "parts": flip_pis,
+                               "slim_value": dict(MASK_ARM_VARIANTS)[other]})
         st["players"].append({"label": p["label"],
                               "welded_range": [w0, len(st["src"])],
                               "tri_range": [t0, len(st["tris"]) // 3],
                               "overlay_tri_start": ov_t0,
                               "parts": parts_meta,
+                              "default_variant": default_variant,
                               "camera_depth": round(_player_camera_depth(p) or 0.0, 3)})
     # per-part gather arrays: part_idx -> (vert indices, unique indices)
     gather = {}
@@ -3070,9 +3095,13 @@ def _anim_frame_positions(st, W, H):
     ce = cam.evaluated_get(dg)
     P = np.array(ce.calc_matrix_camera(dg, x=W, y=H) @ ce.matrix_world.inverted())
     out = np.empty((len(st["uniq"]), 3), np.float32)
-    for pi, name in enumerate(st["parts"]):
-        o = bpy.context.scene.objects[name]
-        ev = o.evaluated_get(dg); me = ev.to_mesh()
+
+    def project(pi, dgv):
+        vi, ui = st["gather"].get(pi, (None, None))
+        if vi is None:
+            return
+        o = bpy.context.scene.objects[st["parts"][pi]]
+        ev = o.evaluated_get(dgv); me = ev.to_mesh()
         co = np.empty(len(me.vertices) * 3, 'float32')
         me.vertices.foreach_get('co', co)
         co = co.reshape(-1, 3)
@@ -3081,11 +3110,28 @@ def _anim_frame_positions(st, W, H):
         clip = w @ P[:3, :3].T + P[:3, 3]
         wcl = w @ P[3, :3] + P[3, 3]
         scr = (clip[:, :2] / wcl[:, None] * 0.5 + 0.5) * [W, H]
-        vi, ui = st["gather"].get(pi, (None, None))
-        if vi is not None:
-            out[ui, :2] = scr[vi]
-            out[ui, 2] = wcl[vi]
+        out[ui, :2] = scr[vi]
+        out[ui, 2] = wcl[vi]
         ev.to_mesh_clear()
+
+    flipped = set()
+    for fl in st.get("flip") or []:
+        flipped.update(fl["parts"])
+    for pi in range(len(st["parts"])):
+        if pi not in flipped:
+            project(pi, dg)
+    # Inactive arm-variant parts sit PARKED away from the body: flip the rig to their style,
+    # capture their posed positions from a fresh depsgraph, restore. The camera projection P
+    # is unaffected by the flip. Both _set_arm_style and _restore_arm_style run a
+    # view_layer.update(), so callers (and the renders) always see the original style.
+    for fl in st.get("flip") or []:
+        arm, saved = _set_arm_style(fl["player"], fl["slim_value"])
+        try:
+            dgf = bpy.context.evaluated_depsgraph_get()
+            for pi in fl["parts"]:
+                project(pi, dgf)
+        finally:
+            _restore_arm_style(arm, fl["player"], saved)
     return out
 
 

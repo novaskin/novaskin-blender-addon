@@ -277,6 +277,7 @@ const tSkins = skins.map((img) => { const t = tex(); upload(t, img, true); retur
 // swap a player's skin at runtime (file input below, or __dbg.setSkin(i, src))
 function setSkin(i, source) { upload(tSkins[i], source, true); }
 const partOff = new Set();    // disabled overlay parts, as "playerLabel::partLabel"
+const variantSel = {};        // arm style per player label: 'classic' (Steve) | 'slim' (Alex)
 {
   const box = document.getElementById('skins');
   box.innerHTML = '';                       // re-boot: drop the previous instance's controls
@@ -304,6 +305,16 @@ const partOff = new Set();    // disabled overlay parts, as "playerLabel::partLa
       cb.onchange = () => { cb.checked ? partOff.delete(key) : partOff.add(key); };
       pl.appendChild(cb); pl.appendChild(document.createTextNode(pm.label + ' '));
       box.appendChild(pl);
+    }
+    // arm-style toggle -- only for manifests that ship both variants (parts[] with variant)
+    if ((p.parts || []).some(pm => pm.variant === 'slim')) {
+      variantSel[p.label] = p.default_variant || 'classic';
+      const vl = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = variantSel[p.label] === 'slim';
+      cb.onchange = () => { variantSel[p.label] = cb.checked ? 'slim' : 'classic'; };
+      vl.appendChild(cb); vl.appendChild(document.createTextNode('slim arms '));
+      box.appendChild(vl);
     }
   });
 }
@@ -414,12 +425,20 @@ function drawPlayers(o) {
   manifest.mesh.players.forEach((p, i) => {
     gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
     gl.uniform1f(gl.getUniformLocation(meshP, 'uTile'), i);   // v5: this player's atlas tile
-    // base span + each ENABLED overlay part (v3+ manifests); older exports = whole range
-    const ranges = p.parts
-      ? [[p.tri_range[0], p.overlay_tri_start ?? p.tri_range[1]],
-         ...p.parts.filter(pm => pm.overlay && !partOff.has(`${p.label}::${pm.label}`))
-                   .map(pm => pm.tri_range)]
-      : [p.tri_range];
+    // parts[] manifests: shared parts + the SELECTED arm variant + each enabled overlay,
+    // coalesced into contiguous spans; older exports = whole range
+    const sel = variantSel[p.label] || p.default_variant || 'classic';
+    let ranges;
+    if (p.parts) {
+      ranges = [];
+      for (const pm of p.parts) {
+        if (pm.variant && pm.variant !== sel) continue;
+        if (pm.overlay && partOff.has(`${p.label}::${pm.label}`)) continue;
+        const [t0, t1] = pm.tri_range;
+        if (ranges.length && ranges[ranges.length - 1][1] === t0) ranges[ranges.length - 1][1] = t1;
+        else ranges.push([t0, t1]);
+      }
+    } else ranges = [p.tri_range];
     if (o.wire) {
       gl.uniform1i(uPass, 0);
       for (const [t0, t1] of ranges)
