@@ -43,6 +43,10 @@
   }
   .group label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
   .group input[type=checkbox] { margin: 0; accent-color: var(--accent); }
+  .tn { font-size: 12px; white-space: nowrap; }
+  .tn input[type=range] { flex: 1 1 auto; min-width: 0; accent-color: var(--accent); }
+  .tn span { min-width: 34px; text-align: right; color: var(--muted);
+             font-variant-numeric: tabular-nums; }
   #side select, #side input[type=file] { width: 100%; }
   #side select {
     background: var(--bg); color: var(--text); border: 1px solid var(--border);
@@ -101,6 +105,19 @@
       <label title="hide the players where scenery is in front of them (scene-depth prepass; the foreground video on older exports)"><input type="checkbox" id="ck_occ" checked> occlusion</label>
       <label title="sample the mesh at the video's frame grid instead of continuously — registers the player exactly with the fg/light frames (at the cost of 24fps-stepped motion)">
         <input type="checkbox" id="ck_snap"> snap
+      </label>
+    </div>
+
+    <div class="group">
+      <h2>Tuning</h2>
+      <label class="tn" title="light level (in /255) at or below which a player fragment is treated as occluded and discarded — pure-black light means the light render saw nothing there">
+        black discard <input type="range" id="tn_black" min="0" max="30" step="1" value="8"><span id="tn_black_v"></span>
+      </label>
+      <label class="tn" title="depth bias (in /255) added to the scenery depth so ties resolve as 'player visible' — absorbs the video round-trip error">
+        depth guard <input type="range" id="tn_guard" min="0" max="10" step="0.5" value="3"><span id="tn_guard_v"></span>
+      </label>
+      <label class="tn" title="scene_depth values at or below this are treated as 'no occluder' (video decode leaves black slightly above 0)">
+        depth cutoff <input type="range" id="tn_cut" min="0" max="0.2" step="0.005" value="0.08"><span id="tn_cut_v"></span>
       </label>
     </div>
 

@@ -175,6 +175,8 @@ const depthP = prog(
   `#version 300 es
    precision highp float;
    uniform sampler2D uTex; in vec2 vUv; out vec4 frag;
+   uniform float uNoData;   // "depth cutoff" slider (default 0.08)
+   uniform float uGuard;    // "depth guard" slider, /255 (default 3)
    void main(){
      float v = texture(uTex,vUv).r;
      frag = vec4(0.0);
@@ -182,8 +184,8 @@ const depthP = prog(
      // above 0 (limited-range YUV), so anything near black is "no data" -- write far
      // depth instead of becoming a phantom far occluder that culls the players' own
      // farthest fragments.
-     if (v <= 0.08) { gl_FragDepth = 1.0; return; }
-     gl_FragDepth = clamp((1.0 - v) + 3.0/255.0, 0.0, 1.0);
+     if (v <= uNoData) { gl_FragDepth = 1.0; return; }
+     gl_FragDepth = clamp((1.0 - v) + uGuard, 0.0, 1.0);
    }`);
 const meshP = prog(
   `#version 300 es
@@ -198,6 +200,7 @@ const meshP = prog(
    uniform bool uUseLight; uniform bool uFlat; uniform int uPass;
    uniform sampler2D uViewLut;
    uniform vec4 uLutSpec;   // N, tiles, min_ev, max_ev (from manifest.view_lut)
+   uniform float uBlackT;   // "black discard" slider, /255 (default 8)
    in vec2 vUv; out vec4 frag;
    // anti-aliased pixel-art sampling: snap UV to the texel CENTRE but ramp across the seam over ~1px.
    vec4 texAA(sampler2D tx, vec2 uv){
@@ -231,11 +234,11 @@ const meshP = prog(
      // PURE-black light = the light render saw NOTHING here: either the lerped mesh
      // drifted past the 16px dilated silhouette, or this surface is enclosed by scenery
      // (no light path reaches inside terrain) that the quantized scene_depth failed to
-     // occlude. Both mean "not visible" -- discard, free extra occlusion. 8/255 is well
-     // above the VP9 noise floor on black (measured 0..3/255, smear tail to ~8 only at
-     // the mask transition) yet far below any legitimately lit surface: 8/255 stored is
-     // sRGB(0.5*L) for L ~ 0.005, pitch black in any scene with a hint of fill light.
-     if (uUseLight && max(lraw.r, max(lraw.g, lraw.b)) <= 8.0/255.0) discard;
+     // occlude. Both mean "not visible" -- discard, free extra occlusion. The default
+     // 8/255 is well above the VP9 noise floor on black (measured 0..3/255) yet far
+     // below any legitimately lit surface: 8/255 stored is sRGB(0.5*L) for L ~ 0.005,
+     // pitch black in any scene with a hint of fill light.
+     if (uUseLight && max(lraw.r, max(lraw.g, lraw.b)) <= uBlackT) discard;
      // relight in LINEAR space (the stream stores sRGB-encoded 0.5*L; the x2 that undoes
      // the gray carrier only means x2 in linear), then display-encode with the scene's
      // REAL view transform (AgX rolls highlights off instead of clipping).
@@ -387,6 +390,13 @@ function setPositions(time) {
 }
 
 const ck = (id) => document.getElementById(id).checked;
+// tuning sliders: live-tweakable magic numbers, read every draw (find what works best)
+const tnv = (id) => document.getElementById(id).valueAsNumber;
+for (const id of ['tn_black', 'tn_guard', 'tn_cut']) {
+  const inp = document.getElementById(id), out = document.getElementById(id + '_v');
+  inp.oninput = () => { out.textContent = inp.value; };
+  out.textContent = inp.value;
+}
 
 // ---- draw steps, shared by the composite and the debug views (the "view" <select>) ----
 function blitVideo(t, rect) {
@@ -404,6 +414,8 @@ function depthPrepass() {
   gl.depthFunc(gl.ALWAYS);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tDepth);
   gl.uniform1i(gl.getUniformLocation(depthP, 'uTex'), 0);
+  gl.uniform1f(gl.getUniformLocation(depthP, 'uNoData'), tnv('tn_cut'));
+  gl.uniform1f(gl.getUniformLocation(depthP, 'uGuard'), tnv('tn_guard') / 255);
   gl.uniform4fv(gl.getUniformLocation(depthP, 'uRect'), cropRectNDC);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   gl.depthFunc(gl.LESS);
@@ -425,6 +437,7 @@ function drawPlayers(o) {
   gl.uniform1i(gl.getUniformLocation(meshP, 'uViewLut'), 2);
   gl.uniform4f(gl.getUniformLocation(meshP, 'uLutSpec'),
                lutMeta.size, lutMeta.tiles, lutMeta.min_ev, lutMeta.max_ev);
+  gl.uniform1f(gl.getUniformLocation(meshP, 'uBlackT'), tnv('tn_black') / 255);
   gl.activeTexture(gl.TEXTURE0);
   const uPass = gl.getUniformLocation(meshP, 'uPass');
   gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.clear(gl.DEPTH_BUFFER_BIT);
