@@ -244,10 +244,11 @@ const meshP = prog(
      // silhouette -- no 8-bit depth fringe. Discard the fragment where it is set.
      if (uOcclude && texture(uOcc, luv).r > 0.5) discard;
      vec3 lraw = texture(uLight, luv).rgb;
-     // secondary safety: PURE-black light = the light render saw nothing here (the lerped
-     // mesh drifted past the 16px dilated silhouette). Default threshold 0 drops only
+     // secondary occlusion safety: PURE-black light = the light render saw nothing here (the
+     // lerped mesh drifted past the 16px dilated silhouette). Gated by uOcclude (it IS an
+     // occlusion cull -- occlusion off shows the raw player). Default threshold 0 drops only
      // exact black, keeping genuinely-dark-but-visible shadow; the slider raises it.
-     if (uUseLight && max(lraw.r, max(lraw.g, lraw.b)) <= uBlackT) discard;
+     if (uOcclude && uUseLight && max(lraw.r, max(lraw.g, lraw.b)) <= uBlackT) discard;
      // relight in LINEAR space (the stream stores sRGB-encoded 0.5*L; the x2 that undoes
      // the gray carrier only means x2 in linear), then display-encode with the scene's
      // REAL view transform (AgX rolls highlights off instead of clipping).
