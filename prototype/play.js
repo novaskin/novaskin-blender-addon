@@ -231,10 +231,11 @@ const meshP = prog(
      // PURE-black light = the light render saw NOTHING here: either the lerped mesh
      // drifted past the 16px dilated silhouette, or this surface is enclosed by scenery
      // (no light path reaches inside terrain) that the quantized scene_depth failed to
-     // occlude. Both mean "not visible" -- discard, free extra occlusion. 4/255 sits just
-     // above the VP9 noise floor on black (measured 0..3/255); legit lit surfaces store
-     // far more (sRGB of 0.5*L).
-     if (uUseLight && max(lraw.r, max(lraw.g, lraw.b)) <= 4.0/255.0) discard;
+     // occlude. Both mean "not visible" -- discard, free extra occlusion. 8/255 is well
+     // above the VP9 noise floor on black (measured 0..3/255, smear tail to ~8 only at
+     // the mask transition) yet far below any legitimately lit surface: 8/255 stored is
+     // sRGB(0.5*L) for L ~ 0.005, pitch black in any scene with a hint of fill light.
+     if (uUseLight && max(lraw.r, max(lraw.g, lraw.b)) <= 8.0/255.0) discard;
      // relight in LINEAR space (the stream stores sRGB-encoded 0.5*L; the x2 that undoes
      // the gray carrier only means x2 in linear), then display-encode with the scene's
      // REAL view transform (AgX rolls highlights off instead of clipping).
