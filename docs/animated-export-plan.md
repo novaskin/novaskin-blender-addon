@@ -10,14 +10,18 @@ ships as of 2026-07):
   `mesh.bin` (NSKM, u16/u32 auto) + `anim.bin` (NSKA v3, 12-bit z) and `manifest.json`
   (`animated_version: 5`).
 - **Occlusion** (player vs scenery): the exporter computes it in FLOAT and ships the
-  RESULT, not depth. The bg render leaves the SCENERY camera depth in `zz.exr`; the light
-  render (scenery camera-invisible) leaves the PLAYER front depth in the same EXR, and its
-  alpha marks where a player is. `matte = (alpha > 0.01) AND (z_scene < z_player)` → a
-  per-pixel 0/1 mask cropped like the light. The viewer discards player fragments where
-  the matte is white. This REPLACED `scene_depth.webm` (scenery Z quantized to 8-bit and
-  seeded into the depth buffer): quantized depth left a hard black fringe where a shadowed
-  player part (e.g. a leg behind grass) failed the imprecise per-fragment test — the matte
-  cuts at the render's exact silhouette because the compare is done in float offline.
+  RESULT, not depth. The bg render leaves the SCENERY camera depth in `zz.exr`; a dedicated
+  occlusion render — the FULL player (base + overlays), scenery camera-invisible, ONE
+  sample (Z + coverage are geometry-exact, no lighting) — leaves the PLAYER front depth in
+  the same EXR, and its alpha marks where a player is. `matte = (alpha > 0.01) AND (z_scene
+  < z_player)` → a per-pixel 0/1 mask cropped like the light. It is a SEPARATE render from
+  the light (which is base-only, so its base light stays overlay-free): the overlay shells
+  extend past the base (~+54% coverage measured) and must occlude against scenery too. The
+  viewer discards player fragments where the matte is white. This REPLACED `scene_depth.webm`
+  (scenery Z quantized to 8-bit and seeded into the depth buffer): quantized depth left a
+  hard black fringe where a shadowed player part (e.g. a leg behind grass) failed the
+  imprecise per-fragment test — the matte cuts at the render's exact silhouette because the
+  compare is done in float offline.
   Player-vs-player occlusion stays a real GPU depth test on the per-vertex mesh z (drawn
   back-to-front). Translucids (water tint over a submerged player) remain binary occlusion.
 - **Light**: ALWAYS screen-space (drafts and full quality) — the visible gray players
@@ -46,7 +50,7 @@ ships as of 2026-07):
   (wireframe / depth / light / grid), one-loop composite recording (⏺ rec → shareable
   MP4/WebM; the tab must stay visible while it records).
 - **Costs** (reference scene, 2 players): draft ≈ 5 s/frame; full quality ≈ 14 s/frame
-  (bg + light renders at full resolution/samples, no bakes). `ffmpeg` is required at
+  (bg + light at full samples + a 1-sample occlusion render, no bakes). `ffmpeg` is required at
   render time (the depth pass is read back through it).
 
 ---

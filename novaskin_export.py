@@ -4895,16 +4895,41 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             cflat, cW2, cH2 = _crop(lbuf.reshape(-1))
             _save_image(cflat, cW2, cH2, os.path.join(adir, "seq", "light", fn))
 
-            # 3) OCCLUSION matte: the light render left the PLAYER depth in the SAME EXR
-            # (scenery camera-invisible -> the player is the front surface), and its alpha
-            # marks where a player is. Comparing the two camera depths in FLOAT -- scenery in
-            # FRONT of the player's front surface => that pixel is occluded -- cuts at the
-            # render's exact silhouette, with no 8-bit depth quantization to leak a black
-            # fringe (the reason scene_depth.webm was replaced). Naturally sparse (0 wherever
-            # no player or nothing in front of it), so the lossless webm stays tiny.
+            # 3) OCCLUSION matte, rendered with the FULL player (base + overlays visible):
+            # the light render above is BASE-ONLY (its base light must stay overlay-free), so
+            # its silhouette misses the overlay shells (hat brim, jacket) that extend past the
+            # base and must occlude against scenery too. This pass adds the overlays back,
+            # keeps scenery camera-invisible, and renders at 1 sample -- the Z + coverage are
+            # geometry-exact, no lighting needed, so it is cheap. Its alpha marks player
+            # pixels; its Z (in the SAME File Output EXR) is the player's front surface.
+            # Comparing the two camera depths in FLOAT -- scenery in FRONT of the player =>
+            # occluded -- cuts at the render's exact silhouette, no 8-bit depth fringe (the
+            # reason scene_depth.webm was dropped). Naturally sparse -> the lossless webm is
+            # tiny. Correct whether the viewer toggles an overlay on or off: the base sits
+            # inside the shell, so "occluded where any player surface is" holds for both.
+            setup()
+            for o in overlay_parts:
+                o.hide_render = False                 # FULL player for the occlusion silhouette
+            sc = {o: o.visible_camera for o in scenery}
+            for o in scenery:
+                o.visible_camera = False
+            occ_samp = s.cycles.samples if hasattr(s, 'cycles') else None
+            occ_den = s.cycles.use_denoising if hasattr(s, 'cycles') else None
+            if hasattr(s, 'cycles'):
+                s.cycles.samples = 1                  # z + coverage are noise-free
+                s.cycles.use_denoising = False
+            bpy.context.view_layer.update()
+            Lo, _, _ = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT,
+                                                             transparent=True)
+            if hasattr(s, 'cycles'):
+                s.cycles.samples = occ_samp
+                s.cycles.use_denoising = occ_den
+            for o, v in sc.items():
+                o.visible_camera = v
+            ao = np.clip(Lo[:, 3], 0.0, 1.0)          # full-player coverage (base + overlays)
             zp = _anim_exr_read(ff, os.path.join(exr_dir, "zz.exr"), 'zz', rW, rH, gray=True)
             z_play = np.clip((zp - zlo) / zsc, 0.0, 1.0)
-            occ = ((la > 0.01) & (z_scene < z_play)).astype('float32')   # 1 = discard
+            occ = ((ao > 0.01) & (z_scene < z_play)).astype('float32')   # 1 = discard
             obuf = np.ones((occ.size, 4), 'float32')
             obuf[:, 0] = obuf[:, 1] = obuf[:, 2] = occ
             co, coW, coH = _crop(obuf.reshape(-1))
