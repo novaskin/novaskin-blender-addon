@@ -391,16 +391,23 @@ app.js first, then converge the static export onto the same renderer as K=1.
 - 4:4:4 (VP9 profile 1, AV1 high profile) is software-only decode where present;
   AV1 decode on macOS/iOS Safari ≈ 24 % / 33 % of sessions
   ([WebCodecs Fundamentals dataset](https://webcodecsfundamentals.org/datasets/codec-analysis-2026/)).
-- **Transparent video on Safari** (July 2026): Safari does NOT composite VP9-alpha WebM,
-  but it DOES support Apple's "HEVC Video with Alpha" since Safari 13 (macOS Catalina /
-  iOS 13) — alpha as an auxiliary layer inside the HEVC track, MP4/MOV container, codec
-  tag **`hvc1`** (`hev1` fails). Caveats: encoding only works through Apple VideoToolbox
-  (`ffmpeg -c:v hevc_videotoolbox -alpha_quality 0.75 -tag:v hvc1`, macOS-only — x265
-  cannot encode alpha, so Windows/Linux exports could not produce the stream), and
-  Chrome/Firefox ignore HEVC alpha, so production use means dual-source (hvc1+alpha for
-  Safari, VP9-alpha WebM for the rest). `canPlayType('video/mp4; codecs="hvc1"')` does
-  not confirm the ALPHA capability — detect by rendering to a canvas and sampling a
-  known-transparent pixel. Not needed by the current player (WebGL composites opaque
-  streams; the old fg used rgb+matte for the same reason) — relevant only if a future
-  feature plays `<video>` directly in the DOM with transparency.
+- **Transparent video on Safari** (July 2026; see
+  [jakearchibald.com/2024/video-with-transparency](https://jakearchibald.com/2024/video-with-transparency/)):
+  Safari does NOT composite VP9-alpha WebM, but it DOES support Apple's "HEVC Video with
+  Alpha" since Safari 13 — alpha as an auxiliary layer in the HEVC track, MP4/MOV, codec
+  tag **`hvc1`** (`hev1` fails). Caveats: encoding only through Apple VideoToolbox
+  (`ffmpeg -c:v hevc_videotoolbox -alpha_quality 0.1 -tag:v hvc1` + REQUIRED
+  `-vf "premultiply=inplace=1"`; macOS-only — x265 cannot encode alpha), Chrome/Firefox
+  ignore HEVC alpha (dual-source needed: hvc1 for Safari, VP9-alpha WebM elsewhere,
+  itself buggy on Android), files are HEAVY (Jake's sample: 3.4 MB native HEVC vs
+  1.1 MB VP9-alpha), and `canPlayType` cannot confirm the ALPHA capability — detect by
+  drawing to a canvas and sampling a known-transparent pixel.
+  **Jake's conclusion = this project's design**: skip native alpha, composite yourself.
+  His refinement worth stealing if a fg/overlay stream ever returns: STACK color (top) +
+  grayscale alpha (bottom) in ONE video (`vstack`) instead of our old two-video
+  rgb+matte — perfect sync by construction (no frame-lock needed), one decode, plain
+  yuv420p everywhere, and stacked AV1 hit 460 kB vs 1.1 MB VP9-alpha (hardware AV1:
+  iPhone 15 Pro+/M3+; stacked HEVC fallback 1.14 MB). He ships the `stacked-alpha-video`
+  npm web component. Gotcha: limited-range YUV banding — use 10-bit (`yuv420p10le`) to
+  mitigate.
 - VP9/AV1 WebM alpha channel: supported for transparency video in Chromium/Firefox.
