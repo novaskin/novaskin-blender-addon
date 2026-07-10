@@ -391,4 +391,16 @@ app.js first, then converge the static export onto the same renderer as K=1.
 - 4:4:4 (VP9 profile 1, AV1 high profile) is software-only decode where present;
   AV1 decode on macOS/iOS Safari ≈ 24 % / 33 % of sessions
   ([WebCodecs Fundamentals dataset](https://webcodecsfundamentals.org/datasets/codec-analysis-2026/)).
+- **Transparent video on Safari** (July 2026): Safari does NOT composite VP9-alpha WebM,
+  but it DOES support Apple's "HEVC Video with Alpha" since Safari 13 (macOS Catalina /
+  iOS 13) — alpha as an auxiliary layer inside the HEVC track, MP4/MOV container, codec
+  tag **`hvc1`** (`hev1` fails). Caveats: encoding only works through Apple VideoToolbox
+  (`ffmpeg -c:v hevc_videotoolbox -alpha_quality 0.75 -tag:v hvc1`, macOS-only — x265
+  cannot encode alpha, so Windows/Linux exports could not produce the stream), and
+  Chrome/Firefox ignore HEVC alpha, so production use means dual-source (hvc1+alpha for
+  Safari, VP9-alpha WebM for the rest). `canPlayType('video/mp4; codecs="hvc1"')` does
+  not confirm the ALPHA capability — detect by rendering to a canvas and sampling a
+  known-transparent pixel. Not needed by the current player (WebGL composites opaque
+  streams; the old fg used rgb+matte for the same reason) — relevant only if a future
+  feature plays `<video>` directly in the DOM with transparency.
 - VP9/AV1 WebM alpha channel: supported for transparency video in Chromium/Firefox.
