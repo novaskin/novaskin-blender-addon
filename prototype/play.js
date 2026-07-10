@@ -227,10 +227,18 @@ const meshP = prog(
      // screen-space light: sampled at the fragment's position inside the crop rect
      vec2 luv = (gl_FragCoord.xy - uLightOrigin)/uLightSize;
      vec3 base = s.a>1e-4 ? s.rgb/s.a : vec3(0.0);   // un-premultiply -> straight colour
+     vec3 lraw = texture(uLight, luv).rgb;
+     // PURE-black light = the light render saw NOTHING here: either the lerped mesh
+     // drifted past the 16px dilated silhouette, or this surface is enclosed by scenery
+     // (no light path reaches inside terrain) that the quantized scene_depth failed to
+     // occlude. Both mean "not visible" -- discard, free extra occlusion. 4/255 sits just
+     // above the VP9 noise floor on black (measured 0..3/255); legit lit surfaces store
+     // far more (sRGB of 0.5*L).
+     if (uUseLight && max(lraw.r, max(lraw.g, lraw.b)) <= 4.0/255.0) discard;
      // relight in LINEAR space (the stream stores sRGB-encoded 0.5*L; the x2 that undoes
      // the gray carrier only means x2 in linear), then display-encode with the scene's
      // REAL view transform (AgX rolls highlights off instead of clipping).
-     vec3 Llin = uUseLight ? pow(texture(uLight,luv).rgb, vec3(2.2)) * 2.0 : vec3(1.0);
+     vec3 Llin = uUseLight ? pow(lraw, vec3(2.2)) * 2.0 : vec3(1.0);
      vec3 lin = pow(base, vec3(2.2)) * Llin;
      vec3 outc = viewLut(lin);
      frag=vec4(outc*s.a, s.a);             // premultiplied relit entity, drawn COMPLETE
