@@ -30,12 +30,12 @@ ships as of 2026-07):
   arm). `default_variant` records the style the atlas/light was rendered for — the other
   borrows its rects (the two UV nets differ ~1px). The rig's inset per-pixel UVs are
   expanded for the export.
-- **Viewer** (`prototype/play.js`): texAA + premultiplied two-pass alpha, depth prepass,
-  screen-light relight in linear + view-transform LUT (older exports without the LUT keep
-  the plain-gamma path; old atlas manifests still draw), per-part toggles + per-player
-  classic/slim arm toggle, folder picker, debug views (wireframe / depth / light / grid),
-  one-loop composite recording (⏺ rec → shareable MP4/WebM; the tab must stay visible
-  while it records).
+- **Viewer** (`prototype/play.js`): CURRENT format only (prototype, no back-compat — old
+  atlas/fg/matte exports are rejected with a "re-export" message). texAA + premultiplied
+  two-pass alpha, depth prepass, screen-light relight in linear + view-transform LUT,
+  per-part toggles + per-player classic/slim arm toggle, folder picker, debug views
+  (wireframe / depth / light / grid), one-loop composite recording (⏺ rec → shareable
+  MP4/WebM; the tab must stay visible while it records).
 - **Costs** (reference scene, 2 players): draft ≈ 5 s/frame; full quality ≈ 14 s/frame
   (bg + light renders at full resolution/samples, no bakes). `ffmpeg` is required at
   render time (the depth pass is read back through it).

@@ -4649,7 +4649,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     W = s.render.resolution_x * MASK_RES_PCT // 100
     H = s.render.resolution_y * MASK_RES_PCT // 100
     adir = os.path.join(_abs(OUT_DIR), ANIM_OUT_SUBDIR)
-    for k in ("bg", "atlas", "light", "depth", "exr"):
+    for k in ("bg", "light", "depth", "exr"):
         os.makedirs(os.path.join(adir, "seq", k), exist_ok=True)
 
     # exported look = base + classic overlay shells; overlay_parts also tracked separately so
