@@ -337,13 +337,14 @@ ANIM_OVERLAY_KEYS = ("hat", "jacket", "sleeve", "pant")
 # lerp vs 24fps video + VP9 edge blur) -- padding prevents black fringes. 0 disables.
 # 16 (not 8): overlay shells extend past the base silhouette and borrow its dilated light.
 ANIM_LIGHT_PAD = 16
-# Occlusion matte bias: scenery must be at least this much NEARER than the player to occlude
-# it (matte = z_scene + ANIM_OCC_DELTA < z_player). In normalized player-band units (both z's
-# are the depth fraction over [zb0, zb1]), so this is a fraction of the player's own depth
-# span -- a contact tolerance that stops coincident surfaces (a player flush against a wall /
-# block) from shimmering between occluded and visible per pixel. Keep small: too large lets a
-# part genuinely just behind scenery poke through (the fringe the matte was built to kill).
-ANIM_OCC_DELTA = 0.005
+# Occlusion matte bias: scenery occludes the player even when it is up to this much BEHIND
+# the player's front surface (matte = z_scene - ANIM_OCC_DELTA < z_player). In normalized
+# player-band units (both z's are the depth fraction over [zb0, zb1]), so it is a fraction of
+# the player's own depth span. This widens occlusion slightly at the contact boundary, so the
+# player fragments that would otherwise poke through where it meets scenery (the black fringe)
+# get culled instead. Keep small: too large also culls player parts genuinely in front of the
+# scenery behind them.
+ANIM_OCC_DELTA = 0.002
 # The animated light is ALWAYS screen-space (drafts and full quality): the visible gray
 # players rendered at frame resolution, sampled by screen position. Two per-frame atlas
 # modes were tried and DROPPED (git history has both): REPROJECT (atlas rebuilt from the
@@ -4937,7 +4938,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             zp = _anim_exr_read(ff, os.path.join(exr_dir, "zz.exr"), 'zz', rW, rH, gray=True)
             z_play = np.clip((zp - zlo) / zsc, 0.0, 1.0)
             occ = ((ao > 0.01)
-                   & (z_scene + ANIM_OCC_DELTA < z_play)).astype('float32')   # 1 = discard
+                   & (z_scene - ANIM_OCC_DELTA < z_play)).astype('float32')   # 1 = discard
             obuf = np.ones((occ.size, 4), 'float32')
             obuf[:, 0] = obuf[:, 1] = obuf[:, 2] = occ
             co, coW, coH = _crop(obuf.reshape(-1))

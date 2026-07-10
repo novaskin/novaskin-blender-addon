@@ -14,10 +14,10 @@ ships as of 2026-07):
   occlusion render — the FULL player (base + overlays), scenery camera-invisible, ONE
   sample (Z + coverage are geometry-exact, no lighting) — leaves the PLAYER front depth in
   the same EXR, and its alpha marks where a player is. `matte = (alpha > 0.01) AND (z_scene
-  + ANIM_OCC_DELTA < z_player)` → a per-pixel 0/1 mask cropped like the light. The small
-  delta (normalized band units) is a contact tolerance so a player flush against a wall
-  doesn't shimmer occluded/visible per pixel — the float heir of the old depth guard. It is
-  a SEPARATE render from
+  - ANIM_OCC_DELTA < z_player)` → a per-pixel 0/1 mask cropped like the light. The small
+  delta (normalized band units) widens occlusion slightly at the contact boundary, so the
+  player fragments that would poke through where it meets scenery (the black fringe) get
+  culled — the float heir of the old depth guard. It is a SEPARATE render from
   the light (which is base-only, so its base light stays overlay-free): the overlay shells
   extend past the base (~+54% coverage measured) and must occlude against scenery too. The
   viewer discards player fragments where the matte is white. This REPLACED `scene_depth.webm`
