@@ -2964,7 +2964,7 @@ def _anim_frame_cached(adir, i):
     fn = f"{i + 1:04d}.png"
     return all(os.path.exists(p) and os.path.getsize(p) > 0
                for p in (os.path.join(adir, "seq", k, fn)
-                         for k in ("bg", "depth", "light")))
+                         for k in ("bg", "occ", "light")))
 
 
 def _anim_dilate_light(rgb, covered, W, H, passes=None):
@@ -4597,10 +4597,10 @@ def _anim_encode(adir, fps):
     seq = os.path.join(adir, "seq")
     jobs = [("bg", "background.webm", ["-pix_fmt", "yuv420p"], "bg"),
             ("light", "light.webm", ["-pix_fmt", "yuv420p"], "light"),
-            # depth is DATA, not picture: lossy VP9 blurs its edges into wrong depths
-            # (measured p99 6+ levels at silhouettes), lossless stays within ~2 levels
-            # (yuv range conversion) which the viewer's guard band absorbs.
-            ("depth", "scene_depth.webm", ["-pix_fmt", "yuv420p"], None)]
+            # the occlusion matte is a hard 0/1 mask, not a picture: lossy VP9 would blur
+            # its edges and bring the occlusion fringe back, so it is encoded LOSSLESS
+            # (a near-binary mask compresses to almost nothing anyway).
+            ("occ", "occlusion.webm", ["-pix_fmt", "yuv420p"], None)]
     # only encode the streams this export produced
     jobs = [j for j in jobs
             if os.path.exists(os.path.join(seq, j[0], "0001.png"))]
@@ -4630,7 +4630,7 @@ def _anim_encode(adir, fps):
         r = subprocess.run(cmd(name, out, extra, ck), capture_output=True, text=True)
         if r.returncode != 0:
             return False, f"ffmpeg failed on {out}: {r.stderr[-400:]}"
-    return True, "encoded bg / light / scene_depth .webm"
+    return True, "encoded bg / light / occlusion .webm"
 
 
 def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
@@ -4649,7 +4649,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     W = s.render.resolution_x * MASK_RES_PCT // 100
     H = s.render.resolution_y * MASK_RES_PCT // 100
     adir = os.path.join(_abs(OUT_DIR), ANIM_OUT_SUBDIR)
-    for k in ("bg", "light", "depth", "exr"):
+    for k in ("bg", "light", "occ", "exr"):
         os.makedirs(os.path.join(adir, "seq", k), exist_ok=True)
 
     # exported look = base + classic overlay shells; overlay_parts also tracked separately so
@@ -4839,7 +4839,6 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             it5.format.color_depth = '32'
             nt5.links.new(src, fo5.inputs[pname])
             v5_fos.append(fo5.name)
-        srcarr5 = np.asarray(st["src"], np.int64)   # welded -> unique map (per-player masks)
         cached = sum(1 for i in range(nf) if ANIM_RESUME and _anim_frame_cached(adir, i))
         if cached:
             print(f"[ANIM] resume: {cached}/{nf} frames already rendered -- skipping them")
@@ -4864,49 +4863,15 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             buf = np.ones((bg.shape[0], 4), 'float32')
             buf[:, :3] = _to_display(bg)
             _save_image(buf.reshape(-1), rW, rH, os.path.join(adir, "seq", "bg", fn))
-            # scene depth from THIS render's Z (scenery only), read BEFORE the light render
-            # overwrites the File Output EXR. Range: the far plateau tells full vs limited.
+            # SCENERY depth from THIS render's Z (players camera-invisible), read BEFORE the
+            # light render overwrites the File Output EXR. Both z's are normalized to the
+            # players' band by the compositor; ffmpeg's EXR read applies a limited-range
+            # squeeze the far plateau reveals -- de-range so 0..1 is the band fraction.
             zr = _anim_exr_read(ff, os.path.join(exr_dir, "zz.exr"), 'zz', rW, rH, gray=True)
             zvals, zcnts = np.unique(np.round(zr, 3), return_counts=True)
             zfar = float(zvals[np.argmax(zcnts)])
             zlo, zsc = (0.0, 1.0) if zfar > 0.99 else (16.0 / 255.0, 219.0 / 255.0)
-            dq = np.clip((zr - zlo) / zsc, 0.0, 1.0)
-            # MASK + INVERT: depth is only ever compared where player fragments draw, so keep
-            # just the scenery that can actually occlude someone -- inside a player's padded
-            # bbox AND nearer than that player's farthest vertex this frame (keys are at the
-            # video rate, so the pose is exact). Stored INVERTED: 0 = black = "no occluder"
-            # (the viewer's 1-v maps it to far depth with no branch), occluders = bright.
-            # Everything else stays flat black -> the lossless VP9 shrinks dramatically.
-            dq_inv = np.zeros_like(dq)
-            # the pose(s) bounding this frame: with ANIM_KEYS_STEP > 1 the union of the two
-            # surrounding keys contains every lerped position (lerp is convex), so the mask
-            # stays a superset of the drawn pose either way.
-            k0 = min(i // ANIM_KEYS_STEP, len(keys) - 1)
-            k1 = min(k0 + 1, len(keys) - 1)
-            pad = 6.0
-            for pl5 in st["players"]:
-                w0p, w1p = pl5["welded_range"]
-                ui5 = np.unique(srcarr5[w0p:w1p])
-                if ui5.size == 0:
-                    continue
-                pp5 = (keys[k0][ui5] if k1 == k0
-                       else np.concatenate([keys[k0][ui5], keys[k1][ui5]]))
-                bx0 = max(0, int(pp5[:, 0].min() - pad))
-                bx1 = min(W, int(pp5[:, 0].max() + pad) + 1)
-                by0 = max(0, int(pp5[:, 1].min() - pad))
-                by1 = min(H, int(pp5[:, 1].max() + pad) + 1)
-                if bx1 <= bx0 or by1 <= by0:
-                    continue                     # player off-camera: nothing to occlude
-                zmax_b = (pp5[:, 2].max() - zb0) / max(zb1 - zb0, 1e-6) + 0.02
-                reg = dq.reshape(H, W)[by0:by1, bx0:bx1]
-                regi = dq_inv.reshape(H, W)[by0:by1, bx0:bx1]
-                sel = reg <= zmax_b
-                regi[sel] = np.maximum(regi[sel], 1.0 - reg[sel])
-            dbuf = np.ones((dq_inv.size, 4), 'float32')
-            dbuf[:, 0] = dbuf[:, 1] = dbuf[:, 2] = dq_inv
-            cd, cdW, cdH = _crop(dbuf.reshape(-1))
-            _save_image(cd, cdW, cdH, os.path.join(adir, "seq", "depth", fn),
-                        colorspace='Non-Color')
+            z_scene = np.clip((zr - zlo) / zsc, 0.0, 1.0)   # scenery depth (band fraction)
 
             # 2) the light render -- players gray VISIBLE, scenery camera-invisible (still
             # lighting/shadowing) -- shipped as the light video. Stored sRGB-encoded so the
@@ -4929,7 +4894,23 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             lbuf[:, :3] = _lin_to_srgb(lsd)
             cflat, cW2, cH2 = _crop(lbuf.reshape(-1))
             _save_image(cflat, cW2, cH2, os.path.join(adir, "seq", "light", fn))
-            yield prog(f"frame {i+1}/{nf} render + light")
+
+            # 3) OCCLUSION matte: the light render left the PLAYER depth in the SAME EXR
+            # (scenery camera-invisible -> the player is the front surface), and its alpha
+            # marks where a player is. Comparing the two camera depths in FLOAT -- scenery in
+            # FRONT of the player's front surface => that pixel is occluded -- cuts at the
+            # render's exact silhouette, with no 8-bit depth quantization to leak a black
+            # fringe (the reason scene_depth.webm was replaced). Naturally sparse (0 wherever
+            # no player or nothing in front of it), so the lossless webm stays tiny.
+            zp = _anim_exr_read(ff, os.path.join(exr_dir, "zz.exr"), 'zz', rW, rH, gray=True)
+            z_play = np.clip((zp - zlo) / zsc, 0.0, 1.0)
+            occ = ((la > 0.01) & (z_scene < z_play)).astype('float32')   # 1 = discard
+            obuf = np.ones((occ.size, 4), 'float32')
+            obuf[:, 0] = obuf[:, 1] = obuf[:, 2] = occ
+            co, coW, coH = _crop(obuf.reshape(-1))
+            _save_image(co, coW, coH, os.path.join(adir, "seq", "occ", fn),
+                        colorspace='Non-Color')
+            yield prog(f"frame {i+1}/{nf} render + light + matte")
 
         welded, unique, ntris = _anim_write_mesh(os.path.join(adir, "mesh.bin"), st)
         K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), keys,
@@ -4940,21 +4921,18 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             "fps": fps,
             "frames": nf,
             "resolution": [W, H],
-            # crop rect for the scene_depth video, in TOP-LEFT pixels (background is
-            # full-frame). The fg quad covers this rect; light is sampled at
-            # (fragScreenTopLeft - crop.xy) / crop.wh.
+            # crop rect for the light + occlusion videos, in TOP-LEFT pixels (background is
+            # full-frame). Both are sampled at (fragScreenTopLeft - crop.xy) / crop.wh.
             "crop": {"x": cx0, "y": H - cy1, "w": cx1 - cx0, "h": cy1 - cy0},
             "videos": {"background": "background.webm",
-                       "scene_depth": "scene_depth.webm"},
-            # scenery-only camera depth, cropped like fg/light, normalized to the players'
-            # band (0 = zmin .. 1 = zmax, clamped; SAME space as anim.bin z). VP9 LOSSLESS.
-            # Viewer: fullscreen-crop prepass writes gl_FragDepth = luma + guard(~3/255),
-            # then the depth-tested mesh is occluded per-pixel; translucids (water tint over
-            # the player) are NOT represented -- binary occlusion only.
-            "scene_depth": {"zmin": round(zb0, 5), "zmax": round(zb1, 5),
-                            # inverted-masked: 0 = no occluder (viewer depth = far), else
-                            # value = 1 - band fraction, kept only around/ahead of players
-                            "encoding": "inverted-masked"},
+                       "light": "light.webm",
+                       "occlusion": "occlusion.webm"},
+            # per-pixel player-vs-scenery occlusion matte, cropped like light, VP9 LOSSLESS.
+            # 1 (white) = scenery is in front of the player here -> the viewer discards the
+            # player fragment; 0 = draw. Computed in FLOAT from the two render depths so it
+            # cuts at the render's exact silhouette (no 8-bit depth fringe). Translucids
+            # (water tint over the player) are NOT represented -- binary occlusion only.
+            "occlusion": {"encoding": "player-matte"},
             "mesh": {"file": "mesh.bin", "welded": welded, "unique": unique,
                      "tris": ntris, "players": st["players"],
                      "layout": "NSKM u32x4 header + zlib(uv u16x2/65535, src u16, tris u16x3)"},
@@ -4965,12 +4943,11 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                                 "zmax/zq) + zlib(int16 xyz: abs, delta, then delta-of-delta);"
                                 " x,y = px*quant; z = (camDepth-zmin)/(zmax-zmin)*zq for the "
                                 "GPU depth test (shared scale, smaller = nearer)")},
-            "shader_note": ("draw background.webm; depth-prepass scene_depth into the z "
-                            "buffer; draw the player meshes depth-tested with linear color "
-                            "= skin_lin(uv) * light_lin(screen) * 2, then the view "
-                            "transform (view_lut). Interpolate positions between mesh keys."),
+            "shader_note": ("draw background.webm; draw the player meshes depth-tested "
+                            "against each other, discarding fragments where occlusion.webm "
+                            "is white; color = skin_lin(uv) * light_lin(screen) * 2, then "
+                            "the view transform (view_lut). Interpolate between mesh keys."),
         }
-        manifest["videos"]["light"] = "light.webm"
         # the scene's view transform as a 3D LUT: the viewer's final display encode after
         # relighting in linear -- exact AgX/Filmic/... match with the background render
         manifest["view_lut"] = _write_view_lut(os.path.join(adir, "view_lut.png"))

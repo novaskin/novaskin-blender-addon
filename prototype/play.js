@@ -1,9 +1,10 @@
 // Animated wallpaper player prototype. Consumes <animated/> as written by the exporter
 // (CURRENT format only -- no back-compat): manifest.json, mesh.bin (NSKM), anim.bin
-// (NSKA v3), background/light/scene_depth .webm, view_lut.png.
-// Composite per displayed frame: seed the depth buffer from scene_depth (inverted-masked),
-// then draw the depth-tested player mesh -- skin x screen light in LINEAR, display-encoded
-// through the scene's view-transform LUT; positions lerped between mesh keys.
+// (NSKA v3), background/light/occlusion .webm, view_lut.png.
+// Composite per displayed frame: draw the background, then the player mesh depth-tested
+// against itself/other players -- discarding fragments the occlusion matte marks as behind
+// scenery -- with skin x screen light in LINEAR, display-encoded through the scene's
+// view-transform LUT; positions lerped between mesh keys.
 const DIR = 'animated/';
 
 // --- source + re-boot plumbing: picking a folder (any export with a manifest.json) stashes its
@@ -57,17 +58,16 @@ async function inflate(bytes) {
 
 const manifest = FILES ? JSON.parse(await (await loadBlob('manifest.json')).text())
                        : await (await fetch(DIR + 'manifest.json' + _cb)).json();
-// current format ONLY (prototype, no back-compat): v5 screen light + inverted-masked
-// scene depth + view-transform LUT. Anything else: re-export with the current add-on.
+// current format ONLY (prototype, no back-compat): screen light + player-matte occlusion
+// + view-transform LUT. Anything else: re-export with the current add-on.
 if (!(manifest.videos && manifest.videos.background && manifest.videos.light
-      && manifest.videos.scene_depth && manifest.view_lut
-      && manifest.scene_depth && manifest.scene_depth.encoding === 'inverted-masked')) {
+      && manifest.videos.occlusion && manifest.view_lut)) {
   document.getElementById('stats').textContent =
-    'unsupported export -- re-export with the current add-on (screen light + view_lut)';
+    'unsupported export -- re-export with the current add-on (screen light + occlusion + view_lut)';
   throw 'unsupported export format';
 }
 const [W, H] = manifest.resolution;
-// light + depth crop rect (top-left px)
+// light + occlusion crop rect (top-left px)
 const crop = manifest.crop;
 const cropBL = { x: crop.x, y: H - crop.y - crop.h, w: crop.w, h: crop.h };  // bottom-up
 
@@ -127,14 +127,14 @@ async function video(src) {
   v.preload = 'auto';
   return new Promise((ok) => { v.oncanplaythrough = () => ok(v); v.load(); });
 }
-const [vBg, vLight, vDepth] = await Promise.all(
-  [manifest.videos.background, manifest.videos.light, manifest.videos.scene_depth].map(video));
+const [vBg, vLight, vOcc] = await Promise.all(
+  [manifest.videos.background, manifest.videos.light, manifest.videos.occlusion].map(video));
 // Frame-lock the secondary videos to the background's clock every drawn frame (independent
-// <video> elements drift, and start playing at slightly different times). The DEPTH must be
-// in step too -- it is the occlusion shape; if it lags, the occlusion freezes/misaligns.
+// <video> elements drift, and start playing at slightly different times). The OCCLUSION must
+// be in step too -- it is the occlusion shape; if it lags, the occlusion freezes/misaligns.
 const SYNC_TOL = 1.5 / manifest.fps;   // re-seek if off by more than ~1.5 frames
 function syncVideos() {
-  for (const v of [vLight, vDepth]) {
+  for (const v of [vLight, vOcc]) {
     if (Math.abs(v.currentTime - vBg.currentTime) > SYNC_TOL)
       v.currentTime = vBg.currentTime;
   }
@@ -164,29 +164,6 @@ const quadP = prog(
 const FULLRECT = [-1, -1, 2, 2];
 // crop rect in NDC (bottom-up px -> clip space)
 const cropRectNDC = [cropBL.x/W*2-1, cropBL.y/H*2-1, cropBL.w/W*2, cropBL.h/H*2];
-// scene-depth prepass (v4): writes the scenery's depth (players' band, SAME space as the mesh
-// z) into the depth buffer over the crop rect; the depth-tested mesh is then occluded per-pixel
-// wherever it is drawn -- registration with the old fg quad no longer matters. The +3/255 guard
-// biases ties toward "player visible" (absorbs the lossless yuv round-trip error).
-const depthP = prog(
-  `#version 300 es
-   layout(location=0) in vec2 aPos; uniform vec4 uRect; out vec2 vUv;
-   void main(){ vUv=aPos; gl_Position=vec4(uRect.xy + aPos*uRect.zw, 0., 1.); }`,
-  `#version 300 es
-   precision highp float;
-   uniform sampler2D uTex; in vec2 vUv; out vec4 frag;
-   uniform float uNoData;   // "depth cutoff" slider (default 0.08)
-   uniform float uGuard;    // "depth guard" slider, /255 (default 3)
-   void main(){
-     float v = texture(uTex,vUv).r;
-     frag = vec4(0.0);
-     // inverted-masked: black = NO occluder. The video decode can leave black a hair
-     // above 0 (limited-range YUV), so anything near black is "no data" -- write far
-     // depth instead of becoming a phantom far occluder that culls the players' own
-     // farthest fragments.
-     if (v <= uNoData) { gl_FragDepth = 1.0; return; }
-     gl_FragDepth = clamp((1.0 - v) + uGuard, 0.0, 1.0);
-   }`);
 const meshP = prog(
   `#version 300 es
    layout(location=0) in vec3 aPx; layout(location=1) in vec2 aUv;
@@ -195,12 +172,12 @@ const meshP = prog(
      gl_Position=vec4(aPx.xy/uRes*2.-1., aPx.z*2.-1., 1.); }`,
   `#version 300 es
    precision highp float;
-   uniform sampler2D uSkin; uniform sampler2D uLight; uniform vec2 uRes;
+   uniform sampler2D uSkin; uniform sampler2D uLight; uniform sampler2D uOcc; uniform vec2 uRes;
    uniform vec2 uLightOrigin; uniform vec2 uLightSize;
-   uniform bool uUseLight; uniform bool uFlat; uniform int uPass;
+   uniform bool uUseLight; uniform bool uOcclude; uniform bool uFlat; uniform int uPass;
    uniform sampler2D uViewLut;
    uniform vec4 uLutSpec;   // N, tiles, min_ev, max_ev (from manifest.view_lut)
-   uniform float uBlackT;   // "black discard" slider, /255 (default 8)
+   uniform float uBlackT;   // "black discard" slider, /255 (default 0)
    in vec2 vUv; out vec4 frag;
    // anti-aliased pixel-art sampling: snap UV to the texel CENTRE but ramp across the seam over ~1px.
    vec4 texAA(sampler2D tx, vec2 uv){
@@ -227,17 +204,17 @@ const meshP = prog(
      if(s.a<0.004) discard;                // outside the silhouette
      if(uPass==0 && s.a<0.996) discard;    // opaque pass: solid texels (write depth)
      if(uPass==1 && s.a>=0.996) discard;   // edge pass: anti-aliased skin edge (blend)
-     // screen-space light: sampled at the fragment's position inside the crop rect
+     // light + occlusion share the crop rect: sample both at the fragment's position
      vec2 luv = (gl_FragCoord.xy - uLightOrigin)/uLightSize;
      vec3 base = s.a>1e-4 ? s.rgb/s.a : vec3(0.0);   // un-premultiply -> straight colour
+     // OCCLUSION matte (white = scenery is in front of the player here): the exporter
+     // computed it in float from the two render depths, so it cuts at the render's exact
+     // silhouette -- no 8-bit depth fringe. Discard the fragment where it is set.
+     if (uOcclude && texture(uOcc, luv).r > 0.5) discard;
      vec3 lraw = texture(uLight, luv).rgb;
-     // PURE-black light = the light render saw NOTHING here: either the lerped mesh
-     // drifted past the 16px dilated silhouette, or this surface is enclosed by scenery
-     // (no light path reaches inside terrain) that the quantized scene_depth failed to
-     // occlude. Both mean "not visible" -- discard, free extra occlusion. The default
-     // 8/255 is well above the VP9 noise floor on black (measured 0..3/255) yet far
-     // below any legitimately lit surface: 8/255 stored is sRGB(0.5*L) for L ~ 0.005,
-     // pitch black in any scene with a hint of fill light.
+     // secondary safety: PURE-black light = the light render saw nothing here (the lerped
+     // mesh drifted past the 16px dilated silhouette). Default threshold 0 drops only
+     // exact black, keeping genuinely-dark-but-visible shadow; the slider raises it.
      if (uUseLight && max(lraw.r, max(lraw.g, lraw.b)) <= uBlackT) discard;
      // relight in LINEAR space (the stream stores sRGB-encoded 0.5*L; the x2 that undoes
      // the gray carrier only means x2 in linear), then display-encode with the scene's
@@ -263,7 +240,7 @@ function upload(t, srcEl, premult) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcEl);
 }
 const tBg = tex(), tLight = tex();
-const tDepth = tex(true);   // NEAREST: depth is data -- interpolating across edges invents depths
+const tOcc = tex(true);   // NEAREST: the matte is a hard 0/1 mask, interpolating invents edges
 const tSkins = skins.map((img) => { const t = tex(); upload(t, img, true); return t; });  // LINEAR + premult (texel-AA safe)
 
 // view-transform 3D LUT: the scene's AgX/Filmic/... baked by the exporter; the mesh shader
@@ -390,10 +367,10 @@ function setPositions(time) {
 }
 
 const ck = (id) => document.getElementById(id).checked;
-// tuning sliders: live-tweakable magic numbers, read every draw (find what works best)
+// tuning slider: live-tweakable magic number, read every draw (find what works best)
 const tnv = (id) => document.getElementById(id).valueAsNumber;
-for (const id of ['tn_black', 'tn_guard', 'tn_cut']) {
-  const inp = document.getElementById(id), out = document.getElementById(id + '_v');
+{
+  const inp = document.getElementById('tn_black'), out = document.getElementById('tn_black_v');
   inp.oninput = () => { out.textContent = inp.value; };
   out.textContent = inp.value;
 }
@@ -406,28 +383,15 @@ function blitVideo(t, rect) {
   gl.uniform4fv(gl.getUniformLocation(quadP, 'uRect'), rect);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
-function depthPrepass() {
-  // v4: seed the depth buffer with the scenery's depth over the crop rect; the depth-tested
-  // mesh below then loses exactly the pixels the scenery occludes. Replaces the fg quad.
-  gl.useProgram(depthP); gl.bindVertexArray(quadVao);
-  gl.colorMask(false, false, false, false);
-  gl.depthFunc(gl.ALWAYS);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tDepth);
-  gl.uniform1i(gl.getUniformLocation(depthP, 'uTex'), 0);
-  gl.uniform1f(gl.getUniformLocation(depthP, 'uNoData'), tnv('tn_cut'));
-  gl.uniform1f(gl.getUniformLocation(depthP, 'uGuard'), tnv('tn_guard') / 255);
-  gl.uniform4fv(gl.getUniformLocation(depthP, 'uRect'), cropRectNDC);
-  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-  gl.depthFunc(gl.LESS);
-  gl.colorMask(true, true, true, true);
-}
-// players: solid (two-pass alpha) or wireframe; optional per-pixel scenery occlusion (v4)
+// players: solid (two-pass alpha) or wireframe. Depth test = player-vs-player only (mesh z,
+// back-to-front); scenery occlusion comes from the occlusion matte discard in the shader.
 function drawPlayers(o) {
   const vao = o.wire ? meshWireVao : meshVao;
   gl.useProgram(meshP); gl.bindVertexArray(vao);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), o.light ? 1 : 0);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uOcclude'), o.occlude ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uFlat'), o.wire ? 1 : 0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLight);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
@@ -437,15 +401,12 @@ function drawPlayers(o) {
   gl.uniform1i(gl.getUniformLocation(meshP, 'uViewLut'), 2);
   gl.uniform4f(gl.getUniformLocation(meshP, 'uLutSpec'),
                lutMeta.size, lutMeta.tiles, lutMeta.min_ev, lutMeta.max_ev);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, tOcc);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uOcc'), 3);
   gl.uniform1f(gl.getUniformLocation(meshP, 'uBlackT'), tnv('tn_black') / 255);
   gl.activeTexture(gl.TEXTURE0);
   const uPass = gl.getUniformLocation(meshP, 'uPass');
   gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.clear(gl.DEPTH_BUFFER_BIT);
-  if (o.occlude) {
-    depthPrepass();
-    gl.useProgram(meshP); gl.bindVertexArray(vao);   // restore the players' state
-    gl.activeTexture(gl.TEXTURE0);
-  }
   manifest.mesh.players.forEach((p, i) => {
     gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
     // shared parts + the SELECTED arm variant + each enabled overlay, coalesced into
@@ -487,7 +448,7 @@ function drawGrid() {
   const tiles = [
     () => blitVideo(tBg, FULLRECT),                          // background (shadows baked)
     () => blitVideo(tLight, cropRectNDC),                    // screen-space light
-    () => blitVideo(tDepth, cropRectNDC),                    // scene depth (players' band)
+    () => blitVideo(tOcc, cropRectNDC),                      // occlusion matte
     () => drawPlayers({ wire: true, occlude: ck('ck_occ') }), // wireframe (occlusion applied)
     () => drawComposite(),                                   // final composite
   ];
@@ -505,10 +466,10 @@ function drawGrid() {
 }
 
 function draw() {
-  if (!vBg.paused) syncVideos();     // keep light/depth locked to bg while playing
+  if (!vBg.paused) syncVideos();     // keep light/occlusion locked to bg while playing
   upload(tBg, vBg);
   upload(tLight, vLight);
-  upload(tDepth, vDepth);
+  upload(tOcc, vOcc);
   // snap: sample the mesh at the video's frame grid (the pose the fg/light frames saw) instead
   // of continuously -- isolates the sub-frame component of mesh-vs-video misregistration.
   const t = vBg.currentTime;
@@ -523,7 +484,7 @@ function draw() {
     if (ck('ck_bg')) blitVideo(tBg, FULLRECT);
     drawPlayers({ wire: true, occlude: ck('ck_occ') });
   }
-  else if (mode === 'depth') blitVideo(tDepth, cropRectNDC);
+  else if (mode === 'occ') blitVideo(tOcc, cropRectNDC);
   else if (mode === 'light') blitVideo(tLight, cropRectNDC);
   else drawComposite();
   if (!scrubbing) scrub.value = Math.round(vBg.currentTime / duration() * 1000) || 0;
@@ -545,11 +506,11 @@ document.getElementById('stats').textContent = statsText;
   const sel = document.getElementById('dbgmode');
   if (sel) sel.onchange = () => {
     document.getElementById('stats').textContent = sel.value === 'grid'
-      ? 'grid: background | light | scene depth / wireframe | composite'
+      ? 'grid: background | light | occlusion / wireframe | composite'
       : statsText;
   };
 }
-const vids = [vBg, vLight, vDepth];
+const vids = [vBg, vLight, vOcc];
 const playbtn = document.getElementById('playbtn');
 playbtn.onclick = () => {
   if (vBg.paused) { vids.forEach(v => v.play()); playbtn.textContent = '❚❚'; }
@@ -624,7 +585,7 @@ if (recbtn) recbtn.onclick = () => {
 
 // debug handle (pause/seek from the console): __dbg.seek(5.0)
 window.__dbg = {
-  vBg, vLight, vDepth, keys, K, keysFps, setSkin,
+  vBg, vLight, vOcc, keys, K, keysFps, setSkin,
   seek(t) { for (const v of vids) { v.pause(); v.currentTime = t; } },
 };
 let rafId = 0, dead = false;

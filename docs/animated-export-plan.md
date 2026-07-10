@@ -5,12 +5,21 @@ sections below describe versions 1-2 and are kept as history. Summary of what ac
 ships as of 2026-07):
 
 - **Streams per export**: `background.webm` (players camera-invisible, shadows baked),
-  `scene_depth.webm` (scenery Z quantized to the players' camera-depth band, VP9
-  lossless — the viewer seeds the depth buffer from it and the depth-tested mesh is
-  occluded per-pixel, replacing the old foreground+matte videos entirely), `light.webm`
-  (below), `view_lut.png` (the scene's view transform as a 64³ 3D LUT), `mesh.bin`
-  (NSKM, u16/u32 auto) + `anim.bin` (NSKA v3, 12-bit z) and `manifest.json`
+  `occlusion.webm` (per-pixel player-vs-scenery matte, VP9 lossless — see below),
+  `light.webm` (below), `view_lut.png` (the scene's view transform as a 64³ 3D LUT),
+  `mesh.bin` (NSKM, u16/u32 auto) + `anim.bin` (NSKA v3, 12-bit z) and `manifest.json`
   (`animated_version: 5`).
+- **Occlusion** (player vs scenery): the exporter computes it in FLOAT and ships the
+  RESULT, not depth. The bg render leaves the SCENERY camera depth in `zz.exr`; the light
+  render (scenery camera-invisible) leaves the PLAYER front depth in the same EXR, and its
+  alpha marks where a player is. `matte = (alpha > 0.01) AND (z_scene < z_player)` → a
+  per-pixel 0/1 mask cropped like the light. The viewer discards player fragments where
+  the matte is white. This REPLACED `scene_depth.webm` (scenery Z quantized to 8-bit and
+  seeded into the depth buffer): quantized depth left a hard black fringe where a shadowed
+  player part (e.g. a leg behind grass) failed the imprecise per-fragment test — the matte
+  cuts at the render's exact silhouette because the compare is done in float offline.
+  Player-vs-player occlusion stays a real GPU depth test on the per-vertex mesh z (drawn
+  back-to-front). Translucids (water tint over a submerged player) remain binary occlusion.
 - **Light**: ALWAYS screen-space (drafts and full quality) — the visible gray players
   rendered at frame resolution, stored sRGB-encoded (`0.5·L`), sampled by screen position;
   the viewer decodes to linear, relights `skin_lin × L × 2`, and applies the scene's real
@@ -32,7 +41,7 @@ ships as of 2026-07):
   expanded for the export.
 - **Viewer** (`prototype/play.js`): CURRENT format only (prototype, no back-compat — old
   atlas/fg/matte exports are rejected with a "re-export" message). texAA + premultiplied
-  two-pass alpha, depth prepass, screen-light relight in linear + view-transform LUT,
+  two-pass alpha, matte-discard occlusion, screen-light relight in linear + view-transform LUT,
   per-part toggles + per-player classic/slim arm toggle, folder picker, debug views
   (wireframe / depth / light / grid), one-loop composite recording (⏺ rec → shareable
   MP4/WebM; the tab must stay visible while it records).

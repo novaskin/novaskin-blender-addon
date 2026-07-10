@@ -241,7 +241,7 @@
           <h2>Tuning</h2>
           <label
             class="tn"
-            title="light level (in /255) at or below which a player fragment is treated as occluded and discarded — pure-black light means the light render saw nothing there"
+            title="secondary safety on top of the occlusion matte: light level (in /255) at or below which a player fragment is discarded. 0 drops only pure-black light (mesh drifted past the dilated silhouette); raise it to also eat near-black fringe"
           >
             black discard
             <input
@@ -250,36 +250,8 @@
               min="0"
               max="60"
               step="1"
-              value="8"
+              value="0"
             /><span id="tn_black_v"></span>
-          </label>
-          <label
-            class="tn"
-            title="depth bias (in /255) added to the scenery depth so ties resolve as 'player visible' — absorbs the video round-trip error"
-          >
-            depth guard
-            <input
-              type="range"
-              id="tn_guard"
-              min="0"
-              max="10"
-              step="0.5"
-              value="0.5"
-            /><span id="tn_guard_v"></span>
-          </label>
-          <label
-            class="tn"
-            title="scene_depth values at or below this are treated as 'no occluder' (video decode leaves black slightly above 0)"
-          >
-            depth cutoff
-            <input
-              type="range"
-              id="tn_cut"
-              min="0"
-              max="0.2"
-              step="0.005"
-              value="0.08"
-            /><span id="tn_cut_v"></span>
           </label>
         </div>
 
@@ -289,7 +261,7 @@
             <option value="composite" selected>composite</option>
             <option value="grid">grid (all steps)</option>
             <option value="wire">wireframe</option>
-            <option value="depth">scene depth</option>
+            <option value="occ">occlusion</option>
             <option value="light">light</option>
           </select>
         </div>
