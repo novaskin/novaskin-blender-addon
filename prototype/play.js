@@ -149,6 +149,38 @@ const skins = await Promise.all(manifest.mesh.players.map(() => loadImage('data/
 const canvas = document.getElementById('gl');
 canvas.width = W; canvas.height = H;   // buffer size = intrinsic aspect; CSS fits it to #stage
 const gl = canvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true });
+
+// touchpad pan/zoom of the rendered output (CSS transform, doesn't touch the render): pinch
+// (ctrl+wheel) zooms toward the cursor, two-finger drag pans when zoomed in, double-click
+// resets. The <video>-persistent canvas outlives module reboots, so drop the prior instance's
+// handlers first (stored on the element) and reset the transform.
+{
+  let scale = 1, tx = 0, ty = 0;
+  const apply = () => { canvas.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`; };
+  const onWheel = (e) => {
+    e.preventDefault();
+    if (e.ctrlKey) {                                  // pinch-zoom toward the cursor
+      const r = canvas.getBoundingClientRect();
+      const mx = e.clientX - r.left, my = e.clientY - r.top;
+      const ns = Math.min(20, Math.max(1, scale * Math.exp(-e.deltaY * 0.01)));
+      tx += mx * (1 - ns / scale); ty += my * (1 - ns / scale);
+      scale = ns;
+      if (scale === 1) { tx = 0; ty = 0; }            // snap back to fit when fully zoomed out
+    } else if (scale > 1) {                           // two-finger pan (only while zoomed in)
+      tx -= e.deltaX; ty -= e.deltaY;
+    } else return;
+    apply();
+  };
+  const onDbl = () => { scale = 1; tx = 0; ty = 0; apply(); };
+  if (canvas.__panzoom) {
+    canvas.removeEventListener('wheel', canvas.__panzoom.w);
+    canvas.removeEventListener('dblclick', canvas.__panzoom.d);
+  }
+  canvas.__panzoom = { w: onWheel, d: onDbl };
+  canvas.addEventListener('wheel', onWheel, { passive: false });
+  canvas.addEventListener('dblclick', onDbl);
+  apply();                                            // reset transform on (re)boot
+}
 function sh(t, s) { const o = gl.createShader(t); gl.shaderSource(o, s); gl.compileShader(o);
   if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(o); return o; }
 function prog(v, f) { const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, v));
