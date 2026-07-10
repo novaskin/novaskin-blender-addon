@@ -337,27 +337,14 @@ ANIM_OVERLAY_KEYS = ("hat", "jacket", "sleeve", "pant")
 # lerp vs 24fps video + VP9 edge blur) -- padding prevents black fringes. 0 disables.
 # 16 (not 8): overlay shells extend past the base silhouette and borrow its dilated light.
 ANIM_LIGHT_PAD = 16
-# v5: per-player UV-space light atlas resolution (the light video is replaced by a tiled atlas
-# video reprojected from the render's UV pass). BIGGER than the 64px skin on purpose: one skin
-# pixel covers a large screen area, so shadow boundaries land INSIDE skin texels -- the extra
-# resolution keeps them sharp. Sparse texels are filled by bilinear splatting + pull-push
-# interpolation, so any power of two works (512 gets real detail only from full-res exports).
-ANIM_ATLAS_RES = 512
-# How the FULL-QUALITY animated light is produced; DRAFT exports always use 'SCREEN' (the bg
-# always renders players CAMERA-INVISIBLE, still casting -- a visible gray mannequin leaks a
-# rim wherever the lerped mesh drifts off the video):
-#   'SCREEN'  screen-space light video (2 renders/frame; fast -- what drafts use);
-#   'BAKE'    per-player Cycles bake per frame into a UV atlas (~10-20 s/player/frame on top;
-#             full texel coverage, the static-atlas look -- the shipping quality).
-# (A cheaper REPROJECT mode -- rebuilding the atlas from the light render's UV pass -- was
-# tried and DROPPED: the screen-sampling density made the atlas quality unsatisfactory.)
-ANIM_LIGHT_MODE = 'BAKE'
-
-
-def _anim_light_mode():
-    """The light mode of the CURRENT export: drafts iterate with the fast SCREEN light, full
-    exports use ANIM_LIGHT_MODE (BAKE)."""
-    return 'SCREEN' if DRAFT_MODE else ANIM_LIGHT_MODE
+# The animated light is ALWAYS screen-space (drafts and full quality): the visible gray
+# players rendered at frame resolution, sampled by screen position. Two per-frame atlas
+# modes were tried and DROPPED (git history has both): REPROJECT (atlas rebuilt from the
+# light render's UV pass -- screen-sampling density made it unsatisfactory) and BAKE
+# (per-player Cycles bake per frame -- per-face atlas resolution loses shadow detail the
+# screen render keeps, ~3x less on a near player, on top of ~20 s/player/frame). The
+# static export still bakes its atlas: ONE bake amortized over the wallpaper, lossless
+# WebP, no per-face-vs-screen resolution race against a moving camera.
 # Crop the foreground + light videos to the players' screen region (union over all frames +
 # this padding). Both only have content where the players are, so the rest of the frame is
 # wasted bytes (foreground is mostly transparent yet nearly as big as the background). The
@@ -660,6 +647,41 @@ def _to_display(rgb):
     except Exception as e:
         print("[shadow] OCIO view transform unavailable, using sRGB:", repr(e))
         return _lin_to_srgb(out)
+
+
+# 3D LUT of the scene's view transform, shipped with animated exports so the browser can
+# apply the EXACT display transform (AgX/Filmic/...) after relighting in linear -- a GLSL
+# port would only approximate it (the minimal AgX approximation misses Blender's by up to
+# 0.19). Domain: per-channel log2 shaper over [VIEW_LUT_MIN_EV, VIEW_LUT_MAX_EV] (AgX's own
+# dynamic range; linear 1.76e-4 .. 16.3 -- relit colors cap at skin*2). Layout: N^3 entries,
+# tile x = red index, tile y = green index, blue = tile number, tiles in TILES x TILES
+# row-major from the image's TOP-left (the PNG is written flipped so browsers read it so).
+VIEW_LUT_N = 64
+VIEW_LUT_TILES = 8
+VIEW_LUT_MIN_EV = -12.47393
+VIEW_LUT_MAX_EV = 4.026069
+
+
+def _write_view_lut(path):
+    """Bake the scene view transform into a (N*T) x (N*T) PNG 3D LUT (see comment above).
+    Returns the manifest dict describing it."""
+    N, T = VIEW_LUT_N, VIEW_LUT_TILES
+    s = np.arange(N, dtype='float64') / (N - 1)
+    lin = np.exp2(s * (VIEW_LUT_MAX_EV - VIEW_LUT_MIN_EV) + VIEW_LUT_MIN_EV)
+    B, G, R = np.meshgrid(lin, lin, lin, indexing='ij')        # [b][g][r], r fastest
+    flat = np.stack([R, G, B], axis=-1).reshape(-1, 3).astype('float32')
+    disp = _to_display(flat).reshape(N, N, N, 3)               # [b][g][r] -> display rgb
+    size = N * T
+    img = np.zeros((size, size, 4), 'float32')
+    img[:, :, 3] = 1.0
+    for b in range(N):
+        ty, tx = divmod(b, T)                                  # tiles row-major from TOP
+        img[ty * N:(ty + 1) * N, tx * N:(tx + 1) * N, :3] = disp[b]
+    _save_image(img[::-1].reshape(-1), size, size, path,       # bpy rows are bottom-up
+                colorspace='Non-Color', file_format='PNG')
+    return {"file": os.path.basename(path), "size": N, "tiles": T,
+            "min_ev": VIEW_LUT_MIN_EV, "max_ev": VIEW_LUT_MAX_EV,
+            "view_transform": bpy.context.scene.view_settings.view_transform}
 
 
 def _light_for_label(light_maps, player_label, part_label):
@@ -2942,8 +2964,7 @@ def _anim_frame_cached(adir, i):
     fn = f"{i + 1:04d}.png"
     return all(os.path.exists(p) and os.path.getsize(p) > 0
                for p in (os.path.join(adir, "seq", k, fn)
-                         for k in ("bg", "depth",
-                                   "light" if _anim_light_mode() == 'SCREEN' else "atlas")))
+                         for k in ("bg", "depth", "light")))
 
 
 def _anim_dilate_light(rgb, covered, W, H, passes=None):
@@ -4567,19 +4588,6 @@ def _anim_exr_read(ff, path, item, W, H, gray):
     return rgb[::-1].reshape(-1, 3)
 
 
-# v5 atlas: each overlay rect copies its light from the base rect underneath (the shell is
-# ~coincident with the base, and overlays are hidden in the render). TOP-LEFT px64 rects:
-# (dst overlay rect, src base rect), same size.
-MC_OVERLAY_FROM_BASE = [
-    ((32, 0, 64, 16), (0, 0, 32, 16)),      # hat <- head
-    ((16, 32, 40, 48), (16, 16, 40, 32)),   # jacket <- body
-    ((0, 32, 16, 48), (0, 16, 16, 32)),     # pant_right <- leg_right
-    ((40, 32, 56, 48), (40, 16, 56, 32)),   # sleeve_right <- arm_right
-    ((0, 48, 16, 64), (16, 48, 32, 64)),    # pant_left <- leg_left
-    ((48, 48, 64, 64), (32, 48, 48, 64)),   # sleeve_left <- arm_left
-]
-
-
 def _anim_encode(adir, fps):
     """Encode the PNG sequences to WebM/VP9 with ffmpeg. The foreground is split into an RGB
     video + a grayscale MATTE video (its alpha) -- no alpha channel anywhere, so it decodes
@@ -4588,13 +4596,12 @@ def _anim_encode(adir, fps):
     import shutil as _sh, subprocess, sys
     seq = os.path.join(adir, "seq")
     jobs = [("bg", "background.webm", ["-pix_fmt", "yuv420p"], "bg"),
-            ("atlas", "light_atlas.webm", ["-pix_fmt", "yuv420p"], "light"),
             ("light", "light.webm", ["-pix_fmt", "yuv420p"], "light"),
             # depth is DATA, not picture: lossy VP9 blurs its edges into wrong depths
             # (measured p99 6+ levels at silhouettes), lossless stays within ~2 levels
             # (yuv range conversion) which the viewer's guard band absorbs.
             ("depth", "scene_depth.webm", ["-pix_fmt", "yuv420p"], None)]
-    # only encode the streams this export produced (light XOR atlas per ANIM_LIGHT_MODE)
+    # only encode the streams this export produced
     jobs = [j for j in jobs
             if os.path.exists(os.path.join(seq, j[0], "0001.png"))]
     ff = _ffmpeg_path()
@@ -4623,7 +4630,7 @@ def _anim_encode(adir, fps):
         r = subprocess.run(cmd(name, out, extra, ck), capture_output=True, text=True)
         if r.returncode != 0:
             return False, f"ffmpeg failed on {out}: {r.stderr[-400:]}"
-    return True, "encoded bg / light_atlas / scene_depth .webm"
+    return True, "encoded bg / light / scene_depth .webm"
 
 
 def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
@@ -4794,8 +4801,6 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         # never grows their sockets. Force Cycles for the whole export, like the static path.
         v5_engine = s.render.engine
         s.render.engine = 'CYCLES'
-        if ANIM_LIGHT_MODE not in ('SCREEN', 'BAKE'):
-            raise RuntimeError(f"ANIM_LIGHT_MODE {ANIM_LIGHT_MODE!r}: use 'SCREEN' or 'BAKE'.")
         v5_vl.use_pass_z = True
         bpy.context.view_layer.update()
         nt5 = s.compositing_node_group
@@ -4834,8 +4839,6 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             it5.format.color_depth = '32'
             nt5.links.new(src, fo5.inputs[pname])
             v5_fos.append(fo5.name)
-        NP = len(players)
-        A = ANIM_ATLAS_RES
         srcarr5 = np.asarray(st["src"], np.int64)   # welded -> unique map (per-player masks)
         cached = sum(1 for i in range(nf) if ANIM_RESUME and _anim_frame_cached(adir, i))
         if cached:
@@ -4905,62 +4908,34 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             _save_image(cd, cdW, cdH, os.path.join(adir, "seq", "depth", fn),
                         colorspace='Non-Color')
 
-            tiles_out = None                     # display-encoded (A, A*NP, 3) when atlas mode
-            if _anim_light_mode() == 'BAKE':
-                # 2) true per-player Cycles bakes: the quality-ceiling reference (~20 s each,
-                # SYNC). Base look (setup): overlays stay out of the bake; their rects are
-                # copied from the base below, like the other atlas modes.
-                setup()
-                tiles_out = np.zeros((A, A * NP, 3), np.float32)
-                for pnum, p in enumerate(ordered_p, start=1):
-                    stem = f"bake_p{pnum}"
-                    _bake_player_light_atlas(p, atlas_res=A, out_dir=exr_dir, stem=stem)
-                    bf = next(f2 for f2 in os.listdir(exr_dir) if f2.startswith(stem))
-                    img5 = bpy.data.images.load(os.path.join(exr_dir, bf), check_existing=False)
-                    img5.colorspace_settings.name = 'Non-Color'   # keep encoded values as-is
-                    px5 = np.array(img5.pixels[:], np.float32).reshape(A, A, 4)[::-1, :, :3]
-                    bpy.data.images.remove(img5)
-                    tiles_out[:, (pnum - 1) * A:pnum * A] = px5   # bake files: display-encoded
-            else:
-                # 2) SCREEN: the light render -- players gray VISIBLE, scenery
-                # camera-invisible (still lighting/shadowing) -- shipped as the light video.
-                setup()
-                sc = {o: o.visible_camera for o in scenery}
-                for o in scenery:
-                    o.visible_camera = False
-                bpy.context.view_layer.update()
-                L, _, _ = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT,
-                                                                transparent=True)
-                for o, v in sc.items():
-                    o.visible_camera = v
-                la = np.clip(L[:, 3], 0.0, 1.0)
-                lst = np.where(la[:, None] > 1e-4,
-                               L[:, :3] / np.maximum(la[:, None], 1e-4), 0.0)
-                lsd = _anim_dilate_light(lst, la > 0.01, rW, rH)
-                lbuf = np.ones((L.shape[0], 4), 'float32')
-                lbuf[:, :3] = _lin_to_srgb(lsd)
-                cflat, cW2, cH2 = _crop(lbuf.reshape(-1))
-                _save_image(cflat, cW2, cH2, os.path.join(adir, "seq", "light", fn))
-            if tiles_out is not None:
-                # overlays borrow the base light: copy each base rect into its overlay rect
-                f64 = A / 64.0
-                for pnum in range(NP):
-                    ox = pnum * A
-                    for (dx0, dy0, dx1, dy1), (sx0, sy0, sx1, sy1) in MC_OVERLAY_FROM_BASE:
-                        tiles_out[int(dy0 * f64):int(dy1 * f64),
-                                  ox + int(dx0 * f64):ox + int(dx1 * f64)] = \
-                            tiles_out[int(sy0 * f64):int(sy1 * f64),
-                                      ox + int(sx0 * f64):ox + int(sx1 * f64)]
-                ab = np.ones((A * A * NP, 4), 'float32')
-                ab[:, :3] = np.asarray(tiles_out)[::-1].reshape(-1, 3)
-                _save_image(ab.reshape(-1), A * NP, A, os.path.join(adir, "seq", "atlas", fn))
-            yield prog(f"frame {i+1}/{nf} render + light ({_anim_light_mode().lower()})")
+            # 2) the light render -- players gray VISIBLE, scenery camera-invisible (still
+            # lighting/shadowing) -- shipped as the light video. Stored sRGB-encoded so the
+            # viewer's pow(2.2) decode recovers the LINEAR light; the view transform (AgX)
+            # is applied by the viewer as the final step, after skin x light.
+            setup()
+            sc = {o: o.visible_camera for o in scenery}
+            for o in scenery:
+                o.visible_camera = False
+            bpy.context.view_layer.update()
+            L, _, _ = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT,
+                                                            transparent=True)
+            for o, v in sc.items():
+                o.visible_camera = v
+            la = np.clip(L[:, 3], 0.0, 1.0)
+            lst = np.where(la[:, None] > 1e-4,
+                           L[:, :3] / np.maximum(la[:, None], 1e-4), 0.0)
+            lsd = _anim_dilate_light(lst, la > 0.01, rW, rH)
+            lbuf = np.ones((L.shape[0], 4), 'float32')
+            lbuf[:, :3] = _lin_to_srgb(lsd)
+            cflat, cW2, cH2 = _crop(lbuf.reshape(-1))
+            _save_image(cflat, cW2, cH2, os.path.join(adir, "seq", "light", fn))
+            yield prog(f"frame {i+1}/{nf} render + light")
 
         welded, unique, ntris = _anim_write_mesh(os.path.join(adir, "mesh.bin"), st)
         K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), keys,
                                 ANIM_QUANT, fps / ANIM_KEYS_STEP)
         manifest = {
-            "animated_version": 5,   # 5: UV-space light_atlas video (replaces the light video)
+            "animated_version": 5,   # 5: optional streams; screen light stores sRGB(0.5*L)
             "addon_version": ADDON_VERSION,
             "fps": fps,
             "frames": nf,
@@ -4991,20 +4966,14 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                                 " x,y = px*quant; z = (camDepth-zmin)/(zmax-zmin)*zq for the "
                                 "GPU depth test (shared scale, smaller = nearer)")},
             "shader_note": ("draw background.webm; depth-prepass scene_depth into the z "
-                            "buffer; draw the player meshes depth-tested with color = "
-                            "skin(uv) * light * 2 (display space) -- light from the "
-                            "per-player atlas tile (uv) or the light video (screen). "
-                            "Interpolate positions between mesh keys."),
+                            "buffer; draw the player meshes depth-tested with linear color "
+                            "= skin_lin(uv) * light_lin(screen) * 2, then the view "
+                            "transform (view_lut). Interpolate positions between mesh keys."),
         }
-        if _anim_light_mode() == 'SCREEN':
-            manifest["videos"]["light"] = "light.webm"
-        else:
-            # per-player UV-space light tiles (back-to-front player order, side by side);
-            # overlay rects pre-filled from their base rects (borrowed light); viewer
-            # relights skin(uv) * atlas(uv) * 2.
-            manifest["videos"]["light_atlas"] = "light_atlas.webm"
-            manifest["light_atlas"] = {"res": ANIM_ATLAS_RES, "tiles": len(players),
-                                       "mode": _anim_light_mode()}
+        manifest["videos"]["light"] = "light.webm"
+        # the scene's view transform as a 3D LUT: the viewer's final display encode after
+        # relighting in linear -- exact AgX/Filmic/... match with the background render
+        manifest["view_lut"] = _write_view_lut(os.path.join(adir, "view_lut.png"))
         with open(os.path.join(adir, "manifest.json"), "w") as fh:
             json.dump(manifest, fh, indent=2)
         yield prog("mesh.bin / anim.bin / manifest.json")
@@ -6047,11 +6016,11 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             box = layout.box()
             box.label(text="Animated", icon='RENDER_ANIMATION')
             if not running:               # while running, the top progress bar is the indicator
-                # draft: first ~N s, fast SCREEN light -- the iteration button
+                # draft: first ~N s at draft resolution/samples -- the iteration button
                 box.operator("render.novaskin_animated",
                              text=f"Export Draft (~{ANIM_DRAFT_SECONDS}s)",
                              icon='MOD_FLUID').draft = True
-                # full: whole range, per-frame BAKED light atlas -- the shipping button
+                # full: whole range at full resolution/samples -- the shipping button
                 col = box.column()
                 col.scale_y = 1.4
                 col.operator("render.novaskin_animated",

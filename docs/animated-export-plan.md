@@ -7,15 +7,21 @@ ships as of 2026-07):
 - **Streams per export**: `background.webm` (players camera-invisible, shadows baked),
   `scene_depth.webm` (scenery Z quantized to the players' camera-depth band, VP9
   lossless — the viewer seeds the depth buffer from it and the depth-tested mesh is
-  occluded per-pixel, replacing the old foreground+matte videos entirely), a light stream
-  (below), `mesh.bin` (NSKM, u16/u32 auto) + `anim.bin` (NSKA v3, 12-bit z) and
-  `manifest.json` (`animated_version: 5`).
-- **Light, two modes** (`_anim_light_mode()`): DRAFT exports use `light.webm`, the
-  screen-space gray-player render sampled at the fragment position; FULL-QUALITY exports
-  bake a per-player **UV light atlas per frame** (`light_atlas.webm`, `ANIM_ATLAS_RES`
-  tiles side by side, display-encoded like the static atlas; overlay rects copy their base
-  rects). A cheaper REPROJECT mode (atlas rebuilt from the light render's UV pass) was
-  tried and dropped — screen-sampling density gave an unsatisfactory atlas.
+  occluded per-pixel, replacing the old foreground+matte videos entirely), `light.webm`
+  (below), `view_lut.png` (the scene's view transform as a 64³ 3D LUT), `mesh.bin`
+  (NSKM, u16/u32 auto) + `anim.bin` (NSKA v3, 12-bit z) and `manifest.json`
+  (`animated_version: 5`).
+- **Light**: ALWAYS screen-space (drafts and full quality) — the visible gray players
+  rendered at frame resolution, stored sRGB-encoded (`0.5·L`), sampled by screen position;
+  the viewer decodes to linear, relights `skin_lin × L × 2`, and applies the scene's real
+  view transform via `view_lut.png` (AgX in GLSL would only approximate; the LUT matches
+  OCIO to ~2/255). Two per-frame atlas modes were tried and DROPPED (git history has
+  both): REPROJECT (atlas from the light render's UV pass — sampling density
+  unsatisfactory) and BAKE (per-player Cycles bake per frame — per-face atlas resolution
+  loses shadow detail the screen render keeps, ~3× less on a near player, plus the
+  AgX-encoded tiles could not be decoded exactly in the shader, plus ~20 s/player/frame).
+  The static export still bakes its atlas: one bake amortized over the wallpaper,
+  lossless WebP, no per-face-vs-screen resolution race.
 - **Players**: base + classic 2nd layer (per-part `parts[]` tri ranges in the manifest,
   toggleable in the viewer; labels come from UV-rect classification, not object names).
   BOTH arm styles ship (same design as the static export): the inactive variant's parts are
@@ -25,12 +31,14 @@ ships as of 2026-07):
   borrows its rects (the two UV nets differ ~1px). The rig's inset per-pixel UVs are
   expanded for the export.
 - **Viewer** (`prototype/play.js`): texAA + premultiplied two-pass alpha, depth prepass,
-  UV- or screen-light per manifest, per-part toggles + per-player classic/slim arm toggle,
-  folder picker, debug views (wireframe / depth / light / grid), one-loop composite
-  recording (⏺ rec → shareable MP4/WebM; the tab must stay visible while it records).
-- **Costs** (reference scene, 2 players, 960×540 draft): draft ≈ 5 s/frame; full quality
-  ≈ 30 s/frame (per-player bakes) — a 210-frame full export ≈ 2 h. `ffmpeg` is required
-  at render time (the depth pass is read back through it).
+  screen-light relight in linear + view-transform LUT (older exports without the LUT keep
+  the plain-gamma path; old atlas manifests still draw), per-part toggles + per-player
+  classic/slim arm toggle, folder picker, debug views (wireframe / depth / light / grid),
+  one-loop composite recording (⏺ rec → shareable MP4/WebM; the tab must stay visible
+  while it records).
+- **Costs** (reference scene, 2 players): draft ≈ 5 s/frame; full quality ≈ 14 s/frame
+  (bg + light renders at full resolution/samples, no bakes). `ffmpeg` is required at
+  render time (the depth pass is read back through it).
 
 ---
 

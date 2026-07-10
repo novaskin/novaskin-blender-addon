@@ -227,11 +227,27 @@ const meshP = prog(
    uniform vec2 uLightOrigin; uniform vec2 uLightSize;
    uniform bool uUseLight; uniform bool uFlat; uniform int uPass;
    uniform bool uLightUV; uniform float uTile; uniform float uTiles;
+   uniform sampler2D uViewLut; uniform bool uUseLut;
+   uniform vec4 uLutSpec;   // N, tiles, min_ev, max_ev (exports that ship view_lut.png)
    in vec2 vUv; out vec4 frag;
    // anti-aliased pixel-art sampling: snap UV to the texel CENTRE but ramp across the seam over ~1px.
    vec4 texAA(sampler2D tx, vec2 uv){
      vec2 ts=vec2(textureSize(tx,0)); vec2 p=uv*ts; vec2 seam=floor(p+0.5);
      p=seam+clamp((p-seam)/max(fwidth(p),1e-5),-0.5,0.5); return texture(tx,p/ts);
+   }
+   // the scene view transform (AgX/Filmic/...) as a 3D LUT: log2 shaper per channel,
+   // hardware bilinear in (r,g) inside a tile, manual mix across the blue slices.
+   // Matches Blender's OCIO to ~2/255 (measured) -- a GLSL AgX approximation misses by ~48/255.
+   vec3 viewLut(vec3 lin){
+     float N=uLutSpec.x, T=uLutSpec.y;
+     vec3 s=clamp((log2(max(lin,vec3(1e-9)))-uLutSpec.z)/(uLutSpec.w-uLutSpec.z),0.,1.)*(N-1.);
+     float b0=floor(s.b), fb=s.b-b0;
+     vec2 inner=(s.rg+0.5)/N;                       // texel-centred; stays inside the tile
+     vec2 t0=vec2(mod(b0,T), floor(b0/T));
+     float b1=min(b0+1., N-1.);
+     vec2 t1=vec2(mod(b1,T), floor(b1/T));
+     return mix(texture(uViewLut,(t0+inner)/T).rgb,
+                texture(uViewLut,(t1+inner)/T).rgb, fb);
    }
    void main(){
      if(uFlat){ frag=vec4(0.1,1.0,0.5,1.0); return; }   // wireframe: flat green, no discards
@@ -250,7 +266,9 @@ const meshP = prog(
      // undo the 0.5 gray where it belongs, re-encode.
      vec3 Llin = uUseLight ? pow(texture(uLight,luv).rgb, vec3(2.2)) * 2.0 : vec3(1.0);
      vec3 lin = pow(base, vec3(2.2)) * Llin;
-     vec3 outc = pow(clamp(lin, 0.0, 1.0), vec3(1.0/2.2));
+     // display encode: exports shipping a view_lut apply the scene's REAL view transform
+     // (AgX rolls highlights off instead of clipping); older exports keep plain gamma
+     vec3 outc = uUseLut ? viewLut(lin) : pow(clamp(lin, 0.0, 1.0), vec3(1.0/2.2));
      frag=vec4(outc*s.a, s.a);             // premultiplied relit entity, drawn COMPLETE
    }`);
 function tex(nearest) {
@@ -272,6 +290,21 @@ const tBg = tex(), tFg = tex(), tLight = tex(), tMatte = tex();
 const tAtlas = tex();       // v5 light tiles: LINEAR (smooth light, interpolation is right)
 const tDepth = tex(true);   // NEAREST: depth is data -- interpolating across edges invents depths
 const tSkins = skins.map((img) => { const t = tex(); upload(t, img, true); return t; });  // LINEAR + premult (texel-AA safe)
+
+// view-transform 3D LUT (exports that ship view_lut.png): the scene's AgX/Filmic/... baked
+// by the exporter; the mesh shader applies it after relighting in linear. LINEAR filter (the
+// shader relies on bilinear inside a tile), NO flip (tiles are addressed from the image TOP).
+const lutMeta = manifest.view_lut || null;
+let tLut = null;
+if (lutMeta) {
+  const img = await loadImage(URL.createObjectURL(await loadBlob(lutMeta.file)));
+  tLut = tex();
+  gl.bindTexture(gl.TEXTURE_2D, tLut);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  URL.revokeObjectURL(img.src);
+}
 
 // swap a player's skin at runtime (file input below, or __dbg.setSkin(i, src))
 function setSkin(i, source) { upload(tSkins[i], source, true); }
@@ -420,6 +453,13 @@ function drawPlayers(o) {
   gl.uniform1f(gl.getUniformLocation(meshP, 'uTiles'), manifest.mesh.players.length);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uLightOrigin'), cropBL.x, cropBL.y);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uLightSize'), cropBL.w, cropBL.h);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLut'), tLut ? 1 : 0);
+  if (tLut) {
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, tLut);
+    gl.uniform1i(gl.getUniformLocation(meshP, 'uViewLut'), 2);
+    gl.uniform4f(gl.getUniformLocation(meshP, 'uLutSpec'),
+                 lutMeta.size, lutMeta.tiles, lutMeta.min_ev, lutMeta.max_ev);
+  }
   gl.activeTexture(gl.TEXTURE0);
   const uPass = gl.getUniformLocation(meshP, 'uPass');
   const useDepth = (CH === 3);   // v2+: per-vertex camera depth -> self / inter occlusion
