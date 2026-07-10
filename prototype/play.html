@@ -1,154 +1,321 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<title>NovaSkin animated wallpaper — player prototype</title>
-<style>
-  :root {
-    --bg: #0e0e10; --panel: #17171a; --border: #2a2a30; --text: #d8d8dc;
-    --muted: #8a8a92; --accent: #4a9eff;
-  }
-  * { box-sizing: border-box; }
-  html, body { height: 100%; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 13px/1.45 system-ui, sans-serif; overflow: hidden;
-    display: flex; flex-direction: column;
-  }
+  <head>
+    <meta charset="utf-8" />
+    <title>NovaSkin animated wallpaper — player prototype</title>
+    <style>
+      :root {
+        --bg: #0e0e10;
+        --panel: #17171a;
+        --border: #2a2a30;
+        --text: #d8d8dc;
+        --muted: #8a8a92;
+        --accent: #4a9eff;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font:
+          13px/1.45 system-ui,
+          sans-serif;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+      }
 
-  /* header */
-  header {
-    flex: 0 0 auto; display: flex; align-items: baseline; gap: 10px;
-    padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel);
-  }
-  header h1 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: .2px; }
-  header .tag {
-    font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px;
-  }
-  header #stats { margin-left: auto; font-size: 11px; color: var(--muted); }
+      /* header */
+      header {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        padding: 10px 16px;
+        border-bottom: 1px solid var(--border);
+        background: var(--panel);
+      }
+      header h1 {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 600;
+        letter-spacing: 0.2px;
+      }
+      header .tag {
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+      }
+      header #stats {
+        margin-left: auto;
+        font-size: 11px;
+        color: var(--muted);
+      }
 
-  /* body: sidebar + main */
-  #app { flex: 1 1 auto; display: flex; min-height: 0; }
+      /* body: sidebar + main */
+      #app {
+        flex: 1 1 auto;
+        display: flex;
+        min-height: 0;
+      }
 
-  /* left sidebar */
-  #side {
-    flex: 0 0 250px; overflow-y: auto; padding: 14px;
-    border-right: 1px solid var(--border); background: var(--panel);
-    display: flex; flex-direction: column; gap: 18px;
-  }
-  .group { display: flex; flex-direction: column; gap: 7px; }
-  .group > h2 {
-    margin: 0 0 2px; font-size: 10px; font-weight: 600; text-transform: uppercase;
-    letter-spacing: .6px; color: var(--muted);
-  }
-  .group label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
-  .group input[type=checkbox] { margin: 0; accent-color: var(--accent); }
-  .tn { font-size: 12px; white-space: nowrap; }
-  .tn input[type=range] { flex: 1 1 auto; min-width: 0; accent-color: var(--accent); }
-  .tn span { min-width: 34px; text-align: right; color: var(--muted);
-             font-variant-numeric: tabular-nums; }
-  #side select, #side input[type=file] { width: 100%; }
-  #side select {
-    background: var(--bg); color: var(--text); border: 1px solid var(--border);
-    border-radius: 4px; padding: 4px 6px;
-  }
-  #side input[type=file] { font-size: 11px; color: var(--muted); }
-  #skins { display: flex; flex-direction: column; gap: 6px; }
-  #skins label { font-size: 12px; }
-  #skins input[type=file] { max-width: 130px; }
+      /* left sidebar */
+      #side {
+        flex: 0 0 250px;
+        overflow-y: auto;
+        padding: 14px;
+        border-right: 1px solid var(--border);
+        background: var(--panel);
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+      }
+      .group {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+      }
+      .group > h2 {
+        margin: 0 0 2px;
+        font-size: 10px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+        color: var(--muted);
+      }
+      .group label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        cursor: pointer;
+      }
+      .group input[type="checkbox"] {
+        margin: 0;
+        accent-color: var(--accent);
+      }
+      .tn {
+        font-size: 12px;
+        white-space: nowrap;
+      }
+      .tn input[type="range"] {
+        flex: 1 1 auto;
+        min-width: 0;
+        accent-color: var(--accent);
+      }
+      .tn span {
+        min-width: 34px;
+        text-align: right;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      #side select,
+      #side input[type="file"] {
+        width: 100%;
+      }
+      #side select {
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        padding: 4px 6px;
+      }
+      #side input[type="file"] {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      #skins {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      #skins label {
+        font-size: 12px;
+      }
+      #skins input[type="file"] {
+        max-width: 130px;
+      }
 
-  /* main: stage (canvas) + controls */
-  #main { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
-  #stage {
-    flex: 1 1 auto; min-height: 0; display: flex; align-items: center;
-    justify-content: center; overflow: hidden; padding: 14px; background: #000;
-  }
-  #stage canvas {
-    width: 100%; height: 100%; object-fit: contain; background: #000;
-  }
-  #controls {
-    flex: 0 0 auto; display: flex; align-items: center; gap: 14px;
-    padding: 10px 16px; border-top: 1px solid var(--border); background: var(--panel);
-  }
-  #controls button {
-    background: var(--bg); color: var(--text); border: 1px solid var(--border);
-    border-radius: 5px; padding: 5px 12px; cursor: pointer; font-size: 13px;
-    min-width: 42px;
-  }
-  #controls button:hover { border-color: var(--accent); }
-  #controls button:disabled { opacity: .5; cursor: default; }
-  #controls #scrub { flex: 1 1 auto; min-width: 120px; accent-color: var(--accent); }
-  #controls #time { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 130px; white-space: nowrap; text-align: right; }
-</style>
-</head>
-<body>
-<header>
-  <h1>NovaSkin</h1>
-  <span class="tag">animated wallpaper player</span>
-  <span id="stats">loading…</span>
-</header>
+      /* main: stage (canvas) + controls */
+      #main {
+        flex: 1 1 auto;
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+      #stage {
+        flex: 1 1 auto;
+        min-height: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        padding: 14px;
+        background: #000;
+      }
+      #stage canvas {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        background: #000;
+      }
+      #controls {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 10px 16px;
+        border-top: 1px solid var(--border);
+        background: var(--panel);
+      }
+      #controls button {
+        background: var(--bg);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        padding: 5px 12px;
+        cursor: pointer;
+        font-size: 13px;
+        min-width: 42px;
+      }
+      #controls button:hover {
+        border-color: var(--accent);
+      }
+      #controls button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #controls #scrub {
+        flex: 1 1 auto;
+        min-width: 120px;
+        accent-color: var(--accent);
+      }
+      #controls #time {
+        font-variant-numeric: tabular-nums;
+        color: var(--muted);
+        min-width: 130px;
+        white-space: nowrap;
+        text-align: right;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>NovaSkin</h1>
+      <span class="tag">animated wallpaper player</span>
+      <span id="stats">loading…</span>
+    </header>
 
-<div id="app">
-  <aside id="side">
-    <div class="group">
-      <h2>Export</h2>
-      <label title="pick an export folder containing manifest.json">
-        <input type="file" id="dir" webkitdirectory multiple>
-      </label>
+    <div id="app">
+      <aside id="side">
+        <div class="group">
+          <h2>Export</h2>
+          <label title="pick an export folder containing manifest.json">
+            <input type="file" id="dir" webkitdirectory multiple />
+          </label>
+        </div>
+
+        <div class="group">
+          <h2>Layers</h2>
+          <label><input type="checkbox" id="ck_bg" checked /> background</label>
+          <label><input type="checkbox" id="ck_pl" checked /> players</label>
+          <label><input type="checkbox" id="ck_li" checked /> light</label>
+          <label
+            title="hide the players where scenery is in front of them (scene-depth prepass; the foreground video on older exports)"
+            ><input type="checkbox" id="ck_occ" checked /> occlusion</label
+          >
+          <label
+            title="sample the mesh at the video's frame grid instead of continuously — registers the player exactly with the fg/light frames (at the cost of 24fps-stepped motion)"
+          >
+            <input type="checkbox" id="ck_snap" /> snap
+          </label>
+        </div>
+
+        <div class="group">
+          <h2>Tuning</h2>
+          <label
+            class="tn"
+            title="light level (in /255) at or below which a player fragment is treated as occluded and discarded — pure-black light means the light render saw nothing there"
+          >
+            black discard
+            <input
+              type="range"
+              id="tn_black"
+              min="0"
+              max="60"
+              step="1"
+              value="8"
+            /><span id="tn_black_v"></span>
+          </label>
+          <label
+            class="tn"
+            title="depth bias (in /255) added to the scenery depth so ties resolve as 'player visible' — absorbs the video round-trip error"
+          >
+            depth guard
+            <input
+              type="range"
+              id="tn_guard"
+              min="0"
+              max="10"
+              step="0.5"
+              value="0.5"
+            /><span id="tn_guard_v"></span>
+          </label>
+          <label
+            class="tn"
+            title="scene_depth values at or below this are treated as 'no occluder' (video decode leaves black slightly above 0)"
+          >
+            depth cutoff
+            <input
+              type="range"
+              id="tn_cut"
+              min="0"
+              max="0.2"
+              step="0.005"
+              value="0.08"
+            /><span id="tn_cut_v"></span>
+          </label>
+        </div>
+
+        <div class="group">
+          <h2>View</h2>
+          <select id="dbgmode">
+            <option value="composite" selected>composite</option>
+            <option value="grid">grid (all steps)</option>
+            <option value="wire">wireframe</option>
+            <option value="depth">scene depth</option>
+            <option value="light">light</option>
+          </select>
+        </div>
+
+        <div class="group">
+          <h2>Skins</h2>
+          <span id="skins"></span>
+        </div>
+      </aside>
+
+      <div id="main">
+        <div id="stage"><canvas id="gl"></canvas></div>
+        <div id="controls">
+          <button id="playbtn">▶</button>
+          <input id="scrub" type="range" min="0" max="1000" value="0" />
+          <span id="time">0.0s</span>
+          <button
+            id="recbtn"
+            title="record one full loop of the composite and download it as a video (keep the tab visible while recording)"
+          >
+            ⏺ rec
+          </button>
+        </div>
+      </div>
     </div>
 
-    <div class="group">
-      <h2>Layers</h2>
-      <label><input type="checkbox" id="ck_bg" checked> background</label>
-      <label><input type="checkbox" id="ck_pl" checked> players</label>
-      <label><input type="checkbox" id="ck_li" checked> light</label>
-      <label title="hide the players where scenery is in front of them (scene-depth prepass; the foreground video on older exports)"><input type="checkbox" id="ck_occ" checked> occlusion</label>
-      <label title="sample the mesh at the video's frame grid instead of continuously — registers the player exactly with the fg/light frames (at the cost of 24fps-stepped motion)">
-        <input type="checkbox" id="ck_snap"> snap
-      </label>
-    </div>
-
-    <div class="group">
-      <h2>Tuning</h2>
-      <label class="tn" title="light level (in /255) at or below which a player fragment is treated as occluded and discarded — pure-black light means the light render saw nothing there">
-        black discard <input type="range" id="tn_black" min="0" max="30" step="1" value="8"><span id="tn_black_v"></span>
-      </label>
-      <label class="tn" title="depth bias (in /255) added to the scenery depth so ties resolve as 'player visible' — absorbs the video round-trip error">
-        depth guard <input type="range" id="tn_guard" min="0" max="10" step="0.5" value="3"><span id="tn_guard_v"></span>
-      </label>
-      <label class="tn" title="scene_depth values at or below this are treated as 'no occluder' (video decode leaves black slightly above 0)">
-        depth cutoff <input type="range" id="tn_cut" min="0" max="0.2" step="0.005" value="0.08"><span id="tn_cut_v"></span>
-      </label>
-    </div>
-
-    <div class="group">
-      <h2>View</h2>
-      <select id="dbgmode">
-        <option value="composite" selected>composite</option>
-        <option value="grid">grid (all steps)</option>
-        <option value="wire">wireframe</option>
-        <option value="depth">scene depth</option>
-        <option value="light">light</option>
-      </select>
-    </div>
-
-    <div class="group">
-      <h2>Skins</h2>
-      <span id="skins"></span>
-    </div>
-  </aside>
-
-  <div id="main">
-    <div id="stage"><canvas id="gl"></canvas></div>
-    <div id="controls">
-      <button id="playbtn">▶</button>
-      <input id="scrub" type="range" min="0" max="1000" value="0">
-      <span id="time">0.0s</span>
-      <button id="recbtn" title="record one full loop of the composite and download it as a video (keep the tab visible while recording)">⏺ rec</button>
-    </div>
-  </div>
-</div>
-
-<script type="module" src="play.js"></script>
-</body>
+    <script type="module" src="play.js"></script>
+  </body>
 </html>
