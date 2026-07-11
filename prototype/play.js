@@ -206,7 +206,7 @@ const meshP = prog(
   `#version 300 es
    precision highp float;
    uniform sampler2D uSkin; uniform sampler2D uStack; uniform vec2 uRes;
-   uniform float uLightBand; uniform float uOccBand;
+   uniform float uLightBand; uniform float uOccBand; uniform float uBgBand;
    uniform bool uUseLight; uniform bool uOcclude; uniform bool uFlat; uniform int uPass;
    uniform sampler2D uViewLut;
    uniform vec4 uLutSpec;   // N, tiles, min_ev, max_ev (from manifest.view_lut)
@@ -247,11 +247,18 @@ const meshP = prog(
      // silhouette. Discard the fragment where it is set.
      if (uOcclude && sampleBand(uStack, fuv, uOccBand).r > 0.5) discard;
      vec3 lraw = sampleBand(uStack, fuv, uLightBand).rgb;
-     // secondary occlusion safety: PURE-black light = the light render saw nothing here (the
-     // lerped mesh drifted past the 16px dilated silhouette). Gated by uOcclude (it IS an
-     // occlusion cull -- occlusion off shows the raw player). Default threshold 0 drops only
-     // exact black, keeping genuinely-dark-but-visible shadow; the slider raises it.
-     if (uOcclude && uUseLight && max(lraw.r, max(lraw.g, lraw.b)) <= uBlackT) discard;
+     // black-discard tiebreak at player/scenery intersections (the z-fighty seam). The winner
+     // is a stable pixel comparison (illum darkness vs bg darkness) instead of the noisy matte
+     // edge -- discard the player ONLY where its illum is black AND the bg has real colour to
+     // show. If the bg is black too, keep the player (discarding would just punch a black hole,
+     // and the both-black seam is where the fight was). bg band = the scenery at this pixel
+     // (players are camera-invisible in the bg render).
+     if (uOcclude && uUseLight) {
+       vec3 bg = sampleBand(uStack, fuv, uBgBand).rgb;
+       bool illumBlack = max(lraw.r, max(lraw.g, lraw.b)) <= uBlackT;
+       bool bgBlack    = max(bg.r,   max(bg.g,   bg.b))   <= uBlackT;
+       if (illumBlack && !bgBlack) discard;
+     }
      // relight in LINEAR space (the stream stores sRGB-encoded 0.5*L; the x2 that undoes
      // the gray carrier only means x2 in linear), then display-encode with the scene's
      // REAL view transform (AgX rolls highlights off instead of clipping).
@@ -438,6 +445,7 @@ function drawPlayers(o) {
   gl.uniform1i(gl.getUniformLocation(meshP, 'uStackV'), STACK_V ? 1 : 0);
   gl.uniform1f(gl.getUniformLocation(meshP, 'uLightBand'), BAND.light);
   gl.uniform1f(gl.getUniformLocation(meshP, 'uOccBand'), BAND.occlusion);
+  gl.uniform1f(gl.getUniformLocation(meshP, 'uBgBand'), BAND.background);
   gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, tLut);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uViewLut'), 2);
   gl.uniform4f(gl.getUniformLocation(meshP, 'uLutSpec'),
