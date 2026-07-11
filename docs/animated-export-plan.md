@@ -4,11 +4,16 @@ Status: **SHIPPED — format v5** (this doc is the original plan plus phase note
 sections below describe versions 1-2 and are kept as history. Summary of what actually
 ships as of 2026-07):
 
-- **Streams per export**: `background.webm` (players camera-invisible, shadows baked),
-  `occlusion.webm` (per-pixel player-vs-scenery matte, VP9 lossless — see below),
-  `light.webm` (below), `view_lut.png` (the scene's view transform as a 64³ 3D LUT),
-  `mesh.bin` (NSKM, u16/u32 auto) + `anim.bin` (NSKA v3, 12-bit z) and `manifest.json`
-  (`animated_version: 5`).
+- **Streams per export**: `composite.webm` — ONE video holding three full-frame bands
+  vstacked top-to-bottom (band 0 = background, 1 = light, 2 = occlusion matte), so a
+  SINGLE decoder keeps them in perfect frame lockstep. Three separate `<video>` elements
+  drift by a frame (independent decoders / start times), and one frame off reads as wrong
+  on the WebGL composite; a single decoder makes drift impossible. Cost: one codec for all
+  three ⇒ lossy, one CRF (`ANIM_STACK_CRF`, default 30) — the occlusion matte's hard edge
+  softens a little (accepted: a 1-frame desync is far worse than a ~1px fuzzy cut). Video
+  is `W × 3H`; sample band b at `(sx/W, (sy + b*H)/(3*H))`. Also ships `view_lut.png` (the
+  scene's view transform as a 64³ 3D LUT), `mesh.bin` (NSKM, u16/u32 auto) + `anim.bin`
+  (NSKA v3, 12-bit z) and `manifest.json` (`animated_version: 5`, `video` + `bands`).
 - **Occlusion** (player vs scenery): the exporter computes it in FLOAT and ships the
   RESULT, not depth. The bg render leaves the SCENERY camera depth in `zz.exr`; a dedicated
   occlusion render — the FULL player (base + overlays), scenery camera-invisible, ONE

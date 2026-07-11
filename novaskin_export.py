@@ -316,7 +316,13 @@ ANIM_Z_BITS = 12            # depth quantization: 12 bits = 4095 levels (plenty 
 # The 'Export Animation Draft' button renders only the first few seconds (fast iteration on
 # look/quality) instead of the whole frame range. The full export uses the scene's range.
 ANIM_DRAFT_SECONDS = 3
-ANIM_CRF = {"bg": 32, "fg": 32, "light": 38}   # VP9 quality per stream
+ANIM_CRF = {"bg": 32, "fg": 32, "light": 38}   # VP9 quality per stream (legacy per-stream)
+# The three streams (bg / light / occlusion) are vstacked into ONE video so a single decoder
+# keeps them in perfect frame lockstep (independent <video> elements drift by a frame, which
+# reads as wrong on the WebGL composite). One codec for all three => lossy, one CRF: the
+# occlusion matte's hard edge softens a little (accepted -- a 1-frame desync is far worse than
+# a ~1px fuzzy cut). Lower = crisper occ + bigger file.
+ANIM_STACK_CRF = 30
 ANIM_ENCODE = True          # run ffmpeg after rendering (else keep PNG sequences + script)
 ANIM_KEEP_SEQUENCES = False  # keep seq/ PNGs after a successful encode
 # Resume an interrupted export: skip frames whose PNGs already exist in seq/. A crash or
@@ -353,12 +359,6 @@ ANIM_OCC_DELTA = 0.002
 # screen render keeps, ~3x less on a near player, on top of ~20 s/player/frame). The
 # static export still bakes its atlas: ONE bake amortized over the wallpaper, lossless
 # WebP, no per-face-vs-screen resolution race against a moving camera.
-# Crop the foreground + light videos to the players' screen region (union over all frames +
-# this padding). Both only have content where the players are, so the rest of the frame is
-# wasted bytes (foreground is mostly transparent yet nearly as big as the background). The
-# background is NOT cropped (it is the whole wallpaper). The manifest records the crop rect;
-# the web player positions the foreground quad and offsets the light sampling. 0 disables.
-ANIM_CROP_PAD = 24
 
 # ---- Static export v2 (mesh K=1 + UV light atlas) -------------------------------------
 # A per-player light atlas in the skin's UV layout: each texel stores the scene lighting on a
@@ -4597,48 +4597,42 @@ def _anim_exr_read(ff, path, item, W, H, gray):
 
 
 def _anim_encode(adir, fps):
-    """Encode the PNG sequences to WebM/VP9 with ffmpeg. The foreground is split into an RGB
-    video + a grayscale MATTE video (its alpha) -- no alpha channel anywhere, so it decodes
-    on Safari too (which lacks VP9-alpha). All streams are plain yuv420p. Returns (ok,
-    message); if ffmpeg is missing, writes encode.sh/.bat with the commands instead."""
-    import shutil as _sh, subprocess, sys
+    """vstack the bg / light / occlusion PNG sequences into ONE WebM/VP9 (composite.webm) so a
+    single decoder holds all three in perfect frame lockstep. All three are full-frame (same
+    width) -> band 0 = bg, band 1 = light, band 2 = occlusion, top to bottom. Lossy, one CRF
+    (ANIM_STACK_CRF), plain yuv420p. Returns (ok, message); if ffmpeg is missing, writes
+    encode.sh/.bat with the command instead."""
+    import subprocess, sys
     seq = os.path.join(adir, "seq")
-    jobs = [("bg", "background.webm", ["-pix_fmt", "yuv420p"], "bg"),
-            ("light", "light.webm", ["-pix_fmt", "yuv420p"], "light"),
-            # the occlusion matte is a hard 0/1 mask, not a picture: lossy VP9 would blur
-            # its edges and bring the occlusion fringe back, so it is encoded LOSSLESS
-            # (a near-binary mask compresses to almost nothing anyway).
-            ("occ", "occlusion.webm", ["-pix_fmt", "yuv420p"], None)]
-    # only encode the streams this export produced
-    jobs = [j for j in jobs
-            if os.path.exists(os.path.join(seq, j[0], "0001.png"))]
+    bands = [b for b in ("bg", "light", "occ")
+             if os.path.exists(os.path.join(seq, b, "0001.png"))]
+    inputs = []
+    for b in bands:
+        inputs += ["-i", os.path.join(seq, b, "%04d.png")]
+    fc = "".join(f"[{i}:v]" for i in range(len(bands))) + f"vstack=inputs={len(bands)}[v]"
     ff = _ffmpeg_path()
-    def cmd(name, out, extra, crf_key):
-        q = (["-lossless", "1"] if crf_key is None
-             else ["-crf", str(ANIM_CRF[crf_key]), "-b:v", "0"])
-        return [ff or "ffmpeg", "-y", "-framerate", str(fps),
-                "-i", os.path.join(seq, name, "%04d.png"),
-                "-c:v", "libvpx-vp9", *q,
-                "-row-mt", "1", "-cpu-used", "4", *extra, os.path.join(adir, out)]
+    def cmd():
+        return [ff or "ffmpeg", "-y", "-framerate", str(fps), *inputs,
+                "-filter_complex", fc, "-map", "[v]",
+                "-c:v", "libvpx-vp9", "-crf", str(ANIM_STACK_CRF), "-b:v", "0",
+                "-row-mt", "1", "-cpu-used", "4", "-pix_fmt", "yuv420p",
+                os.path.join(adir, "composite.webm")]
     if ff is None:
         import shlex
         win = sys.platform == "win32"
         script = os.path.join(adir, "encode.bat" if win else "encode.sh")
+        c = cmd(); c[0] = "ffmpeg"
         with open(script, "w") as f:
             f.write("@echo off\n" if win else "#!/bin/sh\n")
             f.write(("rem " if win else "# ") + "ffmpeg not found -- run this to encode\n")
-            for name, out, extra, ck in jobs:
-                c = cmd(name, out, extra, ck)
-                c[0] = "ffmpeg"
-                f.write((" ".join(c) if win else " ".join(shlex.quote(x) for x in c)) + "\n")
+            f.write((" ".join(c) if win else " ".join(shlex.quote(x) for x in c)) + "\n")
         if not win:
             os.chmod(script, 0o755)
         return False, f"ffmpeg not found -- wrote {os.path.basename(script)}"
-    for name, out, extra, ck in jobs:
-        r = subprocess.run(cmd(name, out, extra, ck), capture_output=True, text=True)
-        if r.returncode != 0:
-            return False, f"ffmpeg failed on {out}: {r.stderr[-400:]}"
-    return True, "encoded bg / light / occlusion .webm"
+    r = subprocess.run(cmd(), capture_output=True, text=True)
+    if r.returncode != 0:
+        return False, f"ffmpeg failed on composite.webm: {r.stderr[-400:]}"
+    return True, f"encoded composite.webm ({'/'.join(bands)} stacked)"
 
 
 def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
@@ -4742,38 +4736,15 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         st = _anim_collect_static(players, W, H)
         yield prog(f"static mesh ({len(st['src'])} welded / {len(st['uniq'])} unique verts)")
 
-        # Pre-pass: capture the crop rect from EVERY frame's vertex bbox (+ padding) and the
-        # mesh keys (every ANIM_KEYS_STEP frames) for anim.bin. Capturing every frame -- not
-        # just keys -- is cheap (~2 ms/frame) and bounds the real (non-linear) motion between
-        # keys, so a non-key silhouette can't extend past the crop and get clipped.
+        # Pre-pass: capture the mesh keys (every ANIM_KEYS_STEP frames) for anim.bin. The
+        # streams are full-frame (no crop -- they vstack into one video), so no bbox needed.
         keys = []
-        pmin = np.array([W, H], 'float64')
-        pmax = np.array([0.0, 0.0], 'float64')
         for i, f in enumerate(range(f0, f1 + 1)):
             s.frame_set(f)
             setup()
             p = _anim_frame_positions(st, W, H)
-            pmin = np.minimum(pmin, p[:, :2].min(0))
-            pmax = np.maximum(pmax, p[:, :2].max(0))
             if i % ANIM_KEYS_STEP == 0 or f == f1:
                 keys.append(p)
-        if ANIM_CROP_PAD > 0:
-            cx0 = max(0, int(np.floor(pmin[0] - ANIM_CROP_PAD)))
-            cy0 = max(0, int(np.floor(pmin[1] - ANIM_CROP_PAD)))
-            cx1 = min(W, int(np.ceil(pmax[0] + ANIM_CROP_PAD)))
-            cy1 = min(H, int(np.ceil(pmax[1] + ANIM_CROP_PAD)))
-            cx1 -= (cx1 - cx0) % 2      # even dims for yuv420p
-            cy1 -= (cy1 - cy0) % 2
-        else:
-            cx0, cy0, cx1, cy1 = 0, 0, W, H
-
-        def _crop(flat):
-            """Crop a flat RGBA (full WxH, bottom-up) to the player rect -> (flat, w, h)."""
-            sub = flat.reshape(H, W, 4)[cy0:cy1, cx0:cx1, :]
-            return np.ascontiguousarray(sub).reshape(-1), cx1 - cx0, cy1 - cy0
-
-        print(f"[ANIM] crop rect (bottom-up px): x{cx0}-{cx1} y{cy0}-{cy1} "
-              f"= {cx1-cx0}x{cy1-cy0} ({100*(cx1-cx0)*(cy1-cy0)/(W*H):.0f}% of frame)")
         # players' camera-depth band over the whole clip (same formula as _anim_write_anim):
         # ONE z space shared by the mesh (anim.bin z) and the scene-depth video, so the
         # viewer's depth prepass compares them directly.
@@ -4900,8 +4871,9 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             lsd = _anim_dilate_light(lst, la > 0.01, rW, rH)
             lbuf = np.ones((L.shape[0], 4), 'float32')
             lbuf[:, :3] = _lin_to_srgb(lsd)
-            cflat, cW2, cH2 = _crop(lbuf.reshape(-1))
-            _save_image(cflat, cW2, cH2, os.path.join(adir, "seq", "light", fn))
+            # full-frame (not cropped): the three streams are vstacked into ONE video, so
+            # they must share width; the unused (black) regions cost ~nothing in the encode.
+            _save_image(lbuf.reshape(-1), rW, rH, os.path.join(adir, "seq", "light", fn))
 
             # 3) OCCLUSION matte, rendered with the FULL player (base + overlays visible):
             # the light render above is BASE-ONLY (its base light must stay overlay-free), so
@@ -4941,9 +4913,8 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                    & (z_scene - ANIM_OCC_DELTA < z_play)).astype('float32')   # 1 = discard
             obuf = np.ones((occ.size, 4), 'float32')
             obuf[:, 0] = obuf[:, 1] = obuf[:, 2] = occ
-            co, coW, coH = _crop(obuf.reshape(-1))
-            _save_image(co, coW, coH, os.path.join(adir, "seq", "occ", fn),
-                        colorspace='Non-Color')
+            _save_image(obuf.reshape(-1), rW, rH, os.path.join(adir, "seq", "occ", fn),
+                        colorspace='Non-Color')   # full-frame; vstacked with bg + light
             yield prog(f"frame {i+1}/{nf} render + light + matte")
 
         welded, unique, ntris = _anim_write_mesh(os.path.join(adir, "mesh.bin"), st)
@@ -4955,16 +4926,15 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             "fps": fps,
             "frames": nf,
             "resolution": [W, H],
-            # crop rect for the light + occlusion videos, in TOP-LEFT pixels (background is
-            # full-frame). Both are sampled at (fragScreenTopLeft - crop.xy) / crop.wh.
-            "crop": {"x": cx0, "y": H - cy1, "w": cx1 - cx0, "h": cy1 - cy0},
-            "videos": {"background": "background.webm",
-                       "light": "light.webm",
-                       "occlusion": "occlusion.webm"},
-            # per-pixel player-vs-scenery occlusion matte, cropped like light, VP9 LOSSLESS.
-            # 1 (white) = scenery is in front of the player here -> the viewer discards the
-            # player fragment; 0 = draw. Computed in FLOAT from the two render depths so it
-            # cuts at the render's exact silhouette (no 8-bit depth fringe). Translucids
+            # ONE video (composite.webm), the three full-frame streams vstacked top-to-bottom
+            # so a single decoder keeps them in perfect frame lockstep. Each band is W x H; the
+            # video is W x (3*H). Sample band b at texture (sx/W, (sy + b*H) / (3*H)).
+            "video": "composite.webm",
+            "bands": {"background": 0, "light": 1, "occlusion": 2, "count": 3},
+            # occlusion band: per-pixel player-vs-scenery matte. 1 (white) = scenery is in
+            # front of the player here -> the viewer discards the player fragment; 0 = draw.
+            # Computed in FLOAT from the two render depths so it cuts at the render's exact
+            # silhouette. Lossy in the stack -> the hard edge softens a little. Translucids
             # (water tint over the player) are NOT represented -- binary occlusion only.
             "occlusion": {"encoding": "player-matte"},
             "mesh": {"file": "mesh.bin", "welded": welded, "unique": unique,
@@ -4977,10 +4947,11 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                                 "zmax/zq) + zlib(int16 xyz: abs, delta, then delta-of-delta);"
                                 " x,y = px*quant; z = (camDepth-zmin)/(zmax-zmin)*zq for the "
                                 "GPU depth test (shared scale, smaller = nearer)")},
-            "shader_note": ("draw background.webm; draw the player meshes depth-tested "
-                            "against each other, discarding fragments where occlusion.webm "
-                            "is white; color = skin_lin(uv) * light_lin(screen) * 2, then "
-                            "the view transform (view_lut). Interpolate between mesh keys."),
+            "shader_note": ("one video, 3 vstacked bands (bg/light/occ). Draw the bg band; "
+                            "draw the player meshes depth-tested against each other, "
+                            "discarding fragments where the occ band is white; color = "
+                            "skin_lin(uv) * light_band(screen) * 2, then the view transform "
+                            "(view_lut). Interpolate between mesh keys."),
         }
         # the scene's view transform as a 3D LUT: the viewer's final display encode after
         # relighting in linear -- exact AgX/Filmic/... match with the background render

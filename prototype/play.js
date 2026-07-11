@@ -1,10 +1,11 @@
 // Animated wallpaper player prototype. Consumes <animated/> as written by the exporter
 // (CURRENT format only -- no back-compat): manifest.json, mesh.bin (NSKM), anim.bin
-// (NSKA v3), background/light/occlusion .webm, view_lut.png.
-// Composite per displayed frame: draw the background, then the player mesh depth-tested
-// against itself/other players -- discarding fragments the occlusion matte marks as behind
-// scenery -- with skin x screen light in LINEAR, display-encoded through the scene's
-// view-transform LUT; positions lerped between mesh keys.
+// (NSKA v3), composite.webm (ONE video, bg/light/occ vstacked into 3 bands -> one decoder,
+// perfect frame lockstep), view_lut.png.
+// Composite per displayed frame: draw the bg band, then the player mesh depth-tested against
+// itself/other players -- discarding fragments the occlusion band marks as behind scenery --
+// with skin x light band in LINEAR, display-encoded through the scene's view-transform LUT;
+// positions lerped between mesh keys.
 const DIR = 'animated/';
 
 // --- source + re-boot plumbing: picking a folder (any export with a manifest.json) stashes its
@@ -58,18 +59,16 @@ async function inflate(bytes) {
 
 const manifest = FILES ? JSON.parse(await (await loadBlob('manifest.json')).text())
                        : await (await fetch(DIR + 'manifest.json' + _cb)).json();
-// current format ONLY (prototype, no back-compat): screen light + player-matte occlusion
-// + view-transform LUT. Anything else: re-export with the current add-on.
-if (!(manifest.videos && manifest.videos.background && manifest.videos.light
-      && manifest.videos.occlusion && manifest.view_lut)) {
+// current format ONLY (prototype, no back-compat): ONE video with 3 vstacked bands
+// (bg/light/occ) + player-matte occlusion + view-transform LUT. Else: re-export.
+if (!(manifest.video && manifest.bands && manifest.view_lut)) {
   document.getElementById('stats').textContent =
-    'unsupported export -- re-export with the current add-on (screen light + occlusion + view_lut)';
+    'unsupported export -- re-export with the current add-on (stacked video + view_lut)';
   throw 'unsupported export format';
 }
 const [W, H] = manifest.resolution;
-// light + occlusion crop rect (top-left px)
-const crop = manifest.crop;
-const cropBL = { x: crop.x, y: H - crop.y - crop.h, w: crop.w, h: crop.h };  // bottom-up
+const NBANDS = manifest.bands.count;          // 3: bg=0 (top), light=1, occ=2 (bottom)
+const BAND = manifest.bands;
 
 // --- mesh.bin: NSKM | u32 version, welded, unique, ntris | zlib(uv u16x2, src u16, tris u16x3)
 const mb = await bin(manifest.mesh.file);
@@ -127,18 +126,9 @@ async function video(src) {
   v.preload = 'auto';
   return new Promise((ok) => { v.oncanplaythrough = () => ok(v); v.load(); });
 }
-const [vBg, vLight, vOcc] = await Promise.all(
-  [manifest.videos.background, manifest.videos.light, manifest.videos.occlusion].map(video));
-// Frame-lock the secondary videos to the background's clock every drawn frame (independent
-// <video> elements drift, and start playing at slightly different times). The OCCLUSION must
-// be in step too -- it is the occlusion shape; if it lags, the occlusion freezes/misaligns.
-const SYNC_TOL = 1.5 / manifest.fps;   // re-seek if off by more than ~1.5 frames
-function syncVideos() {
-  for (const v of [vLight, vOcc]) {
-    if (Math.abs(v.currentTime - vBg.currentTime) > SYNC_TOL)
-      v.currentTime = vBg.currentTime;
-  }
-}
+// ONE video: bg/light/occ vstacked into 3 bands. A single decoder keeps them in perfect
+// frame lockstep -- no cross-video drift, no re-seeking to resync.
+const vComp = await video(manifest.video);
 // one skin per player (the customizer swaps these individually); default: same skin
 const loadImage = (src) => new Promise((ok, err) => {
   const i = new Image(); i.onload = () => ok(i); i.onerror = err; i.src = src;
@@ -186,16 +176,22 @@ function sh(t, s) { const o = gl.createShader(t); gl.shaderSource(o, s); gl.comp
 function prog(v, f) { const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, v));
   gl.attachShader(p, sh(gl.FRAGMENT_SHADER, f)); gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw gl.getProgramInfoLog(p); return p; }
+// the single stacked video holds NBANDS full-frame bands top-to-bottom (bg/light/occ). With
+// UNPACK_FLIP_Y the top band is the highest V, so band b at full-frame vertical t (0=bottom,
+// 1=top) is texture V = (N-1-b+t)/N; U is unchanged.
+const BAND_GLSL = `
+   uniform float uNBands;
+   float bandV(float t, float b){ return (uNBands - 1.0 - b + t) / uNBands; }
+   vec4 sampleBand(sampler2D tx, vec2 uv, float b){ return texture(tx, vec2(uv.x, bandV(uv.y, b))); }`;
 const quadP = prog(
   `#version 300 es
    layout(location=0) in vec2 aPos; uniform vec4 uRect; out vec2 vUv;
    void main(){ vUv=aPos; gl_Position=vec4(uRect.xy + aPos*uRect.zw, 0., 1.); }`,
   `#version 300 es
-   precision highp float; uniform sampler2D uTex; in vec2 vUv; out vec4 frag;
-   void main(){ frag=texture(uTex,vUv); }`);
+   precision highp float; uniform sampler2D uTex; uniform float uBand; in vec2 vUv; out vec4 frag;
+   ${BAND_GLSL}
+   void main(){ frag=sampleBand(uTex, vUv, uBand); }`);
 const FULLRECT = [-1, -1, 2, 2];
-// crop rect in NDC (bottom-up px -> clip space)
-const cropRectNDC = [cropBL.x/W*2-1, cropBL.y/H*2-1, cropBL.w/W*2, cropBL.h/H*2];
 const meshP = prog(
   `#version 300 es
    layout(location=0) in vec3 aPx; layout(location=1) in vec2 aUv;
@@ -204,13 +200,14 @@ const meshP = prog(
      gl_Position=vec4(aPx.xy/uRes*2.-1., aPx.z*2.-1., 1.); }`,
   `#version 300 es
    precision highp float;
-   uniform sampler2D uSkin; uniform sampler2D uLight; uniform sampler2D uOcc; uniform vec2 uRes;
-   uniform vec2 uLightOrigin; uniform vec2 uLightSize;
+   uniform sampler2D uSkin; uniform sampler2D uStack; uniform vec2 uRes;
+   uniform float uLightBand; uniform float uOccBand;
    uniform bool uUseLight; uniform bool uOcclude; uniform bool uFlat; uniform int uPass;
    uniform sampler2D uViewLut;
    uniform vec4 uLutSpec;   // N, tiles, min_ev, max_ev (from manifest.view_lut)
    uniform float uBlackT;   // "black discard" slider, /255 (default 0)
    in vec2 vUv; out vec4 frag;
+   ${BAND_GLSL}
    // anti-aliased pixel-art sampling: snap UV to the texel CENTRE but ramp across the seam over ~1px.
    vec4 texAA(sampler2D tx, vec2 uv){
      vec2 ts=vec2(textureSize(tx,0)); vec2 p=uv*ts; vec2 seam=floor(p+0.5);
@@ -236,14 +233,15 @@ const meshP = prog(
      if(s.a<0.004) discard;                // outside the silhouette
      if(uPass==0 && s.a<0.996) discard;    // opaque pass: solid texels (write depth)
      if(uPass==1 && s.a>=0.996) discard;   // edge pass: anti-aliased skin edge (blend)
-     // light + occlusion share the crop rect: sample both at the fragment's position
-     vec2 luv = (gl_FragCoord.xy - uLightOrigin)/uLightSize;
+     // light + occlusion are bands of the stacked video, sampled at the fragment's full-frame
+     // screen position (gl_FragCoord is px, bottom-up)
+     vec2 fuv = gl_FragCoord.xy / uRes;
      vec3 base = s.a>1e-4 ? s.rgb/s.a : vec3(0.0);   // un-premultiply -> straight colour
      // OCCLUSION matte (white = scenery is in front of the player here): the exporter
      // computed it in float from the two render depths, so it cuts at the render's exact
-     // silhouette -- no 8-bit depth fringe. Discard the fragment where it is set.
-     if (uOcclude && texture(uOcc, luv).r > 0.5) discard;
-     vec3 lraw = texture(uLight, luv).rgb;
+     // silhouette. Discard the fragment where it is set.
+     if (uOcclude && sampleBand(uStack, fuv, uOccBand).r > 0.5) discard;
+     vec3 lraw = sampleBand(uStack, fuv, uLightBand).rgb;
      // secondary occlusion safety: PURE-black light = the light render saw nothing here (the
      // lerped mesh drifted past the 16px dilated silhouette). Gated by uOcclude (it IS an
      // occlusion cull -- occlusion off shows the raw player). Default threshold 0 drops only
@@ -272,8 +270,7 @@ function upload(t, srcEl, premult) {
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !!premult);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, srcEl);
 }
-const tBg = tex(), tLight = tex();
-const tOcc = tex(true);   // NEAREST: the matte is a hard 0/1 mask, interpolating invents edges
+const tStack = tex();   // the single stacked video (bg/light/occ bands); LINEAR (light wants it)
 const tSkins = skins.map((img) => { const t = tex(); upload(t, img, true); return t; });  // LINEAR + premult (texel-AA safe)
 
 // view-transform 3D LUT: the scene's AgX/Filmic/... baked by the exporter; the mesh shader
@@ -409,10 +406,13 @@ const tnv = (id) => document.getElementById(id).valueAsNumber;
 }
 
 // ---- draw steps, shared by the composite and the debug views (the "view" <select>) ----
-function blitVideo(t, rect) {
+// blit band `band` of the stacked video over `rect` (full-screen = FULLRECT).
+function blitBand(band, rect) {
   gl.useProgram(quadP); gl.bindVertexArray(quadVao);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tStack);
   gl.uniform1i(gl.getUniformLocation(quadP, 'uTex'), 0);
+  gl.uniform1f(gl.getUniformLocation(quadP, 'uBand'), band);
+  gl.uniform1f(gl.getUniformLocation(quadP, 'uNBands'), NBANDS);
   gl.uniform4fv(gl.getUniformLocation(quadP, 'uRect'), rect);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
@@ -426,16 +426,15 @@ function drawPlayers(o) {
   gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), o.light ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uOcclude'), o.occlude ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uFlat'), o.wire ? 1 : 0);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tLight);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uLight'), 1);
-  gl.uniform2f(gl.getUniformLocation(meshP, 'uLightOrigin'), cropBL.x, cropBL.y);
-  gl.uniform2f(gl.getUniformLocation(meshP, 'uLightSize'), cropBL.w, cropBL.h);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tStack);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uStack'), 1);
+  gl.uniform1f(gl.getUniformLocation(meshP, 'uNBands'), NBANDS);
+  gl.uniform1f(gl.getUniformLocation(meshP, 'uLightBand'), BAND.light);
+  gl.uniform1f(gl.getUniformLocation(meshP, 'uOccBand'), BAND.occlusion);
   gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, tLut);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uViewLut'), 2);
   gl.uniform4f(gl.getUniformLocation(meshP, 'uLutSpec'),
                lutMeta.size, lutMeta.tiles, lutMeta.min_ev, lutMeta.max_ev);
-  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, tOcc);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uOcc'), 3);
   gl.uniform1f(gl.getUniformLocation(meshP, 'uBlackT'), tnv('tn_black') / 255);
   gl.activeTexture(gl.TEXTURE0);
   const uPass = gl.getUniformLocation(meshP, 'uPass');
@@ -473,15 +472,15 @@ function drawPlayers(o) {
   gl.disable(gl.DEPTH_TEST);
 }
 function drawComposite() {
-  if (ck('ck_bg')) blitVideo(tBg, FULLRECT);
+  if (ck('ck_bg')) blitBand(BAND.background, FULLRECT);
   if (ck('ck_pl')) drawPlayers({ occlude: ck('ck_occ'), light: ck('ck_li') });
 }
 // grid: every stream/step side by side, all in sync -- what each one contributes
 function drawGrid() {
   const tiles = [
-    () => blitVideo(tBg, FULLRECT),                          // background (shadows baked)
-    () => blitVideo(tLight, cropRectNDC),                    // screen-space light
-    () => blitVideo(tOcc, cropRectNDC),                      // occlusion matte
+    () => blitBand(BAND.background, FULLRECT),               // background (shadows baked)
+    () => blitBand(BAND.light, FULLRECT),                    // screen-space light band
+    () => blitBand(BAND.occlusion, FULLRECT),               // occlusion matte band
     () => drawPlayers({ wire: true, occlude: ck('ck_occ') }), // wireframe (occlusion applied)
     () => drawComposite(),                                   // final composite
   ];
@@ -498,16 +497,14 @@ function drawGrid() {
   gl.viewport(0, 0, W, H);
 }
 
-// Composite one frame, sampling the mesh at video time `t`. Held (returns without drawing)
-// while ANY decoder is mid-seek: the mesh pose (anim.bin) is exact, but a <video>'s currentTime
+// Composite one frame, sampling the mesh at video time `t`. Held (returns without drawing) while
+// the single decoder is mid-seek: the mesh pose (anim.bin) is exact, but a <video>'s currentTime
 // is an async seek -- until it lands the decoder still shows the OLD frame, and drawing the exact
-// mesh over that stale frame misaligns. So wait until every video has finished seeking, then draw.
+// mesh over that stale frame misaligns. So wait until the seek finishes, then draw. (One video
+// now, so all three bands are inherently in lockstep -- no cross-video sync needed.)
 function render(t) {
-  if (vids.some(v => v.seeking)) return;         // a seek is still in flight -- hold last frame
-  if (!vBg.paused) syncVideos();                 // keep light/occlusion locked to bg while playing
-  upload(tBg, vBg);
-  upload(tLight, vLight);
-  upload(tOcc, vOcc);
+  if (vComp.seeking) return;                     // a seek is still in flight -- hold last frame
+  upload(tStack, vComp);
   setPositions(ck('ck_snap') ? Math.floor(t * manifest.fps) / manifest.fps : t);   // snap to frame grid
   gl.viewport(0, 0, W, H);
   gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
@@ -516,11 +513,11 @@ function render(t) {
   const mode = (document.getElementById('dbgmode') || { value: 'composite' }).value;
   if (mode === 'grid') drawGrid();
   else if (mode === 'wire') {
-    if (ck('ck_bg')) blitVideo(tBg, FULLRECT);
+    if (ck('ck_bg')) blitBand(BAND.background, FULLRECT);
     drawPlayers({ wire: true, occlude: ck('ck_occ') });
   }
-  else if (mode === 'occ') blitVideo(tOcc, cropRectNDC);
-  else if (mode === 'light') blitVideo(tLight, cropRectNDC);
+  else if (mode === 'occ') blitBand(BAND.occlusion, FULLRECT);
+  else if (mode === 'light') blitBand(BAND.light, FULLRECT);
   else drawComposite();
   if (recTrack) recTrack.requestFrame();         // recording: push THIS frame into the capture
 }
@@ -538,16 +535,16 @@ function readout(t) {
 const hasRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
 function onVideoFrame(now, meta) {
   if (dead) return;
-  vBg.requestVideoFrameCallback(onVideoFrame);
+  vComp.requestVideoFrameCallback(onVideoFrame);
   render(meta.mediaTime);
   readout(meta.mediaTime);
 }
 function rafLoop() {
   if (dead) return;
   rafId = requestAnimationFrame(rafLoop);
-  if (hasRVFC && !vBg.paused) return;            // playing with rVFC: onVideoFrame drives it
-  render(vBg.currentTime);
-  readout(vBg.currentTime);
+  if (hasRVFC && !vComp.paused) return;            // playing with rVFC: onVideoFrame drives it
+  render(vComp.currentTime);
+  readout(vComp.currentTime);
 }
 
 // keys at the video rate -> default to SNAP (the pose every render saw; the depth mask is
@@ -566,17 +563,17 @@ document.getElementById('stats').textContent = statsText;
       : statsText;
   };
 }
-const vids = [vBg, vLight, vOcc];
+const vids = [vComp];
 const playbtn = document.getElementById('playbtn');
 playbtn.onclick = () => {
-  if (vBg.paused) { vids.forEach(v => v.play()); playbtn.textContent = '❚❚'; }
+  if (vComp.paused) { vids.forEach(v => v.play()); playbtn.textContent = '❚❚'; }
   else { vids.forEach(v => v.pause()); playbtn.textContent = '▶'; }
 };
 const scrub = document.getElementById('scrub');
 scrub.min = 0; scrub.max = manifest.frames - 1; scrub.step = 1;   // navigate by video frame
 const timeEl = document.getElementById('time');
-const duration = () => (isFinite(vBg.duration) && vBg.duration > 0)
-  ? vBg.duration : manifest.frames / manifest.fps;   // streamed webm: duration=Infinity
+const duration = () => (isFinite(vComp.duration) && vComp.duration > 0)
+  ? vComp.duration : manifest.frames / manifest.fps;   // streamed webm: duration=Infinity
 let scrubbing = false;
 scrub.onpointerdown = () => { scrubbing = true; };
 scrub.onpointerup = () => { scrubbing = false; };
@@ -618,9 +615,9 @@ if (recbtn) recbtn.onclick = () => {
     };
     let prevT = 0;
     const watch = setInterval(() => {                    // stop at the loop wrap
-      recbtn.textContent = '■ ' + vBg.currentTime.toFixed(1) + 's';
-      if (vBg.currentTime < prevT - 0.25) recStop();
-      else prevT = vBg.currentTime;
+      recbtn.textContent = '■ ' + vComp.currentTime.toFixed(1) + 's';
+      if (vComp.currentTime < prevT - 0.25) recStop();
+      else prevT = vComp.currentTime;
     }, 100);
     const safety = setTimeout(() => recStop(), duration() * 1000 + 3000);
     recStop = (discard) => {
@@ -637,13 +634,13 @@ if (recbtn) recbtn.onclick = () => {
     recbtn.disabled = false;
   };
   // a same-position seek may complete synchronously (no 'seeked' coming) -- start right away
-  if (vBg.seeking) vBg.addEventListener('seeked', startRec, { once: true });
+  if (vComp.seeking) vComp.addEventListener('seeked', startRec, { once: true });
   else startRec();
 };
 
 // debug handle (pause/seek from the console): __dbg.seek(5.0)
 window.__dbg = {
-  vBg, vLight, vOcc, keys, K, keysFps, setSkin,
+  vComp, keys, K, keysFps, setSkin,
   seek(t) { for (const v of vids) { v.pause(); v.currentTime = t; } },
 };
 let rafId = 0, dead = false;
@@ -655,5 +652,5 @@ window.__nskTeardown = () => {
   for (const v of vids) { v.pause(); URL.revokeObjectURL(v.src); }
   document.getElementById('skins').innerHTML = '';
 };
-if (hasRVFC) vBg.requestVideoFrameCallback(onVideoFrame);   // playback driver
+if (hasRVFC) vComp.requestVideoFrameCallback(onVideoFrame);   // playback driver
 rafLoop();                                                   // paused/UI driver + fallback
