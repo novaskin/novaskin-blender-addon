@@ -67,8 +67,9 @@ if (!(manifest.video && manifest.bands && manifest.view_lut)) {
   throw 'unsupported export format';
 }
 const [W, H] = manifest.resolution;
-const NBANDS = manifest.bands.count;          // 3: bg=0 (top), light=1, occ=2 (bottom)
+const NBANDS = manifest.bands.count;          // 3: bg=0, light=1, occ=2
 const BAND = manifest.bands;
+const STACK_V = manifest.bands.vertical !== false;   // vertical (landscape) vs horizontal
 
 // --- mesh.bin: NSKM | u32 version, welded, unique, ntris | zlib(uv u16x2, src u16, tris u16x3)
 const mb = await bin(manifest.mesh.file);
@@ -176,13 +177,17 @@ function sh(t, s) { const o = gl.createShader(t); gl.shaderSource(o, s); gl.comp
 function prog(v, f) { const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, v));
   gl.attachShader(p, sh(gl.FRAGMENT_SHADER, f)); gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw gl.getProgramInfoLog(p); return p; }
-// the single stacked video holds NBANDS full-frame bands top-to-bottom (bg/light/occ). With
-// UNPACK_FLIP_Y the top band is the highest V, so band b at full-frame vertical t (0=bottom,
-// 1=top) is texture V = (N-1-b+t)/N; U is unchanged.
+// the single stacked video holds NBANDS full-frame bands (bg/light/occ). Landscape frames are
+// stacked VERTICALLY (top-to-bottom) -- with UNPACK_FLIP_Y the top band (bg) is the highest V,
+// so band b at full-frame t is V=(N-1-b+t)/N. Portrait frames are stacked HORIZONTALLY
+// (left-to-right, no U flip), so band b is U=(b+u)/N. `uStackV` picks the axis.
 const BAND_GLSL = `
-   uniform float uNBands;
-   float bandV(float t, float b){ return (uNBands - 1.0 - b + t) / uNBands; }
-   vec4 sampleBand(sampler2D tx, vec2 uv, float b){ return texture(tx, vec2(uv.x, bandV(uv.y, b))); }`;
+   uniform float uNBands; uniform bool uStackV;
+   vec2 bandUV(vec2 uv, float b){
+     return uStackV ? vec2(uv.x, (uNBands - 1.0 - b + uv.y) / uNBands)
+                    : vec2((b + uv.x) / uNBands, uv.y);
+   }
+   vec4 sampleBand(sampler2D tx, vec2 uv, float b){ return texture(tx, bandUV(uv, b)); }`;
 const quadP = prog(
   `#version 300 es
    layout(location=0) in vec2 aPos; uniform vec4 uRect; out vec2 vUv;
@@ -413,6 +418,7 @@ function blitBand(band, rect) {
   gl.uniform1i(gl.getUniformLocation(quadP, 'uTex'), 0);
   gl.uniform1f(gl.getUniformLocation(quadP, 'uBand'), band);
   gl.uniform1f(gl.getUniformLocation(quadP, 'uNBands'), NBANDS);
+  gl.uniform1i(gl.getUniformLocation(quadP, 'uStackV'), STACK_V ? 1 : 0);
   gl.uniform4fv(gl.getUniformLocation(quadP, 'uRect'), rect);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
@@ -429,6 +435,7 @@ function drawPlayers(o) {
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tStack);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uStack'), 1);
   gl.uniform1f(gl.getUniformLocation(meshP, 'uNBands'), NBANDS);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uStackV'), STACK_V ? 1 : 0);
   gl.uniform1f(gl.getUniformLocation(meshP, 'uLightBand'), BAND.light);
   gl.uniform1f(gl.getUniformLocation(meshP, 'uOccBand'), BAND.occlusion);
   gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, tLut);

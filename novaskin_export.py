@@ -4604,12 +4604,13 @@ def _anim_exr_read(ff, path, item, W, H, gray):
     return rgb[::-1].reshape(-1, 3)
 
 
-def _anim_encode(adir, fps):
-    """vstack the bg / light / occlusion PNG sequences into ONE WebM/VP9 (composite.webm) so a
-    single decoder holds all three in perfect frame lockstep. All three are full-frame (same
-    width) -> band 0 = bg, band 1 = light, band 2 = occlusion, top to bottom. Lossy, one CRF
-    (ANIM_STACK_CRF), plain yuv420p. Returns (ok, message); if ffmpeg is missing, writes
-    encode.sh/.bat with the command instead."""
+def _anim_encode(adir, fps, vertical):
+    """Stack the bg / light / occlusion PNG sequences into ONE WebM/VP9 (composite.webm) so a
+    single decoder holds all three in perfect frame lockstep. Band 0 = bg, 1 = light, 2 = occ.
+    `vertical` (landscape frames) => vstack top-to-bottom (W x 3H); else (portrait) => hstack
+    left-to-right (3W x H) -- stacking along the SHORTER axis keeps the composite near-square and
+    its max dimension small (hardware decoders cap ~4-8k). Lossy, one CRF (ANIM_STACK_CRF), plain
+    yuv420p. Returns (ok, message); if ffmpeg is missing, writes encode.sh/.bat with the command."""
     import subprocess, sys
     seq = os.path.join(adir, "seq")
     bands = [b for b in ("bg", "light", "occ")
@@ -4620,7 +4621,8 @@ def _anim_encode(adir, fps):
         # every input -- otherwise only the first gets `fps` and the rest default to 25, and
         # the bands drift out of sync (bg ends early while light/occ keep playing).
         inputs += ["-framerate", str(fps), "-i", os.path.join(seq, b, "%04d.png")]
-    fc = "".join(f"[{i}:v]" for i in range(len(bands))) + f"vstack=inputs={len(bands)}[v]"
+    stack = "vstack" if vertical else "hstack"
+    fc = "".join(f"[{i}:v]" for i in range(len(bands))) + f"{stack}=inputs={len(bands)}[v]"
     ff = _ffmpeg_path()
     def cmd():
         return [ff or "ffmpeg", "-y", *inputs,
@@ -4938,11 +4940,13 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             "fps": fps,
             "frames": nf,
             "resolution": [W, H],
-            # ONE video (composite.webm), the three full-frame streams vstacked top-to-bottom
-            # so a single decoder keeps them in perfect frame lockstep. Each band is W x H; the
-            # video is W x (3*H). Sample band b at texture (sx/W, (sy + b*H) / (3*H)).
+            # ONE video (composite.webm): the three full-frame streams stacked into 3 bands so
+            # a single decoder keeps them in perfect frame lockstep. Stacked along the SHORTER
+            # axis to stay near-square: `vertical` (landscape) -> W x 3H, bands top-to-bottom;
+            # else (portrait) -> 3W x H, bands left-to-right. Band 0 = bg, 1 = light, 2 = occ.
             "video": "composite.webm",
-            "bands": {"background": 0, "light": 1, "occlusion": 2, "count": 3},
+            "bands": {"background": 0, "light": 1, "occlusion": 2, "count": 3,
+                      "vertical": bool(W >= H)},
             # occlusion band: per-pixel player-vs-scenery matte. 1 (white) = scenery is in
             # front of the player here -> the viewer discards the player fragment; 0 = draw.
             # Computed in FLOAT from the two render depths so it cuts at the render's exact
@@ -4972,7 +4976,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             json.dump(manifest, fh, indent=2)
         yield prog("mesh.bin / anim.bin / manifest.json")
         if ANIM_ENCODE:
-            ok, msg = _anim_encode(adir, fps)
+            ok, msg = _anim_encode(adir, fps, W >= H)
             print("[ANIM] encode:", msg)
             if op is not None and not ok:
                 # encode failed/skipped -> the PNG sequences are kept; surface it instead of
