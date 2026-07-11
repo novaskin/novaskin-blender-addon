@@ -2992,6 +2992,14 @@ def _anim_dilate_light(rgb, covered, W, H, passes=None):
         for axis, shift in ((0, 1), (0, -1), (1, 1), (1, -1)):
             sm = np.roll(m, shift, axis)
             sc = np.roll(img, shift, axis)
+            # np.roll WRAPS around the frame border -- kill the wrapped edge so light near the
+            # top doesn't bleed to the bottom (invisible when the video was cropped, but the
+            # streams are now saved full-frame for stacking, so the wrap would show).
+            edge = 0 if shift == 1 else -1
+            if axis == 0:
+                sm[edge, :] = False
+            else:
+                sm[:, edge] = False
             take = (~m) & sm
             img[take] = sc[take]
             m |= take
