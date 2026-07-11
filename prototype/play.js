@@ -499,32 +499,40 @@ function drawGrid() {
 }
 
 function draw() {
-  if (!vBg.paused) syncVideos();     // keep light/occlusion locked to bg while playing
-  upload(tBg, vBg);
-  upload(tLight, vLight);
-  upload(tOcc, vOcc);
-  // snap: sample the mesh at the video's frame grid (the pose the fg/light frames saw) instead
-  // of continuously -- isolates the sub-frame component of mesh-vs-video misregistration.
-  const t = vBg.currentTime;
-  setPositions(ck('ck_snap') ? Math.floor(t * manifest.fps) / manifest.fps : t);
-  gl.viewport(0, 0, W, H);
-  gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
-  gl.clearColor(0.13, 0.13, 0.13, 1);
-  gl.clear(gl.COLOR_BUFFER_BIT);
-  const mode = (document.getElementById('dbgmode') || { value: 'composite' }).value;
-  if (mode === 'grid') drawGrid();
-  else if (mode === 'wire') {
-    if (ck('ck_bg')) blitVideo(tBg, FULLRECT);
-    drawPlayers({ wire: true, occlude: ck('ck_occ') });
+  if (!dead) rafId = requestAnimationFrame(draw);
+  // Frame-exact present: the mesh pose (from anim.bin) is exact for the frame, but setting a
+  // <video>'s currentTime is an async seek -- until it lands, the decoder still shows the OLD
+  // frame. Drawing the mesh over that stale frame is the misalignment. So HOLD the composite
+  // while ANY decoder is mid-seek (scrubbing/stepping always seeks; playback re-seeks only on
+  // drift), and only sample the mesh + composite once every video has finished seeking.
+  const seeking = vids.some(v => v.seeking);
+  if (!seeking) {
+    if (!vBg.paused) syncVideos();   // keep light/occlusion locked to bg while playing
+    upload(tBg, vBg);
+    upload(tLight, vLight);
+    upload(tOcc, vOcc);
+    // snap: sample the mesh at the video's frame grid (the pose every render saw)
+    const t = vBg.currentTime;
+    setPositions(ck('ck_snap') ? Math.floor(t * manifest.fps) / manifest.fps : t);
+    gl.viewport(0, 0, W, H);
+    gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+    gl.clearColor(0.13, 0.13, 0.13, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    const mode = (document.getElementById('dbgmode') || { value: 'composite' }).value;
+    if (mode === 'grid') drawGrid();
+    else if (mode === 'wire') {
+      if (ck('ck_bg')) blitVideo(tBg, FULLRECT);
+      drawPlayers({ wire: true, occlude: ck('ck_occ') });
+    }
+    else if (mode === 'occ') blitVideo(tOcc, cropRectNDC);
+    else if (mode === 'light') blitVideo(tLight, cropRectNDC);
+    else drawComposite();
+    if (recTrack) recTrack.requestFrame();   // recording: push THIS frame into the capture
   }
-  else if (mode === 'occ') blitVideo(tOcc, cropRectNDC);
-  else if (mode === 'light') blitVideo(tLight, cropRectNDC);
-  else drawComposite();
+  // the readout tracks the target frame even while the composite is held mid-seek
   const fr = Math.min(manifest.frames - 1, Math.floor(vBg.currentTime * manifest.fps));
   if (!scrubbing) scrub.value = fr;              // scrub is a frame index (0 .. frames-1)
   timeEl.textContent = `f${fr}/${manifest.frames - 1} · ${vBg.currentTime.toFixed(1)}s`;
-  if (recTrack) recTrack.requestFrame();   // recording: push THIS frame into the capture
-  if (!dead) rafId = requestAnimationFrame(draw);
 }
 
 // keys at the video rate -> default to SNAP (the pose every render saw; the depth mask is
