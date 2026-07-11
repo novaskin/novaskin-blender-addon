@@ -498,41 +498,56 @@ function drawGrid() {
   gl.viewport(0, 0, W, H);
 }
 
-function draw() {
-  if (!dead) rafId = requestAnimationFrame(draw);
-  // Frame-exact present: the mesh pose (from anim.bin) is exact for the frame, but setting a
-  // <video>'s currentTime is an async seek -- until it lands, the decoder still shows the OLD
-  // frame. Drawing the mesh over that stale frame is the misalignment. So HOLD the composite
-  // while ANY decoder is mid-seek (scrubbing/stepping always seeks; playback re-seeks only on
-  // drift), and only sample the mesh + composite once every video has finished seeking.
-  const seeking = vids.some(v => v.seeking);
-  if (!seeking) {
-    if (!vBg.paused) syncVideos();   // keep light/occlusion locked to bg while playing
-    upload(tBg, vBg);
-    upload(tLight, vLight);
-    upload(tOcc, vOcc);
-    // snap: sample the mesh at the video's frame grid (the pose every render saw)
-    const t = vBg.currentTime;
-    setPositions(ck('ck_snap') ? Math.floor(t * manifest.fps) / manifest.fps : t);
-    gl.viewport(0, 0, W, H);
-    gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
-    gl.clearColor(0.13, 0.13, 0.13, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    const mode = (document.getElementById('dbgmode') || { value: 'composite' }).value;
-    if (mode === 'grid') drawGrid();
-    else if (mode === 'wire') {
-      if (ck('ck_bg')) blitVideo(tBg, FULLRECT);
-      drawPlayers({ wire: true, occlude: ck('ck_occ') });
-    }
-    else if (mode === 'occ') blitVideo(tOcc, cropRectNDC);
-    else if (mode === 'light') blitVideo(tLight, cropRectNDC);
-    else drawComposite();
-    if (recTrack) recTrack.requestFrame();   // recording: push THIS frame into the capture
+// Composite one frame, sampling the mesh at video time `t`. Held (returns without drawing)
+// while ANY decoder is mid-seek: the mesh pose (anim.bin) is exact, but a <video>'s currentTime
+// is an async seek -- until it lands the decoder still shows the OLD frame, and drawing the exact
+// mesh over that stale frame misaligns. So wait until every video has finished seeking, then draw.
+function render(t) {
+  if (vids.some(v => v.seeking)) return;         // a seek is still in flight -- hold last frame
+  if (!vBg.paused) syncVideos();                 // keep light/occlusion locked to bg while playing
+  upload(tBg, vBg);
+  upload(tLight, vLight);
+  upload(tOcc, vOcc);
+  setPositions(ck('ck_snap') ? Math.floor(t * manifest.fps) / manifest.fps : t);   // snap to frame grid
+  gl.viewport(0, 0, W, H);
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+  gl.clearColor(0.13, 0.13, 0.13, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  const mode = (document.getElementById('dbgmode') || { value: 'composite' }).value;
+  if (mode === 'grid') drawGrid();
+  else if (mode === 'wire') {
+    if (ck('ck_bg')) blitVideo(tBg, FULLRECT);
+    drawPlayers({ wire: true, occlude: ck('ck_occ') });
   }
-  // the readout tracks the target frame even while the composite is held mid-seek
-  const fr = Math.min(manifest.frames - 1, Math.floor(vBg.currentTime * manifest.fps));
+  else if (mode === 'occ') blitVideo(tOcc, cropRectNDC);
+  else if (mode === 'light') blitVideo(tLight, cropRectNDC);
+  else drawComposite();
+  if (recTrack) recTrack.requestFrame();         // recording: push THIS frame into the capture
+}
+// the readout tracks the target frame even while the composite is held mid-seek
+function readout(t) {
+  const fr = Math.min(manifest.frames - 1, Math.floor(t * manifest.fps));
   if (!scrubbing) scrub.value = fr;              // scrub is a frame index (0 .. frames-1)
-  timeEl.textContent = `f${fr}/${manifest.frames - 1} · ${vBg.currentTime.toFixed(1)}s`;
+  timeEl.textContent = `f${fr}/${manifest.frames - 1} · ${t.toFixed(1)}s`;
+}
+
+// Playback is driven by requestVideoFrameCallback: it fires when the background decoder actually
+// PRESENTS a frame (not on a screen tick that guessed a time), giving meta.mediaTime = the exact
+// frame on screen, so the mesh is sampled at precisely that frame. The rAF loop then only has to
+// cover the paused case (UI edits / scrub redraws) and browsers without rVFC.
+const hasRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+function onVideoFrame(now, meta) {
+  if (dead) return;
+  vBg.requestVideoFrameCallback(onVideoFrame);
+  render(meta.mediaTime);
+  readout(meta.mediaTime);
+}
+function rafLoop() {
+  if (dead) return;
+  rafId = requestAnimationFrame(rafLoop);
+  if (hasRVFC && !vBg.paused) return;            // playing with rVFC: onVideoFrame drives it
+  render(vBg.currentTime);
+  readout(vBg.currentTime);
 }
 
 // keys at the video rate -> default to SNAP (the pose every render saw; the depth mask is
@@ -640,4 +655,5 @@ window.__nskTeardown = () => {
   for (const v of vids) { v.pause(); URL.revokeObjectURL(v.src); }
   document.getElementById('skins').innerHTML = '';
 };
-draw();
+if (hasRVFC) vBg.requestVideoFrameCallback(onVideoFrame);   // playback driver
+rafLoop();                                                   // paused/UI driver + fallback
