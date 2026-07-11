@@ -6055,10 +6055,11 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
             box = layout.box()
             box.label(text="Animated", icon='RENDER_ANIMATION')
             # which composite bands to render (drop Occlusion when nothing occludes the players)
-            brow = box.row(align=True)
-            brow.prop(st, "anim_background", text="BG", toggle=True)
-            brow.prop(st, "anim_light", text="Light", toggle=True)
-            brow.prop(st, "anim_occlusion", text="Occ", toggle=True)
+            bcol = box.column(align=True)
+            bcol.label(text="Bands:")
+            bcol.prop(st, "anim_background")
+            bcol.prop(st, "anim_light")
+            bcol.prop(st, "anim_occlusion")
             if not running:               # while running, the top progress bar is the indicator
                 # draft: first ~N s at draft resolution/samples -- the iteration button
                 box.operator("render.novaskin_animated",
