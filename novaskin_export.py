@@ -300,12 +300,13 @@ COMPOSITE_BASE_LABELS = ["head", "body",
                          "arm_left_{variant}", "arm_right_{variant}",
                          "leg_left", "leg_right"]
 
-# ---- ANIMATED EXPORT (simplified mode -- see docs/animated-export-plan.md) ----
-# Exports <OUT_DIR>/animated/: three lossy videos (background with baked player shadows,
-# per-pixel foreground occlusion layer, combined player light) + the player base-layer
-# geometry as a screen-space mesh stream (mesh.bin static + anim.bin per-frame positions).
-# Base layer only, no per-player toggles, players always drawn; optional-layer marks are
-# IGNORED here (marked objects render as plain scenery). Frame range = the scene's.
+# ---- ANIMATED EXPORT (see docs/animated-export-plan.md) ----
+# Exports <OUT_DIR>/animated/: ONE lossy video (composite.webm -- background with baked player
+# shadows, combined player light, and the player-vs-scenery occlusion matte vstacked into three
+# full-frame bands, so a single decoder keeps them in perfect frame lockstep) + the player mesh
+# as a screen-space stream (mesh.bin static + anim.bin per-frame positions) + view_lut.png.
+# Optional-layer marks are IGNORED here (marked objects render as plain scenery). Frame range =
+# the scene's.
 ANIM_OUT_SUBDIR = "animated"
 ANIM_KEYS_STEP = 1          # mesh keys every Nth video frame. 1 = keys AT the video rate: the
                             # viewer snaps the pose to the exact one every render saw (no lerp
@@ -316,7 +317,6 @@ ANIM_Z_BITS = 12            # depth quantization: 12 bits = 4095 levels (plenty 
 # The 'Export Animation Draft' button renders only the first few seconds (fast iteration on
 # look/quality) instead of the whole frame range. The full export uses the scene's range.
 ANIM_DRAFT_SECONDS = 3
-ANIM_CRF = {"bg": 32, "fg": 32, "light": 38}   # VP9 quality per stream (legacy per-stream)
 # The three streams (bg / light / occlusion) are vstacked into ONE video so a single decoder
 # keeps them in perfect frame lockstep (independent <video> elements drift by a frame, which
 # reads as wrong on the WebGL composite). One codec for all three => lossy, one CRF: the
@@ -4648,9 +4648,10 @@ def _anim_encode(adir, fps):
 
 def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     """Generator for the animated export (one yield per unit of work, like _render_steps).
-    Per frame: background (players camera-invisible, shadows baked) + scenery depth (1-sample
-    Z, per-pixel occlusion in the viewer), and the combined light; plus mesh keys every
-    ANIM_KEYS_STEP frames. Writes mesh.bin/anim.bin/manifest.json and encodes the videos."""
+    Per frame renders three full-frame streams -- background (players camera-invisible, shadows
+    baked), combined player light, and the player-vs-scenery occlusion matte -- plus mesh keys
+    every ANIM_KEYS_STEP frames. Writes mesh.bin/anim.bin/manifest.json + view_lut.png and
+    vstacks the three streams into ONE composite.webm."""
     s = bpy.context.scene
     f0 = s.frame_start if frame_start is None else frame_start
     f1 = s.frame_end if frame_end is None else frame_end
@@ -4894,10 +4895,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             # geometry-exact, no lighting needed, so it is cheap. Its alpha marks player
             # pixels; its Z (in the SAME File Output EXR) is the player's front surface.
             # Comparing the two camera depths in FLOAT -- scenery in FRONT of the player =>
-            # occluded -- cuts at the render's exact silhouette, no 8-bit depth fringe (the
-            # reason scene_depth.webm was dropped). Naturally sparse -> the lossless webm is
-            # tiny. Correct whether the viewer toggles an overlay on or off: the base sits
-            # inside the shell, so "occluded where any player surface is" holds for both.
+            # occluded -- cuts at the render's exact silhouette (a per-pixel depth video would
+            # fringe from 8-bit quantization). Lossy in the stacked composite -> the hard edge
+            # softens a little. Correct whether the viewer toggles an overlay on or off: the
+            # base sits inside the shell, so "occluded where any player surface is" holds.
             setup()
             for o in overlay_parts:
                 o.hide_render = False                 # FULL player for the occlusion silhouette
@@ -4932,7 +4933,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), keys,
                                 ANIM_QUANT, fps / ANIM_KEYS_STEP)
         manifest = {
-            "animated_version": 5,   # 5: optional streams; screen light stores sRGB(0.5*L)
+            "animated_version": 6,   # 6: single composite.webm (bg/light/occ bands)
             "addon_version": ADDON_VERSION,
             "fps": fps,
             "frames": nf,
