@@ -4616,11 +4616,14 @@ def _anim_encode(adir, fps):
              if os.path.exists(os.path.join(seq, b, "0001.png"))]
     inputs = []
     for b in bands:
-        inputs += ["-i", os.path.join(seq, b, "%04d.png")]
+        # -framerate is a per-INPUT option (applies to the NEXT -i only), so it MUST precede
+        # every input -- otherwise only the first gets `fps` and the rest default to 25, and
+        # the bands drift out of sync (bg ends early while light/occ keep playing).
+        inputs += ["-framerate", str(fps), "-i", os.path.join(seq, b, "%04d.png")]
     fc = "".join(f"[{i}:v]" for i in range(len(bands))) + f"vstack=inputs={len(bands)}[v]"
     ff = _ffmpeg_path()
     def cmd():
-        return [ff or "ffmpeg", "-y", "-framerate", str(fps), *inputs,
+        return [ff or "ffmpeg", "-y", *inputs,
                 "-filter_complex", fc, "-map", "[v]",
                 "-c:v", "libvpx-vp9", "-crf", str(ANIM_STACK_CRF), "-b:v", "0",
                 "-row-mt", "1", "-cpu-used", "4", "-pix_fmt", "yuv420p",
