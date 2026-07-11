@@ -323,6 +323,12 @@ ANIM_DRAFT_SECONDS = 3
 # occlusion matte's hard edge softens a little (accepted -- a 1-frame desync is far worse than
 # a ~1px fuzzy cut). Lower = crisper occ + bigger file.
 ANIM_STACK_CRF = 30
+# Which composite.webm bands to render (panel toggles sync these; defaults for script launch).
+# The player still needs the BACKGROUND render when OCCLUSION is on (its scenery depth drives
+# the matte), even if the bg band itself is dropped.
+ANIM_DO_BG = True
+ANIM_DO_LIGHT = True
+ANIM_DO_OCC = True
 ANIM_ENCODE = True          # run ffmpeg after rendering (else keep PNG sequences + script)
 ANIM_KEEP_SEQUENCES = False  # keep seq/ PNGs after a successful encode
 # Resume an interrupted export: skip frames whose PNGs already exist in seq/. A crash or
@@ -2968,11 +2974,12 @@ def render_all(op=None, draft=False):
 # ----------------------- ANIMATED EXPORT (docs/animated-export-plan.md) -----------------------
 
 def _anim_frame_cached(adir, i):
-    """True if frame i's four PNGs already exist (non-empty) -- resume skips re-rendering."""
+    """True if frame i's PNGs for the ENABLED bands already exist (non-empty) -- resume skips
+    re-rendering. Only the bands actually saved (per the ANIM_DO_* toggles) are required."""
     fn = f"{i + 1:04d}.png"
-    return all(os.path.exists(p) and os.path.getsize(p) > 0
-               for p in (os.path.join(adir, "seq", k, fn)
-                         for k in ("bg", "occ", "light")))
+    dirs = [k for k, on in (("bg", ANIM_DO_BG), ("light", ANIM_DO_LIGHT), ("occ", ANIM_DO_OCC)) if on]
+    return bool(dirs) and all(os.path.exists(p) and os.path.getsize(p) > 0
+                              for p in (os.path.join(adir, "seq", k, fn) for k in dirs))
 
 
 def _anim_dilate_light(rgb, covered, W, H, passes=None):
@@ -4654,6 +4661,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     baked), combined player light, and the player-vs-scenery occlusion matte -- plus mesh keys
     every ANIM_KEYS_STEP frames. Writes mesh.bin/anim.bin/manifest.json + view_lut.png and
     vstacks the three streams into ONE composite.webm."""
+    if not (ANIM_DO_BG or ANIM_DO_LIGHT or ANIM_DO_OCC):
+        if op is not None:
+            op.report({'ERROR'}, "NovaSkin animated: enable at least one band (BG / Light / Occ)")
+        return
     s = bpy.context.scene
     f0 = s.frame_start if frame_start is None else frame_start
     f1 = s.frame_end if frame_end is None else frame_end
@@ -4841,54 +4852,61 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                 yield prog(f"frame {i+1}/{nf} (cached)")
                 continue
             s.frame_set(f)
-            # 1) BACKGROUND: players camera-invisible (still casting -> shadows baked in)
-            # 1) BACKGROUND: players CAMERA-INVISIBLE (still casting -> shadows baked in).
-            # The visible-mannequin experiment is gone: any lerped-mesh drift exposed a gray
-            # rim; with invisible players the same drift exposes scenery -- correct content.
-            setup()
-            sc = {o: o.visible_camera for o in base_parts}
-            for o in base_parts:
-                o.visible_camera = False
-            bpy.context.view_layer.update()
-            bg, rW, rH = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT)
-            for o, v in sc.items():
-                o.visible_camera = v
-            buf = np.ones((bg.shape[0], 4), 'float32')
-            buf[:, :3] = _to_display(bg)
-            _save_image(buf.reshape(-1), rW, rH, os.path.join(adir, "seq", "bg", fn))
-            # SCENERY depth from THIS render's Z (players camera-invisible), read BEFORE the
-            # light render overwrites the File Output EXR. Both z's are normalized to the
-            # players' band by the compositor; ffmpeg's EXR read applies a limited-range
-            # squeeze the far plateau reveals -- de-range so 0..1 is the band fraction.
-            zr = _anim_exr_read(ff, os.path.join(exr_dir, "zz.exr"), 'zz', rW, rH, gray=True)
-            zvals, zcnts = np.unique(np.round(zr, 3), return_counts=True)
-            zfar = float(zvals[np.argmax(zcnts)])
-            zlo, zsc = (0.0, 1.0) if zfar > 0.99 else (16.0 / 255.0, 219.0 / 255.0)
-            z_scene = np.clip((zr - zlo) / zsc, 0.0, 1.0)   # scenery depth (band fraction)
+            rW = rH = None
+            # 1) BACKGROUND: players CAMERA-INVISIBLE (still casting -> shadows baked in). Render
+            # it if the bg band is wanted OR occlusion is (the matte needs its scenery depth).
+            if ANIM_DO_BG or ANIM_DO_OCC:
+                setup()
+                sc = {o: o.visible_camera for o in base_parts}
+                for o in base_parts:
+                    o.visible_camera = False
+                bpy.context.view_layer.update()
+                bg, rW, rH = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT)
+                for o, v in sc.items():
+                    o.visible_camera = v
+                if ANIM_DO_BG:
+                    buf = np.ones((bg.shape[0], 4), 'float32')
+                    buf[:, :3] = _to_display(bg)
+                    _save_image(buf.reshape(-1), rW, rH, os.path.join(adir, "seq", "bg", fn))
+                if ANIM_DO_OCC:
+                    # SCENERY depth, read BEFORE the light/occ renders overwrite the EXR. Both
+                    # z's are normalized to the players' band by the compositor; ffmpeg's EXR
+                    # read squeezes to limited range (far plateau reveals it) -- de-range so
+                    # 0..1 is the band fraction.
+                    zr = _anim_exr_read(ff, os.path.join(exr_dir, "zz.exr"), 'zz', rW, rH, gray=True)
+                    zvals, zcnts = np.unique(np.round(zr, 3), return_counts=True)
+                    zfar = float(zvals[np.argmax(zcnts)])
+                    zlo, zsc = (0.0, 1.0) if zfar > 0.99 else (16.0 / 255.0, 219.0 / 255.0)
+                    z_scene = np.clip((zr - zlo) / zsc, 0.0, 1.0)
 
-            # 2) the light render -- players gray VISIBLE, scenery camera-invisible (still
-            # lighting/shadowing) -- shipped as the light video. Stored sRGB-encoded so the
-            # viewer's pow(2.2) decode recovers the LINEAR light; the view transform (AgX)
-            # is applied by the viewer as the final step, after skin x light.
-            setup()
-            sc = {o: o.visible_camera for o in scenery}
-            for o in scenery:
-                o.visible_camera = False
-            bpy.context.view_layer.update()
-            L, _, _ = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT,
-                                                            transparent=True)
-            for o, v in sc.items():
-                o.visible_camera = v
-            la = np.clip(L[:, 3], 0.0, 1.0)
-            lst = np.where(la[:, None] > 1e-4,
-                           L[:, :3] / np.maximum(la[:, None], 1e-4), 0.0)
-            lsd = _anim_dilate_light(lst, la > 0.01, rW, rH)
-            lbuf = np.ones((L.shape[0], 4), 'float32')
-            lbuf[:, :3] = _lin_to_srgb(lsd)
-            # full-frame (not cropped): the three streams are vstacked into ONE video, so
-            # they must share width; the unused (black) regions cost ~nothing in the encode.
-            _save_image(lbuf.reshape(-1), rW, rH, os.path.join(adir, "seq", "light", fn))
+            # 2) LIGHT -- players gray VISIBLE, scenery camera-invisible. sRGB-encoded so the
+            # viewer's pow(2.2) decode recovers linear light; the view transform is applied in
+            # the viewer, after skin x light.
+            if ANIM_DO_LIGHT:
+                setup()
+                sc = {o: o.visible_camera for o in scenery}
+                for o in scenery:
+                    o.visible_camera = False
+                bpy.context.view_layer.update()
+                L, lW, lH = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT,
+                                                                  transparent=True)
+                for o, v in sc.items():
+                    o.visible_camera = v
+                if rW is None:
+                    rW, rH = lW, lH
+                la = np.clip(L[:, 3], 0.0, 1.0)
+                lst = np.where(la[:, None] > 1e-4,
+                               L[:, :3] / np.maximum(la[:, None], 1e-4), 0.0)
+                lsd = _anim_dilate_light(lst, la > 0.01, rW, rH)
+                lbuf = np.ones((L.shape[0], 4), 'float32')
+                lbuf[:, :3] = _lin_to_srgb(lsd)
+                # full-frame (not cropped): the streams stack into ONE video, so they share
+                # dims; the unused (black) regions cost ~nothing in the encode.
+                _save_image(lbuf.reshape(-1), rW, rH, os.path.join(adir, "seq", "light", fn))
 
+            if not ANIM_DO_OCC:
+                yield prog(f"frame {i+1}/{nf} render")
+                continue
             # 3) OCCLUSION matte, rendered with the FULL player (base + overlays visible):
             # the light render above is BASE-ONLY (its base light must stay overlay-free), so
             # its silhouette misses the overlay shells (hat brim, jacket) that extend past the
@@ -4929,11 +4947,19 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             obuf[:, 0] = obuf[:, 1] = obuf[:, 2] = occ
             _save_image(obuf.reshape(-1), rW, rH, os.path.join(adir, "seq", "occ", fn),
                         colorspace='Non-Color')   # full-frame; vstacked with bg + light
-            yield prog(f"frame {i+1}/{nf} render + light + matte")
+            yield prog(f"frame {i+1}/{nf} render")
 
         welded, unique, ntris = _anim_write_mesh(os.path.join(adir, "mesh.bin"), st)
         K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), keys,
                                 ANIM_QUANT, fps / ANIM_KEYS_STEP)
+        # which bands the composite actually has, in stack order (matches _anim_encode); a
+        # disabled band is simply absent, and the viewer skips it.
+        band_order = [name for (name, on) in (("background", ANIM_DO_BG),
+                                              ("light", ANIM_DO_LIGHT),
+                                              ("occlusion", ANIM_DO_OCC)) if on]
+        bands = {name: idx for idx, name in enumerate(band_order)}
+        bands["count"] = len(band_order)
+        bands["vertical"] = bool(W >= H)
         manifest = {
             "animated_version": 6,   # 6: single composite.webm (bg/light/occ bands)
             "addon_version": ADDON_VERSION,
@@ -4945,8 +4971,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             # axis to stay near-square: `vertical` (landscape) -> W x 3H, bands top-to-bottom;
             # else (portrait) -> 3W x H, bands left-to-right. Band 0 = bg, 1 = light, 2 = occ.
             "video": "composite.webm",
-            "bands": {"background": 0, "light": 1, "occlusion": 2, "count": 3,
-                      "vertical": bool(W >= H)},
+            "bands": bands,
             # occlusion band: per-pixel player-vs-scenery matte. 1 (white) = scenery is in
             # front of the player here -> the viewer discards the player fragment; 0 = draw.
             # Computed in FLOAT from the two render depths so it cuts at the render's exact
@@ -5303,6 +5328,19 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
     static_sprites: BoolProperty(
         name="Sprites", default=True,
         description="Export Mesh v2: render the sprite-type scenery layers. OFF reuses the previous")
+    # Animated export: which of the three composite.webm bands to render. Turning one OFF drops it
+    # from the stacked video (and the viewer skips it). E.g. disable Occlusion when nothing in the
+    # scene occludes the players -- one fewer render pass and band.
+    anim_background: BoolProperty(
+        name="Background", default=True,
+        description="Animated: include the background band (the scenery behind the players)")
+    anim_light: BoolProperty(
+        name="Light", default=True,
+        description="Animated: include the light band (per-frame player relighting). OFF = flat skin")
+    anim_occlusion: BoolProperty(
+        name="Occlusion", default=True,
+        description="Animated: include the occlusion band (player-vs-scenery matte). OFF when nothing "
+                    "occludes the players -- skips a render pass and a band")
     fix_2layer_position: BoolProperty(
         name="Fix Hat Position and Scale", default=True,
         description="Snap the hat (2_Layer_Extrusion) onto the head and scale it to the "
@@ -5369,6 +5407,9 @@ def _apply_settings(scene, draft=False):
     g["STATIC_DO_FOREGROUND"] = st.static_foreground
     g["STATIC_DO_SHADOWS"] = st.static_shadows
     g["STATIC_DO_SPRITES"] = st.static_sprites
+    g["ANIM_DO_BG"] = st.anim_background
+    g["ANIM_DO_LIGHT"] = st.anim_light
+    g["ANIM_DO_OCC"] = st.anim_occlusion
     g["FIX_2LAYER_POSITION"] = st.fix_2layer_position
     g["LIGHTSHADOW_FORMAT"] = st.lightshadow_format
     g["JPEG_QUALITY"] = st.jpeg_quality
@@ -6013,6 +6054,11 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 
             box = layout.box()
             box.label(text="Animated", icon='RENDER_ANIMATION')
+            # which composite bands to render (drop Occlusion when nothing occludes the players)
+            brow = box.row(align=True)
+            brow.prop(st, "anim_background", text="BG", toggle=True)
+            brow.prop(st, "anim_light", text="Light", toggle=True)
+            brow.prop(st, "anim_occlusion", text="Occ", toggle=True)
             if not running:               # while running, the top progress bar is the indicator
                 # draft: first ~N s at draft resolution/samples -- the iteration button
                 box.operator("render.novaskin_animated",
@@ -6026,8 +6072,8 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                              icon='RENDER_ANIMATION').draft = False
             box.label(text=f"frames {context.scene.frame_start}-{context.scene.frame_end}"
                            f" @ {context.scene.render.fps} fps, base + 2nd layer")
-            box.label(text=f"(draft: first ~{ANIM_DRAFT_SECONDS}s, fast screen light; "
-                           f"full: baked light atlas, slower)", icon='INFO')
+            box.label(text=f"(draft: first ~{ANIM_DRAFT_SECONDS}s; one composite.webm "
+                           f"= bg/light/occ bands)", icon='INFO')
 
 
 _classes = (NovaSkinAddonPreferences, NovaSkinSettings, RENDER_OT_novaskin,

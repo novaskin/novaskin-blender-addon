@@ -67,9 +67,13 @@ if (!(manifest.video && manifest.bands && manifest.view_lut)) {
   throw 'unsupported export format';
 }
 const [W, H] = manifest.resolution;
-const NBANDS = manifest.bands.count;          // 3: bg=0, light=1, occ=2
+const NBANDS = manifest.bands.count;          // enabled bands, in stack order
 const BAND = manifest.bands;
 const STACK_V = manifest.bands.vertical !== false;   // vertical (landscape) vs horizontal
+// a band the export dropped is simply absent from manifest.bands (see the panel toggles)
+const HAS_BG = BAND.background !== undefined;
+const HAS_LIGHT = BAND.light !== undefined;
+const HAS_OCC = BAND.occlusion !== undefined;
 
 // --- mesh.bin: NSKM | u32 version, welded, unique, ntris | zlib(uv u16x2, src u16, tris u16x3)
 const mb = await bin(manifest.mesh.file);
@@ -207,7 +211,7 @@ const meshP = prog(
    precision highp float;
    uniform sampler2D uSkin; uniform sampler2D uStack; uniform vec2 uRes;
    uniform float uLightBand; uniform float uOccBand; uniform float uBgBand;
-   uniform bool uUseLight; uniform bool uOcclude; uniform bool uFlat; uniform int uPass;
+   uniform bool uUseLight; uniform bool uOcclude; uniform bool uHasBg; uniform bool uFlat; uniform int uPass;
    uniform sampler2D uViewLut;
    uniform vec4 uLutSpec;   // N, tiles, min_ev, max_ev (from manifest.view_lut)
    uniform float uBlackT;   // "black discard" slider, /255 (default 0)
@@ -245,18 +249,21 @@ const meshP = prog(
      // OCCLUSION matte (white = scenery is in front of the player here): the exporter
      // computed it in float from the two render depths, so it cuts at the render's exact
      // silhouette. Discard the fragment where it is set.
+     // uOcclude/uUseLight/uHasBg are false when the export dropped that band (see JS).
      if (uOcclude && sampleBand(uStack, fuv, uOccBand).r > 0.5) discard;
-     vec3 lraw = sampleBand(uStack, fuv, uLightBand).rgb;
+     vec3 lraw = uUseLight ? sampleBand(uStack, fuv, uLightBand).rgb : vec3(1.0);
      // black-discard tiebreak at player/scenery intersections (the z-fighty seam). The winner
      // is a stable pixel comparison (illum darkness vs bg darkness) instead of the noisy matte
      // edge -- discard the player ONLY where its illum is black AND the bg has real colour to
-     // show. If the bg is black too, keep the player (discarding would just punch a black hole,
-     // and the both-black seam is where the fight was). bg band = the scenery at this pixel
-     // (players are camera-invisible in the bg render).
+     // show. If the bg is black too (or absent), keep the player. bg band = the scenery at this
+     // pixel (players are camera-invisible in the bg render).
      if (uOcclude && uUseLight) {
-       vec3 bg = sampleBand(uStack, fuv, uBgBand).rgb;
        bool illumBlack = max(lraw.r, max(lraw.g, lraw.b)) <= uBlackT;
-       bool bgBlack    = max(bg.r,   max(bg.g,   bg.b))   <= uBlackT;
+       bool bgBlack = false;
+       if (uHasBg) {
+         vec3 bg = sampleBand(uStack, fuv, uBgBand).rgb;
+         bgBlack = max(bg.r, max(bg.g, bg.b)) <= uBlackT;
+       }
        if (illumBlack && !bgBlack) discard;
      }
      // relight in LINEAR space (the stream stores sRGB-encoded 0.5*L; the x2 that undoes
@@ -436,16 +443,17 @@ function drawPlayers(o) {
   gl.useProgram(meshP); gl.bindVertexArray(vao);
   gl.uniform2f(gl.getUniformLocation(meshP, 'uRes'), W, H);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uSkin'), 0);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), o.light ? 1 : 0);
-  gl.uniform1i(gl.getUniformLocation(meshP, 'uOcclude'), o.occlude ? 1 : 0);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), (o.light && HAS_LIGHT) ? 1 : 0);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uOcclude'), (o.occlude && HAS_OCC) ? 1 : 0);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uHasBg'), HAS_BG ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uFlat'), o.wire ? 1 : 0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tStack);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uStack'), 1);
   gl.uniform1f(gl.getUniformLocation(meshP, 'uNBands'), NBANDS);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uStackV'), STACK_V ? 1 : 0);
-  gl.uniform1f(gl.getUniformLocation(meshP, 'uLightBand'), BAND.light);
-  gl.uniform1f(gl.getUniformLocation(meshP, 'uOccBand'), BAND.occlusion);
-  gl.uniform1f(gl.getUniformLocation(meshP, 'uBgBand'), BAND.background);
+  gl.uniform1f(gl.getUniformLocation(meshP, 'uLightBand'), BAND.light ?? 0);
+  gl.uniform1f(gl.getUniformLocation(meshP, 'uOccBand'), BAND.occlusion ?? 0);
+  gl.uniform1f(gl.getUniformLocation(meshP, 'uBgBand'), BAND.background ?? 0);
   gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, tLut);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uViewLut'), 2);
   gl.uniform4f(gl.getUniformLocation(meshP, 'uLutSpec'),
@@ -487,15 +495,16 @@ function drawPlayers(o) {
   gl.disable(gl.DEPTH_TEST);
 }
 function drawComposite() {
-  if (ck('ck_bg')) blitBand(BAND.background, FULLRECT);
+  if (ck('ck_bg') && HAS_BG) blitBand(BAND.background, FULLRECT);
   if (ck('ck_pl')) drawPlayers({ occlude: ck('ck_occ'), light: ck('ck_li') });
 }
-// grid: every stream/step side by side, all in sync -- what each one contributes
+// grid: every stream/step side by side, all in sync -- what each one contributes (absent bands
+// leave their tile empty)
 function drawGrid() {
   const tiles = [
-    () => blitBand(BAND.background, FULLRECT),               // background (shadows baked)
-    () => blitBand(BAND.light, FULLRECT),                    // screen-space light band
-    () => blitBand(BAND.occlusion, FULLRECT),               // occlusion matte band
+    () => { if (HAS_BG) blitBand(BAND.background, FULLRECT); },
+    () => { if (HAS_LIGHT) blitBand(BAND.light, FULLRECT); },
+    () => { if (HAS_OCC) blitBand(BAND.occlusion, FULLRECT); },
     () => drawPlayers({ wire: true, occlude: ck('ck_occ') }), // wireframe (occlusion applied)
     () => drawComposite(),                                   // final composite
   ];
@@ -528,11 +537,11 @@ function render(t) {
   const mode = (document.getElementById('dbgmode') || { value: 'composite' }).value;
   if (mode === 'grid') drawGrid();
   else if (mode === 'wire') {
-    if (ck('ck_bg')) blitBand(BAND.background, FULLRECT);
+    if (ck('ck_bg') && HAS_BG) blitBand(BAND.background, FULLRECT);
     drawPlayers({ wire: true, occlude: ck('ck_occ') });
   }
-  else if (mode === 'occ') blitBand(BAND.occlusion, FULLRECT);
-  else if (mode === 'light') blitBand(BAND.light, FULLRECT);
+  else if (mode === 'occ') { if (HAS_OCC) blitBand(BAND.occlusion, FULLRECT); }
+  else if (mode === 'light') { if (HAS_LIGHT) blitBand(BAND.light, FULLRECT); }
   else drawComposite();
   if (recTrack) recTrack.requestFrame();         // recording: push THIS frame into the capture
 }
