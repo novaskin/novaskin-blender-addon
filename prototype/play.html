@@ -278,7 +278,8 @@
         <div id="stage"><canvas id="gl"></canvas></div>
         <div id="controls">
           <button id="playbtn">▶</button>
-          <input id="scrub" type="range" min="0" max="1000" value="0" />
+          <!-- min/max/step set to the video frame range once the manifest loads -->
+          <input id="scrub" type="range" min="0" max="1" step="1" value="0" />
           <span id="time">0.0s</span>
           <button
             id="recbtn"

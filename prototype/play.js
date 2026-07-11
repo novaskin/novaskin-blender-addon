@@ -520,8 +520,8 @@ function draw() {
   else if (mode === 'occ') blitVideo(tOcc, cropRectNDC);
   else if (mode === 'light') blitVideo(tLight, cropRectNDC);
   else drawComposite();
-  if (!scrubbing) scrub.value = Math.round(vBg.currentTime / duration() * 1000) || 0;
-  const fr = Math.min(manifest.frames - 1, Math.round(vBg.currentTime * manifest.fps));
+  const fr = Math.min(manifest.frames - 1, Math.floor(vBg.currentTime * manifest.fps));
+  if (!scrubbing) scrub.value = fr;              // scrub is a frame index (0 .. frames-1)
   timeEl.textContent = `f${fr}/${manifest.frames - 1} · ${vBg.currentTime.toFixed(1)}s`;
   if (recTrack) recTrack.requestFrame();   // recording: push THIS frame into the capture
   if (!dead) rafId = requestAnimationFrame(draw);
@@ -550,6 +550,7 @@ playbtn.onclick = () => {
   else { vids.forEach(v => v.pause()); playbtn.textContent = '▶'; }
 };
 const scrub = document.getElementById('scrub');
+scrub.min = 0; scrub.max = manifest.frames - 1; scrub.step = 1;   // navigate by video frame
 const timeEl = document.getElementById('time');
 const duration = () => (isFinite(vBg.duration) && vBg.duration > 0)
   ? vBg.duration : manifest.frames / manifest.fps;   // streamed webm: duration=Infinity
@@ -557,7 +558,8 @@ let scrubbing = false;
 scrub.onpointerdown = () => { scrubbing = true; };
 scrub.onpointerup = () => { scrubbing = false; };
 scrub.oninput = () => {
-  const t = (scrub.value / 1000) * duration();
+  // seek to the MIDDLE of the frame so the video reliably decodes that exact frame
+  const t = Math.min((+scrub.value + 0.5) / manifest.fps, duration() - 1e-4);
   vids.forEach(v => { v.currentTime = t; });
 };
 // --- record: capture the composited canvas over exactly one loop and download it as a
