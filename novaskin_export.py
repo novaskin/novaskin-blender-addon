@@ -2029,8 +2029,8 @@ def _bake_layer_texture(meshes, res, out_dir, stem, samples=1):
     saved_sel = list(bpy.context.selected_objects)
     temp_mats = []        # (obj) meshes we gave a temporary slot (slotless -> bake needs one)
     added_nodes = []      # (node_tree, target image node) to remove
-    added_emit = []       # (node_tree, emit node) + restore its output link
-    restore_surface = []  # (surface_input, original_from_socket)
+    made = []             # (node_tree, node) opacity-graph nodes we added, to remove
+    restore_surface = []  # (node_tree, surface_input, original_from_socket)
     vis_restore = None
     try:
         for o in meshes:
@@ -2066,31 +2066,72 @@ def _bake_layer_texture(meshes, res, out_dir, stem, samples=1):
         rgba = buf.reshape(-1, 4).copy()
         rgba[:, 3] = 1.0                              # default opaque (if the alpha bake is skipped)
 
-        # 2) ALPHA: emit each Principled's Alpha, bake EMIT -> the opacity (constant OR textured)
+        # 2) ALPHA: emit the OPACITY of each material's surface tree (0 = fully transparent), then
+        # bake EMIT. Mirror the shader tree with Emission leaves -- Transparent BSDF -> 0,
+        # Principled -> its Alpha, any other shader -> 1 (opaque) -- and KEEP the Mix / Add Shader
+        # nodes, which blend the emissions exactly like they blend the real shaders. So both idioms
+        # work: a Principled Alpha, AND a Mix Shader(Transparent, opaque) at factor F (= the opacity).
         for mat in mats:
             nt = mat.node_tree
+
+            def opacity(node):        # -> a node whose output emits `node`'s opacity
+                if node.type == 'MIX_SHADER':
+                    m = nt.nodes.new('ShaderNodeMixShader'); made.append((nt, m))
+                    fac = node.inputs[0]
+                    if fac.is_linked:
+                        nt.links.new(fac.links[0].from_socket, m.inputs[0])
+                    else:
+                        m.inputs[0].default_value = fac.default_value
+                    for i in (1, 2):
+                        if node.inputs[i].is_linked:
+                            nt.links.new(opacity(node.inputs[i].links[0].from_node).outputs[0],
+                                         m.inputs[i])
+                    return m
+                if node.type == 'ADD_SHADER':
+                    m = nt.nodes.new('ShaderNodeAddShader'); made.append((nt, m))
+                    for i in (0, 1):
+                        if node.inputs[i].is_linked:
+                            nt.links.new(opacity(node.inputs[i].links[0].from_node).outputs[0],
+                                         m.inputs[i])
+                    return m
+                e = nt.nodes.new('ShaderNodeEmission'); made.append((nt, e))
+                if node.type == 'BSDF_TRANSPARENT':
+                    e.inputs['Color'].default_value = (0.0, 0.0, 0.0, 1.0)
+                elif node.type == 'BSDF_PRINCIPLED':
+                    a = node.inputs.get('Alpha')
+                    if a is not None and a.is_linked:
+                        nt.links.new(a.links[0].from_socket, e.inputs['Color'])
+                    else:
+                        v = float(a.default_value) if a is not None else 1.0
+                        e.inputs['Color'].default_value = (v, v, v, 1.0)
+                else:
+                    e.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)   # opaque leaf
+                return e
+
             out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
             if out is None:
                 continue
             surf = out.inputs.get('Surface')
             orig = surf.links[0].from_socket if (surf and surf.is_linked) else None
-            emit = nt.nodes.new('ShaderNodeEmission')
-            added_emit.append((nt, emit))
-            bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
-            a_in = bsdf.inputs.get('Alpha') if bsdf else None
-            if a_in is not None and a_in.is_linked:
-                nt.links.new(a_in.links[0].from_socket, emit.inputs['Color'])
-            else:
-                a = float(a_in.default_value) if a_in is not None else 1.0
-                emit.inputs['Color'].default_value = (a, a, a, 1.0)
-            nt.links.new(emit.outputs['Emission'], surf)
+            top = opacity(orig.node) if orig is not None else None
+            if top is None:                              # no surface shader -> treat as opaque
+                top = nt.nodes.new('ShaderNodeEmission'); made.append((nt, top))
+                top.inputs['Color'].default_value = (1.0, 1.0, 1.0, 1.0)
+            nt.links.new(top.outputs[0], surf)
             restore_surface.append((nt, surf, orig))
+        for nt, tgt in added_nodes:                      # re-assert the bake target after adding nodes
+            nt.nodes.active = tgt
         bpy.context.view_layer.update()
         bpy.ops.object.bake(type='EMIT', use_clear=True)
         aimg = np.empty(res * res * 4, 'float32')
         img.pixels.foreach_get(aimg)
         rgba[:, 3] = np.clip(aimg.reshape(-1, 4)[:, 0], 0.0, 1.0)   # emitted alpha (R channel)
-
+        # the DIFFUSE COLOR pass is weighted by opacity (a Transparent/Alpha branch darkens it by
+        # the same factor as the alpha), so un-weight it by the alpha -> the FULL albedo. The
+        # viewer re-applies the transparency through the alpha channel; without this the color
+        # would be darkened AND alpha-blended (double-counting the transparency).
+        vis = rgba[:, 3] > 1e-3
+        rgba[vis, :3] = np.clip(rgba[vis, :3] / rgba[vis, 3:4], 0.0, 1.0)
         rgba[:, :3] = _lin_to_srgb(rgba[:, :3])
         fn = stem + "_tex.png"
         os.makedirs(out_dir, exist_ok=True)
@@ -2101,8 +2142,11 @@ def _bake_layer_texture(meshes, res, out_dir, stem, samples=1):
         for nt, surf, orig in restore_surface:        # reconnect the real surface shader
             if orig is not None:
                 nt.links.new(orig, surf)
-        for nt, emit in added_emit:
-            nt.nodes.remove(emit)
+        for nt, node in made:                         # remove the opacity mirror graph
+            try:
+                nt.nodes.remove(node)
+            except (RuntimeError, ReferenceError):
+                pass
         for nt, tgt in added_nodes:
             nt.nodes.remove(tgt)
         for o in temp_mats:                           # drop the temporary material slot we added
