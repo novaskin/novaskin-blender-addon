@@ -5056,11 +5056,15 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             setup()
             for o in overlay_parts:
                 o.hide_render = False                 # FULL player for the occlusion silhouette
-            # mesh layers are camera-invisible here: the matte is player-vs-scenery only, so their
-            # depth must not enter z_play. (Layer-vs-scenery occlusion is a v1 gap; layer-vs-player
-            # is handled by the shared mesh z-buffer in the viewer.)
-            sc = {o: o.visible_camera for o in list(scenery) + layer_meshes}
-            for o in list(scenery) + layer_meshes:
+            # mesh layers stay camera-VISIBLE here (only scenery is hidden): the matte becomes
+            # "scenery in front of the nearest entity" (player OR layer), so z_play / coverage
+            # include them. That gives layers real scenery occlusion AND stops the player's matte
+            # from punching holes in a layer drawn in front of an occluded player. The z-band
+            # already spans the layers (their verts are in the mesh keys). Overlaps resolve via
+            # the shared z-buffer in the viewer (a rare scenery-BETWEEN case only shows through a
+            # semi-transparent layer).
+            sc = {o: o.visible_camera for o in scenery}
+            for o in scenery:
                 o.visible_camera = False
             occ_samp = s.cycles.samples if hasattr(s, 'cycles') else None
             occ_den = s.cycles.use_denoising if hasattr(s, 'cycles') else None
@@ -5075,7 +5079,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                 s.cycles.use_denoising = occ_den
             for o, v in sc.items():
                 o.visible_camera = v
-            ao = np.clip(Lo[:, 3], 0.0, 1.0)          # full-player coverage (base + overlays)
+            ao = np.clip(Lo[:, 3], 0.0, 1.0)          # entity coverage (players + overlays + layers)
             zp = _anim_exr_read(ff, os.path.join(exr_dir, "zz.exr"), 'zz', rW, rH, gray=True)
             z_play = np.clip((zp - zlo) / zsc, 0.0, 1.0)
             occ = ((ao > 0.01)
