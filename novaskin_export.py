@@ -2999,6 +2999,25 @@ def _anim_frame_cached(adir, i):
                               for p in (os.path.join(adir, "seq", k, fn) for k in dirs))
 
 
+def _anim_atlas_pack(n, W, H, max_res):
+    """Choose how to pack n square light-atlas tiles into the WxH light-band slot: pick the
+    column count whose grid gives the LARGEST tile side that still fits the frame, then cap that
+    side at max_res (the panel 'Atlas res' -- a quality ceiling / "not too big") and make it
+    even (yuv420). Returns (tile_res, cols); tiles are laid row-major, `cols` per row. This
+    scales the atlas with the render: a small draft frame gets small tiles automatically, so it
+    always fits -- no fixed-size failure. Every arrangement it considers fits by construction
+    (best_a = min(W//cols, H//rows)), and capping only shrinks tiles within that grid."""
+    best_a, best_cols = 0, 1
+    for cols in range(1, max(1, n) + 1):
+        rows = (n + cols - 1) // cols
+        a = min(W // cols, H // rows)
+        if a > best_a:
+            best_a, best_cols = a, cols
+    a = min(best_a, int(max_res))
+    a = max(2, a - (a % 2))                 # even dimensions for the VP9 (yuv420) encode
+    return a, best_cols
+
+
 def _anim_dilate_light(rgb, covered, W, H, passes=None):
     """Pad the light outward: fill uncovered pixels with the nearest covered color
     (iterative 4-neighbour dilation, `passes` px). Keeps player-edge sampling from
@@ -4808,16 +4827,13 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         # players (the atlas tile order). Scenery zeroed so nothing pollutes a player's tile.
         # (_Session snapshots pass_index and restores it.)
         ordered_p = sorted(players, key=lambda p: _player_camera_depth(p) or 0.0, reverse=True)
-        # bake-atlas packing: ATLAS_RES tiles laid row-major in the WxH light-band slot. Guard
-        # that the players fit the frame (a 4K frame holds 3 x 1024 or many 512 tiles).
-        atlas_A = int(ATLAS_RES)
-        atlas_per_row = max(1, W // atlas_A)
-        atlas_rows = (len(ordered_p) + atlas_per_row - 1) // atlas_per_row
-        if ANIM_DO_ATLAS and (atlas_A > W or atlas_rows * atlas_A > H):
-            raise RuntimeError(
-                f"Bake atlas: {len(ordered_p)} player(s) x {atlas_A}px do not fit a {W}x{H} "
-                f"frame ({atlas_per_row}/row, {atlas_rows} rows). Lower 'Atlas res' or raise "
-                f"the output resolution.")
+        # bake-atlas packing: size the tiles to FIT the WxH light-band slot (capped at the panel
+        # 'Atlas res'), so drafts (smaller frames) shrink the tiles automatically instead of
+        # failing. Reused every frame; the manifest ships res + per_row for the viewer.
+        atlas_A, atlas_per_row = _anim_atlas_pack(len(ordered_p), W, H, int(ATLAS_RES))
+        if ANIM_DO_ATLAS:
+            print(f"[ANIM] bake atlas: {len(ordered_p)} player(s) -> {atlas_A}px tiles, "
+                  f"{atlas_per_row}/row (frame {W}x{H}, cap {ATLAS_RES})")
         for o in s.objects:
             o.pass_index = 0
         for pnum, p in enumerate(ordered_p, start=1):
@@ -5402,10 +5418,11 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
                     "occludes the players -- skips a render pass and a band")
     anim_light_atlas: BoolProperty(
         name="Bake atlas", default=False,
-        description="Animated: bake a per-player UV light atlas (reuses the static 'Atlas res') "
-                    "instead of the screen-space light band. Lights the 2nd-layer overlays "
-                    "correctly per-face (no screen-space fringe), overlay-free base (no phantom). "
-                    "Costs a Cycles bake per player per frame; replaces the Light band")
+        description="Animated: bake a per-player UV light atlas instead of the screen-space light "
+                    "band. Lights the 2nd-layer overlays correctly per-face (no screen-space "
+                    "fringe), overlay-free base (no phantom). Tile size auto-fits the frame, "
+                    "capped at 'Atlas res' (drafts shrink it). Costs a Cycles bake per player per "
+                    "frame; replaces the Light band")
     fix_2layer_position: BoolProperty(
         name="Fix Hat Position and Scale", default=True,
         description="Snap the hat (2_Layer_Extrusion) onto the head and scale it to the "
