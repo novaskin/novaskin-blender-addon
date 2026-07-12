@@ -142,7 +142,13 @@ const vComp = await video(manifest.video);
 const loadImage = (src) => new Promise((ok, err) => {
   const i = new Image(); i.onload = () => ok(i); i.onerror = err; i.src = src;
 });
-const skins = await Promise.all(manifest.mesh.players.map(() => loadImage('data/skin.png')));
+// per-entity base texture: players get the swappable default skin; a mesh LAYER (role='layer',
+// a prop like a held sword) ships its own texture in the export (manifest.layers[label].tex).
+const LAYERTEX = manifest.layers || {};
+const skins = await Promise.all(manifest.mesh.players.map(async (p) =>
+  (p.role === 'layer' && LAYERTEX[p.label]?.tex)
+    ? loadImage(URL.createObjectURL(await loadBlob(LAYERTEX[p.label].tex)))
+    : loadImage('data/skin.png')));
 
 // --- GL setup (same shaders as the one-frame prototype)
 const canvas = document.getElementById('gl');
@@ -329,6 +335,7 @@ const tLut = tex();
 // swap a player's skin at runtime (file input below, or __dbg.setSkin(i, src))
 function setSkin(i, source) { upload(tSkins[i], source, true); }
 const partOff = new Set();    // disabled overlays, keyed "playerLabel::variantStrippedLabel"
+const layerOff = new Set();   // disabled optional mesh layers, keyed by entity label
 const variantSel = {};        // arm style per player label: 'classic' (Steve) | 'slim' (Alex)
 const baseLabel = (lab) => lab.replace(/_(classic|slim)$/, '');   // drop the arm-style suffix
 {
@@ -341,19 +348,36 @@ const baseLabel = (lab) => lab.replace(/_(classic|slim)$/, '');   // drop the ar
     box.appendChild(note);
   }
   manifest.mesh.players.forEach((p, i) => {
+    // re-skin picker: swap this entity's base texture (player skin or layer texture) at runtime
+    const picker = () => {
+      const inp = document.createElement('input');
+      inp.type = 'file'; inp.accept = 'image/png,image/webp,image/jpeg';
+      inp.style.width = '90px';
+      inp.onchange = () => {
+        const f = inp.files[0];
+        if (!f) return;
+        const img = new Image();
+        img.onload = () => { setSkin(i, img); URL.revokeObjectURL(img.src); };
+        img.src = URL.createObjectURL(f);
+      };
+      return inp;
+    };
+    // optional mesh LAYER (a prop): a whole-entity on/off toggle + a texture swap. No arm
+    // variant / 2nd layer -- it depth-composites with the players via the shared z buffer.
+    if (p.role === 'layer') {
+      const ll = document.createElement('label');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = true;
+      cb.onchange = () => { cb.checked ? layerOff.delete(p.label) : layerOff.add(p.label); };
+      ll.appendChild(cb);
+      ll.appendChild(document.createTextNode(` ${p.label} `));
+      ll.appendChild(picker());
+      box.appendChild(ll);
+      return;
+    }
     const lab = document.createElement('label');
     lab.textContent = ` ${p.label}: `;
-    const inp = document.createElement('input');
-    inp.type = 'file'; inp.accept = 'image/png,image/webp,image/jpeg';
-    inp.style.width = '110px';
-    inp.onchange = () => {
-      const f = inp.files[0];
-      if (!f) return;
-      const img = new Image();
-      img.onload = () => { setSkin(i, img); URL.revokeObjectURL(img.src); };
-      img.src = URL.createObjectURL(f);
-    };
-    lab.appendChild(inp);
+    lab.appendChild(picker());
     box.appendChild(lab);
     // per-part toggles for the 2nd layer -- ONLY when the export ships a light atlas (full
     // quality), which lights the overlay shells per-face in UV. A screen-space light export
@@ -494,8 +518,9 @@ function drawPlayers(o) {
   const uPass = gl.getUniformLocation(meshP, 'uPass');
   gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.clear(gl.DEPTH_BUFFER_BIT);
   manifest.mesh.players.forEach((p, i) => {
+    if (p.role === 'layer' && layerOff.has(p.label)) return;   // optional layer toggled off
     gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
-    if (HAS_ATLAS) gl.uniform1f(gl.getUniformLocation(meshP, 'uAtlasTile'), i);  // player -> tile
+    if (HAS_ATLAS) gl.uniform1f(gl.getUniformLocation(meshP, 'uAtlasTile'), i);  // entity -> tile
     // shared parts + the SELECTED arm variant + each enabled overlay, coalesced into
     // contiguous spans
     const sel = variantSel[p.label] || p.default_variant || 'classic';
