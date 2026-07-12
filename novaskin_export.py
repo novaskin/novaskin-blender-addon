@@ -282,6 +282,10 @@ LIGHTSHADOW_EXT = {'JPEG': '.jpg', 'WEBP': '.webp'}.get(LIGHTSHADOW_FORMAT, '.pn
 # fast iteration on framing/marking before the real export. The manifest records it.
 DRAFT_MODE = False
 DRAFT_RES_PCT = 50
+# Draft also renders at a fraction of the scene fps (fewer frames = faster), to match the half
+# resolution: 50% -> every 2nd frame. The animated export samples the scene every
+# round(100/DRAFT_FPS_PCT) frames and plays back at the matching lower rate.
+DRAFT_FPS_PCT = 50
 DRAFT_SAMPLES = 8
 
 # The default RGBA of every UV file is (R=U, G=V, B=depth, A=coverage). When exporting as
@@ -317,10 +321,6 @@ ANIM_Z_BITS = 12            # depth quantization: 12 bits = 4095 levels (plenty 
 # The 'Export Animation Draft' button renders only the first few seconds (fast iteration on
 # look/quality) instead of the whole frame range. The full export uses the scene's range.
 ANIM_DRAFT_SECONDS = 3
-# ...and at a LOWER frame rate than the scene (fewer frames = faster). The scene fps is sampled
-# every `round(scene_fps / ANIM_DRAFT_FPS)` frames, so the real draft rate is the nearest integer
-# divisor of the scene fps (30 -> 15, 24 -> 12, 60 -> 12). The full export keeps the scene fps.
-ANIM_DRAFT_FPS = 12
 # The three streams (bg / light / occlusion) are vstacked into ONE video so a single decoder
 # keeps them in perfect frame lockstep (independent <video> elements drift by a frame, which
 # reads as wrong on the WebGL composite). One codec for all three => lossy, one CRF: the
@@ -4741,7 +4741,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     fps = scene_fps
     if DRAFT_MODE and frame_start is None and frame_end is None:
         f1 = min(f1, f0 + max(1, int(ANIM_DRAFT_SECONDS * scene_fps)) - 1)
-        frame_step = max(1, round(scene_fps / ANIM_DRAFT_FPS))
+        frame_step = max(1, round(100 / DRAFT_FPS_PCT))   # 50% -> every 2nd frame, half fps
         fps = scene_fps / frame_step
         if fps == int(fps):
             fps = int(fps)
@@ -6246,8 +6246,8 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                              icon='RENDER_ANIMATION').draft = False
             box.label(text=f"frames {context.scene.frame_start}-{context.scene.frame_end}"
                            f" @ {context.scene.render.fps} fps, base + 2nd layer")
-            box.label(text=f"(draft: first ~{ANIM_DRAFT_SECONDS}s @ ~{ANIM_DRAFT_FPS}fps, "
-                           f"{DRAFT_RES_PCT}% res; one composite.webm)", icon='INFO')
+            box.label(text=f"(draft: first ~{ANIM_DRAFT_SECONDS}s at {DRAFT_RES_PCT}% res / "
+                           f"{DRAFT_FPS_PCT}% fps; one composite.webm)", icon='INFO')
 
 
 _classes = (NovaSkinAddonPreferences, NovaSkinSettings, RENDER_OT_novaskin,
