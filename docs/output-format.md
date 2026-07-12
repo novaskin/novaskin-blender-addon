@@ -94,30 +94,59 @@ A separate output for the animated wallpaper, consumed by a WebGL player (refere
 
 ```
 animated/
-├── background.webm        full-frame scenery (player shadows baked in); lossy VP9
-├── foreground.webm        scenery IN FRONT of the players; RGB only, cropped (no alpha)
-├── foreground_matte.webm  the foreground's alpha as grayscale; cropped (Safari-safe)
-├── light.webm             combined player light (gray-0.5 basis); cropped
-├── mesh.bin               static geometry (NSKM)
-├── anim.bin               per-frame screen positions + depth (NSKA)
-└── manifest.json          fps, frames, resolution, crop, file list, format versions
+├── composite.webm     ONE video: the per-frame streams stacked into BANDS (a single decoder
+│                      keeps them in perfect frame lockstep). Lossy VP9, yuv420p. Bands, in
+│                      `manifest.bands` order: background (scenery, player shadows baked in),
+│                      light, occlusion. Stacked along the SHORTER axis -- landscape (W≥H):
+│                      vertical, W × N·H; portrait: horizontal, N·W × H.
+├── view_lut.png       the scene's view transform (AgX/Filmic/...) as a 64³ 3D LUT (8×8 tiles)
+├── <layer>_tex.png    one per optional MESH layer -- its baked base texture (albedo + alpha)
+├── mesh.bin           static geometry (NSKM) -- players AND mesh layers
+├── anim.bin           per-frame screen positions + depth (NSKA)
+└── manifest.json      fps, frames, resolution, bands, view_lut, light_atlas?, layers?, ...
 ```
 
-The character is NOT video — it is a screen-space triangle mesh re-textured live with the
-user's skin. Only base-layer parts; players always drawn.
+The characters (and mesh layers) are NOT video — they are screen-space triangle meshes,
+re-textured live and relit from the light band. `manifest.bands`
+(`{background, light, occlusion, count, vertical}`) names the bands present; any can be
+dropped (a missing band is simply absent). `bandUV(uv, b)` maps a full-frame `uv` into band
+`b`: `vertical` → `(uv.x, (N−1−b+uv.y)/N)` (top band = bg, highest V after UNPACK_FLIP_Y);
+else `((b+uv.x)/N, uv.y)`.
+
+The **light** band has one of two forms, flagged by `manifest.light_atlas`:
+- **screen-space** (draft; no `light_atlas`) — a full-frame image of the players/layers
+  rendered gray-0.5. Sample it at the fragment's screen position. Base layer only: the viewer
+  turns the 2nd-layer overlays OFF (screen light can't light the overlay shells).
+- **UV atlas** (full quality; `light_atlas = {res, tiles, per_row}`) — the band holds one
+  `res×res` UV light tile per entity (players first, then mesh layers, in `mesh.players`
+  order), packed row-major (`per_row` across) in the band's bottom-left corner. Sample it by
+  the entity's own skin/layer UV inside its tile: `tile i` at `(i%per_row, i//per_row)`. This
+  lights the 2nd layer per-face.
+
+Both light forms store `sRGB(0.5·L)`, so the decode is identical.
 
 ### Compositing recipe (per displayed frame `t`)
 
-1. Draw `background.webm` full-frame.
-2. Draw each player's mesh (back-to-front), with a **depth test** on the vertex z and
-   `color = skin(uv) · light(screenUv) · 2` (display space). Vertex positions are the mesh
-   keys interpolated at `t` (see anim.bin). `light` is sampled in screen space, offset by
-   the crop: `screenUv = (fragCoord − cropOrigin) / cropSize`.
-3. Draw the foreground over the players: `rgba = (foreground.rgb, foreground_matte.r)` with
-   straight-alpha "over", positioned at the crop rect (not full-frame).
+1. Draw the **background** band full-frame.
+2. Draw each entity's mesh (`mesh.players`, back-to-front) with a **depth test** on the
+   vertex z (players and layers share the buffer). Discard fragments where the **occlusion**
+   band (sampled at the screen position) is white (scenery in front). Relight in LINEAR then
+   display-encode with the view transform:
+   `light_lin = pow(lightSample, 2.2) · 2` · `lin = pow(base, 2.2) · light_lin` ·
+   `outColor = viewLut(lin)` — where `lightSample` is the entity's UV atlas tile (full) or the
+   screen-space band at the fragment position (draft), and `base` is the skin (or a layer's
+   `<layer>_tex.png`, with alpha) UV colour.
+   - A `role: "layer"` entity uses its own baked texture instead of a skin, gets a
+     whole-entity on/off toggle (`manifest.layers[label]`), and depth-composites with the
+     players. Draft (screen light) draws layers too; the 2nd-layer overlays are what draft
+     drops.
+3. Vertex positions are the mesh keys interpolated at `t` (see anim.bin). Sample the mesh at
+   the frame the composite actually shows: with `requestVideoFrameCallback`,
+   `frame = round(mediaTime · fps)` (the mediaTime sits on the frame boundary — flooring it
+   drops to `frame−1` on float undershoot and lags the mesh a frame behind the video).
 
-`light`/`foreground`/`foreground_matte` are cropped to `manifest.crop`; `background` is
-full-frame. Keep the three secondary videos time-locked to the background's clock.
+One `composite.webm` = one decoder, so the bands are inherently frame-locked; there is no
+cross-video sync to maintain.
 
 ### `mesh.bin` — NSKM (static, little-endian)
 

@@ -1,6 +1,6 @@
 # Animated Export — Planning Doc
 
-Status: **SHIPPED — format v5** (this doc is the original plan plus phase notes; the
+Status: **SHIPPED — format v6** (this doc is the original plan plus phase notes; the
 sections below describe versions 1-2 and are kept as history. Summary of what actually
 ships as of 2026-07):
 
@@ -35,17 +35,22 @@ ships as of 2026-07):
   compare is done in float offline.
   Player-vs-player occlusion stays a real GPU depth test on the per-vertex mesh z (drawn
   back-to-front). Translucids (water tint over a submerged player) remain binary occlusion.
-- **Light**: ALWAYS screen-space (drafts and full quality) — the visible gray players
-  rendered at frame resolution, stored sRGB-encoded (`0.5·L`), sampled by screen position;
+- **Light**: the LIGHT band is **screen-space in DRAFT, a baked UV atlas in FULL** quality
+  (`do_atlas = ANIM_DO_LIGHT and not DRAFT_MODE`). Screen-space = the visible gray players at
+  frame resolution, sampled by screen position; the atlas = a per-entity UV light tile baked
+  per frame (players + mesh layers), packed row-major into the band's corner
+  (`light_atlas {res, tiles, per_row}`; tile size auto-fits the frame via `_anim_atlas_pack`,
+  capped at `ATLAS_RES`, so drafts shrink instead of overflowing). Both store `sRGB(0.5·L)`;
   the viewer decodes to linear, relights `skin_lin × L × 2`, and applies the scene's real
-  view transform via `view_lut.png` (AgX in GLSL would only approximate; the LUT matches
-  OCIO to ~2/255). Two per-frame atlas modes were tried and DROPPED (git history has
-  both): REPROJECT (atlas from the light render's UV pass — sampling density
-  unsatisfactory) and BAKE (per-player Cycles bake per frame — per-face atlas resolution
-  loses shadow detail the screen render keeps, ~3× less on a near player, plus the
-  AgX-encoded tiles could not be decoded exactly in the shader, plus ~20 s/player/frame).
-  The static export still bakes its atlas: one bake amortized over the wallpaper,
-  lossless WebP, no per-face-vs-screen resolution race.
+  view transform via `view_lut.png` (AgX in GLSL would only approximate; the LUT matches OCIO
+  to ~2/255). The atlas was tried and DROPPED once (git history: REPROJECT + per-frame BAKE)
+  then **revived** after the two real blockers were fixed: the failure was the multi-VIDEO
+  sync (separate webms drifting) — the single composite makes it moot — and the AgX-encoded
+  tiles (now stored sRGB and decoded by the view LUT, exact). Its payoff is the **2nd layer**:
+  screen light is base-only (the overlay shells extend past the base silhouette in SCREEN
+  space and would sample the dilated fringe), so DRAFT turns overlays OFF; the atlas lights
+  every face in UV, so FULL enables them. DRAFT also runs at half resolution and half fps
+  (every 2nd frame). The static export still bakes its own single amortized atlas.
 - **Players**: base + classic 2nd layer (per-part `parts[]` tri ranges in the manifest,
   toggleable in the viewer; labels come from UV-rect classification, not object names).
   BOTH arm styles ship (same design as the static export): the inactive variant's parts are
@@ -54,12 +59,26 @@ ships as of 2026-07):
   arm). `default_variant` records the style the atlas/light was rendered for — the other
   borrows its rects (the two UV nets differ ~1px). The rig's inset per-pixel UVs are
   expanded for the export.
+- **Optional mesh layers**: a marked optional layer (a held sword, a pane of glass) is
+  exported as a toggleable MESH, not a sprite, so it **depth-composites** with the players
+  (front/behind via the shared z buffer + per-fragment alpha for semi-transparent props).
+  It behaves like a player in every render pass — camera-invisible in bg (but casts shadows),
+  gray in the light render, its own atlas tile in FULL, and visible in the occ matte (so it
+  gets scenery occlusion) — and is a simple entity in `mesh.bin` (`role='layer'`, every mesh a
+  base part, NO arm variant / 2nd layer). Its base texture is **baked** from the real material
+  (`_bake_layer_texture`): DIFFUSE COLOR for the albedo + an EMIT of the shader tree's opacity
+  (Transparent BSDF → 0, Principled Alpha, Mix/Add Shader kept) for the alpha — so material
+  colour mods AND transparency are captured, unlike copying the raw image node. Shipped as
+  `<layer>_tex.png` (`manifest.layers[label]`); re-skinnable + on/off toggle in the viewer.
+  Draft (screen light) draws layers too — only the players' 2nd-layer overlays need FULL.
 - **Viewer** (`prototype/play.js`): CURRENT format only (prototype, no back-compat — old
   atlas/fg/matte exports are rejected with a "re-export" message). texAA + premultiplied
-  two-pass alpha, matte-discard occlusion, screen-light relight in linear + view-transform LUT,
-  per-part toggles + per-player classic/slim arm toggle, folder picker, debug views
-  (wireframe / depth / light / grid), one-loop composite recording (⏺ rec → shareable
-  MP4/WebM; the tab must stay visible while it records).
+  two-pass alpha, matte-discard occlusion, relight in linear (light sampled by UV atlas tile
+  or screen-space band) + view-transform LUT, per-part 2nd-layer toggles + per-player
+  classic/slim arm toggle + per-layer on/off & re-skin, folder picker, debug views (wireframe
+  / depth / light / grid), one-loop composite recording (⏺ rec → shareable MP4/WebM; the tab
+  must stay visible while it records). Playback driven by `requestVideoFrameCallback`; the
+  mesh is snapped to `round(mediaTime·fps)` so it matches the exact composite frame on screen.
 - **Costs** (reference scene, 2 players): draft ≈ 5 s/frame; full quality ≈ 14 s/frame
   (bg + light at full samples + a 1-sample occlusion render, no bakes). `ffmpeg` is required at
   render time (the depth pass is read back through it).
