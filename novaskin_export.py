@@ -317,6 +317,10 @@ ANIM_Z_BITS = 12            # depth quantization: 12 bits = 4095 levels (plenty 
 # The 'Export Animation Draft' button renders only the first few seconds (fast iteration on
 # look/quality) instead of the whole frame range. The full export uses the scene's range.
 ANIM_DRAFT_SECONDS = 3
+# ...and at a LOWER frame rate than the scene (fewer frames = faster). The scene fps is sampled
+# every `round(scene_fps / ANIM_DRAFT_FPS)` frames, so the real draft rate is the nearest integer
+# divisor of the scene fps (30 -> 15, 24 -> 12, 60 -> 12). The full export keeps the scene fps.
+ANIM_DRAFT_FPS = 12
 # The three streams (bg / light / occlusion) are vstacked into ONE video so a single decoder
 # keeps them in perfect frame lockstep (independent <video> elements drift by a frame, which
 # reads as wrong on the WebGL composite). One codec for all three => lossy, one CRF: the
@@ -4729,11 +4733,23 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     s = bpy.context.scene
     f0 = s.frame_start if frame_start is None else frame_start
     f1 = s.frame_end if frame_end is None else frame_end
-    fps = s.render.fps
-    # Draft (panel button): only the first few seconds, for fast look/quality iteration.
+    scene_fps = s.render.fps
+    # Draft (panel button): only the first few seconds, at a lower frame rate (fewer frames =
+    # faster). Sample the scene every `frame_step` frames; the video/mesh play back at the
+    # matching lower fps so the clip still covers the same seconds.
+    frame_step = 1
+    fps = scene_fps
     if DRAFT_MODE and frame_start is None and frame_end is None:
-        f1 = min(f1, f0 + max(1, int(ANIM_DRAFT_SECONDS * fps)) - 1)
-    nf = f1 - f0 + 1
+        f1 = min(f1, f0 + max(1, int(ANIM_DRAFT_SECONDS * scene_fps)) - 1)
+        frame_step = max(1, round(scene_fps / ANIM_DRAFT_FPS))
+        fps = scene_fps / frame_step
+        if fps == int(fps):
+            fps = int(fps)
+    frames = list(range(f0, f1 + 1, frame_step))
+    nf = len(frames)
+    if DRAFT_MODE:
+        print(f"[ANIM] draft: ~{ANIM_DRAFT_SECONDS}s at {fps}fps ({nf} frames, every "
+              f"{frame_step} scene frame(s), {DRAFT_RES_PCT}% res)")
     W = s.render.resolution_x * MASK_RES_PCT // 100
     H = s.render.resolution_y * MASK_RES_PCT // 100
     adir = os.path.join(_abs(OUT_DIR), ANIM_OUT_SUBDIR)
@@ -4844,11 +4860,11 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         # Pre-pass: capture the mesh keys (every ANIM_KEYS_STEP frames) for anim.bin. The
         # streams are full-frame (no crop -- they vstack into one video), so no bbox needed.
         keys = []
-        for i, f in enumerate(range(f0, f1 + 1)):
+        for i, f in enumerate(frames):
             s.frame_set(f)
             setup()
             p = _anim_frame_positions(st, W, H)
-            if i % ANIM_KEYS_STEP == 0 or f == f1:
+            if i % ANIM_KEYS_STEP == 0 or f == frames[-1]:
                 keys.append(p)
         # players' camera-depth band over the whole clip (same formula as _anim_write_anim):
         # ONE z space shared by the mesh (anim.bin z) and the scene-depth video, so the
@@ -4940,7 +4956,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         cached = sum(1 for i in range(nf) if ANIM_RESUME and _anim_frame_cached(adir, i))
         if cached:
             print(f"[ANIM] resume: {cached}/{nf} frames already rendered -- skipping them")
-        for i, f in enumerate(range(f0, f1 + 1)):
+        for i, f in enumerate(frames):
             fn = f"{i+1:04d}.png"
             if ANIM_RESUME and _anim_frame_cached(adir, i):   # resume: this frame is done
                 yield prog(f"frame {i+1}/{nf} (cached)")
@@ -6230,8 +6246,8 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
                              icon='RENDER_ANIMATION').draft = False
             box.label(text=f"frames {context.scene.frame_start}-{context.scene.frame_end}"
                            f" @ {context.scene.render.fps} fps, base + 2nd layer")
-            box.label(text=f"(draft: first ~{ANIM_DRAFT_SECONDS}s; one composite.webm "
-                           f"= bg/light/occ bands)", icon='INFO')
+            box.label(text=f"(draft: first ~{ANIM_DRAFT_SECONDS}s @ ~{ANIM_DRAFT_FPS}fps, "
+                           f"{DRAFT_RES_PCT}% res; one composite.webm)", icon='INFO')
 
 
 _classes = (NovaSkinAddonPreferences, NovaSkinSettings, RENDER_OT_novaskin,
