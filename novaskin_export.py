@@ -474,6 +474,10 @@ STATIC_SHADOW_FLOOR = 0.06     # darkening (1-ratio) below this -> no shadow (no
 # (mobs are small, so 256 is plenty for the low-frequency light).
 STATIC_LAYERS_AS_MESH = True
 LAYER_ATLAS_RES = 256
+# A mesh layer's base texture is BAKED (Diffuse Color albedo + Alpha) rather than copied from the
+# raw image node, so it captures the material's colour modifications AND transparency (_bake_layer_
+# texture). LAYER_TEX_RES sizes that baked texture (the prop's "skin", swappable in the browser).
+LAYER_TEX_RES = 512
 LAYER_PLACEHOLDER_PX = 16   # size of the blank base texture for a bare-UV retexturable layer
                             # (no image in Blender -> textured entirely in the wallpaper tool)
 # How a marked optional layer is exported (a per-layer enum on the object/collection, registered in
@@ -1978,6 +1982,131 @@ def _bake_player_light_atlas(player, atlas_res=None, samples=None, out_dir=None,
             o.visible_diffuse, o.visible_shadow, o.visible_glossy = d, sh, g
         for m, sr in flat_mods:
             m.show_render = sr
+        scene.render.engine = saved_eng
+        if saved_samp is not None:
+            scene.cycles.samples = saved_samp
+        if saved_den is not None:
+            scene.cycles.use_denoising = saved_den
+        scene.render.bake.margin = saved_margin
+        if vis_restore is not None:
+            vis_restore()
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in saved_sel:
+            try:
+                o.select_set(True)
+            except RuntimeError:
+                pass
+        if saved_active is not None:
+            bpy.context.view_layer.objects.active = saved_active
+        if bpy.data.images.get(name):
+            bpy.data.images.remove(bpy.data.images[name])
+        bpy.context.view_layer.update()
+
+
+def _bake_layer_texture(meshes, res, out_dir, stem, samples=1):
+    """Bake an optional mesh-layer's OWN appearance into a UV texture (its swappable 'skin'),
+    capturing what the MATERIAL GRAPH does -- colour mix / tint / procedural AND transparency --
+    which copying the raw image texture misses. Two Cycles bakes onto the layer's real materials:
+    DIFFUSE COLOR -> the unlit albedo (RGB), then an EMIT of each Principled's Alpha -> the
+    opacity (A). Saved sRGB(RGB)+A as `<stem>_tex.png`. Baked ONCE (material colour is
+    frame-constant, so this is cheap even for the draft). Returns the bare file name, or None if
+    there is nothing to bake. Self-contained: restores materials/nodes/engine/samples/selection."""
+    scene = bpy.context.scene
+    meshes = [o for o in meshes if o.type == 'MESH' and o.data.uv_layers.active is not None]
+    if not meshes:
+        return None
+    name = "__LAYER_TEX__"
+    if bpy.data.images.get(name):
+        bpy.data.images.remove(bpy.data.images[name])
+    img = bpy.data.images.new(name, res, res, alpha=True, float_buffer=True)
+
+    saved_eng = scene.render.engine
+    cyc = getattr(scene, 'cycles', None)
+    saved_samp = getattr(cyc, 'samples', None) if cyc else None
+    saved_den = getattr(cyc, 'use_denoising', None) if cyc else None
+    saved_margin = scene.render.bake.margin
+    saved_active = bpy.context.view_layer.objects.active
+    saved_sel = list(bpy.context.selected_objects)
+    temp_mats = []        # (obj) meshes we gave a temporary slot (slotless -> bake needs one)
+    added_nodes = []      # (node_tree, target image node) to remove
+    added_emit = []       # (node_tree, emit node) + restore its output link
+    restore_surface = []  # (surface_input, original_from_socket)
+    vis_restore = None
+    try:
+        for o in meshes:
+            if not o.material_slots:
+                m = bpy.data.materials.new("__LAYER_TMP__"); m.use_nodes = True
+                o.data.materials.append(m)
+                temp_mats.append(o)
+        mats = list({ms.material for o in meshes for ms in o.material_slots if ms.material})
+        for mat in mats:                              # target image node = the bake destination
+            if not mat.use_nodes:
+                mat.use_nodes = True
+            nt = mat.node_tree
+            tgt = nt.nodes.new('ShaderNodeTexImage')
+            tgt.image = img
+            nt.nodes.active = tgt
+            added_nodes.append((nt, tgt))
+        vis_restore = _force_bake_visible(meshes)
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in meshes:
+            o.select_set(True)
+        bpy.context.view_layer.objects.active = meshes[0]
+        scene.render.engine = 'CYCLES'
+        if cyc:
+            scene.cycles.samples = samples            # DIFFUSE COLOR is the albedo -> noise-free
+            scene.cycles.use_denoising = False
+        scene.render.bake.margin = ATLAS_BAKE_MARGIN
+        bpy.context.view_layer.update()
+
+        # 1) ALBEDO: the diffuse base colour, unlit, WITH the material's node modifications
+        bpy.ops.object.bake(type='DIFFUSE', pass_filter={'COLOR'}, use_clear=True)
+        buf = np.empty(res * res * 4, 'float32')
+        img.pixels.foreach_get(buf)
+        rgba = buf.reshape(-1, 4).copy()
+        rgba[:, 3] = 1.0                              # default opaque (if the alpha bake is skipped)
+
+        # 2) ALPHA: emit each Principled's Alpha, bake EMIT -> the opacity (constant OR textured)
+        for mat in mats:
+            nt = mat.node_tree
+            out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
+            if out is None:
+                continue
+            surf = out.inputs.get('Surface')
+            orig = surf.links[0].from_socket if (surf and surf.is_linked) else None
+            emit = nt.nodes.new('ShaderNodeEmission')
+            added_emit.append((nt, emit))
+            bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+            a_in = bsdf.inputs.get('Alpha') if bsdf else None
+            if a_in is not None and a_in.is_linked:
+                nt.links.new(a_in.links[0].from_socket, emit.inputs['Color'])
+            else:
+                a = float(a_in.default_value) if a_in is not None else 1.0
+                emit.inputs['Color'].default_value = (a, a, a, 1.0)
+            nt.links.new(emit.outputs['Emission'], surf)
+            restore_surface.append((nt, surf, orig))
+        bpy.context.view_layer.update()
+        bpy.ops.object.bake(type='EMIT', use_clear=True)
+        aimg = np.empty(res * res * 4, 'float32')
+        img.pixels.foreach_get(aimg)
+        rgba[:, 3] = np.clip(aimg.reshape(-1, 4)[:, 0], 0.0, 1.0)   # emitted alpha (R channel)
+
+        rgba[:, :3] = _lin_to_srgb(rgba[:, :3])
+        fn = stem + "_tex.png"
+        os.makedirs(out_dir, exist_ok=True)
+        _save_image(rgba.reshape(-1), res, res, os.path.join(out_dir, fn), file_format='PNG')
+        print(f"[LAYER] baked texture {fn} ({res}x{res}, {len(meshes)} mesh, {len(mats)} mat)")
+        return fn
+    finally:
+        for nt, surf, orig in restore_surface:        # reconnect the real surface shader
+            if orig is not None:
+                nt.links.new(orig, surf)
+        for nt, emit in added_emit:
+            nt.nodes.remove(emit)
+        for nt, tgt in added_nodes:
+            nt.nodes.remove(tgt)
+        for o in temp_mats:                           # drop the temporary material slot we added
+            o.data.materials.pop()
         scene.render.engine = saved_eng
         if saved_samp is not None:
             scene.cycles.samples = saved_samp
@@ -4560,7 +4689,10 @@ def _static_export_steps(players, op=None, out_dir=None):
                                                    out_dir=out_dir, stem=f"{ml['name']}_atlas")
                     for d in muted:
                         d.mute = False
-                    tex = _static_export_layer_texture(ml["image"], out_dir, ml["name"])
+                    # bake the base texture (albedo + alpha) from the real material -- captures
+                    # colour modifications and transparency the raw image node misses
+                    tex = (_bake_layer_texture(ml["meshes"], LAYER_TEX_RES, out_dir, ml["name"])
+                           or _static_export_layer_texture(ml["image"], out_dir, ml["name"]))
                     mesh_layer_assets[ml["name"]] = {
                         "atlas": os.path.basename(rel) if rel else None, "tex": tex}
             finally:
@@ -4883,6 +5015,11 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         if ff is None:
             raise RuntimeError("The animated export needs ffmpeg at RENDER time (v5 reads the "
                                "UV/index/depth passes back through it). Install ffmpeg first.")
+        # bake each mesh layer's OWN texture (albedo + alpha) NOW, while its real materials are
+        # still in place -- the gray swap below replaces them for the light render. Baked once
+        # (the material colour is frame-constant); shipped + referenced in the manifest.
+        layer_tex = {ml["name"]: _bake_layer_texture(ml["meshes"], LAYER_TEX_RES, adir, ml["name"])
+                     for ml in mesh_layers}
         # players (and mesh layers) wear the gray light material for the WHOLE export: the light
         # render is a gray mannequin, relit in the viewer by the skin/layer texture -- restored
         # in the finally. (The atlas bake swaps to its own bake material per entity anyway.)
@@ -5109,10 +5246,11 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         welded, unique, ntris = _anim_write_mesh(os.path.join(adir, "mesh.bin"), st)
         K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), keys,
                                 ANIM_QUANT, fps / ANIM_KEYS_STEP)
-        # optional mesh layers: ship each one's base texture (its swappable "skin"). Its light is
-        # the shared atlas tile / screen light band, sampled by the same UV as a player.
-        layer_assets = {ml["name"]: {"tex": _static_export_layer_texture(
-            ml["image"], adir, ml["name"])} for ml in mesh_layers}
+        # optional mesh layers: reference each one's baked base texture (its swappable "skin",
+        # albedo + alpha; baked above before the gray swap). Light = the shared atlas tile / screen
+        # light band, sampled by the same UV as a player.
+        layer_assets = {ml["name"]: {"tex": layer_tex[ml["name"]]}
+                        for ml in mesh_layers if layer_tex.get(ml["name"])}
         # which bands the composite actually has, in stack order (matches _anim_encode); a
         # disabled band is simply absent, and the viewer skips it.
         band_order = [name for (name, on) in (("background", ANIM_DO_BG),
