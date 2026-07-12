@@ -334,6 +334,12 @@ const baseLabel = (lab) => lab.replace(/_(classic|slim)$/, '');   // drop the ar
 {
   const box = document.getElementById('skins');
   box.innerHTML = '';                       // re-boot: drop the previous instance's controls
+  if (!HAS_ATLAS) {                         // draft/screen-light export: no 2nd-layer support
+    const note = document.createElement('div');
+    note.style.cssText = 'color:var(--muted);font-size:11px;margin-bottom:4px';
+    note.textContent = '2nd layer off — full-quality export (baked atlas) required';
+    box.appendChild(note);
+  }
   manifest.mesh.players.forEach((p, i) => {
     const lab = document.createElement('label');
     lab.textContent = ` ${p.label}: `;
@@ -349,22 +355,25 @@ const baseLabel = (lab) => lab.replace(/_(classic|slim)$/, '');   // drop the ar
     };
     lab.appendChild(inp);
     box.appendChild(lab);
-    // per-part toggles for the 2nd layer (manifests with parts[]; overlays borrow the base
-    // light). Variant-specific overlays (classic/slim sleeves) collapse to ONE checkbox per
-    // side, keyed by the variant-stripped label -- so the panel shows "sleeve_left" once
-    // rather than a live and a dead checkbox for the two arm styles.
-    const ovSeen = new Set();
-    for (const pm of (p.parts || []).filter(pm => pm.overlay)) {
-      const base = baseLabel(pm.label);
-      if (ovSeen.has(base)) continue;
-      ovSeen.add(base);
-      const key = `${p.label}::${base}`;
-      const pl = document.createElement('label');
-      const cb = document.createElement('input');
-      cb.type = 'checkbox'; cb.checked = true;
-      cb.onchange = () => { cb.checked ? partOff.delete(key) : partOff.add(key); };
-      pl.appendChild(cb); pl.appendChild(document.createTextNode(base + ' '));
-      box.appendChild(pl);
+    // per-part toggles for the 2nd layer -- ONLY when the export ships a light atlas (full
+    // quality), which lights the overlay shells per-face in UV. A screen-space light export
+    // (draft) is base-only and can't light them, so the viewer keeps the 2nd layer OFF and
+    // hides these toggles. Variant-specific overlays (classic/slim sleeves) collapse to ONE
+    // checkbox per side, keyed by the variant-stripped label.
+    if (HAS_ATLAS) {
+      const ovSeen = new Set();
+      for (const pm of (p.parts || []).filter(pm => pm.overlay)) {
+        const base = baseLabel(pm.label);
+        if (ovSeen.has(base)) continue;
+        ovSeen.add(base);
+        const key = `${p.label}::${base}`;
+        const pl = document.createElement('label');
+        const cb = document.createElement('input');
+        cb.type = 'checkbox'; cb.checked = true;
+        cb.onchange = () => { cb.checked ? partOff.delete(key) : partOff.add(key); };
+        pl.appendChild(cb); pl.appendChild(document.createTextNode(base + ' '));
+        box.appendChild(pl);
+      }
     }
     // arm-style toggle -- only for manifests that ship both variants (parts[] with variant)
     if ((p.parts || []).some(pm => pm.variant === 'slim')) {
@@ -493,7 +502,8 @@ function drawPlayers(o) {
     const ranges = [];
     for (const pm of p.parts) {
       if (pm.variant && pm.variant !== sel) continue;
-      if (pm.overlay && partOff.has(`${p.label}::${baseLabel(pm.label)}`)) continue;
+      // 2nd layer: off entirely without a light atlas (draft), else per the panel toggle
+      if (pm.overlay && (!HAS_ATLAS || partOff.has(`${p.label}::${baseLabel(pm.label)}`))) continue;
       const [t0, t1] = pm.tri_range;
       if (ranges.length && ranges[ranges.length - 1][1] === t0) ranges[ranges.length - 1][1] = t1;
       else ranges.push([t0, t1]);

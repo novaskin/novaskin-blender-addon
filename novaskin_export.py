@@ -329,14 +329,17 @@ ANIM_STACK_CRF = 30
 ANIM_DO_BG = True
 ANIM_DO_LIGHT = True
 ANIM_DO_OCC = True
-# "Bake atlas" mode: replace the screen-space LIGHT band with a per-player UV-space light
-# atlas (the static export's bake, per frame). The atlas lights the 2nd-layer overlays
-# per-face in UV -- no screen-space extension/fringe -- and bakes overlays non-occluding so
-# the base stays overlay-free (no phantom). The atlas TILES ride in the light band's slot
-# (a WxH canvas, ATLAS_RES tiles packed row-major in a corner) so the composite stacking is
-# unchanged. Stored sRGB (not _to_display) -> the viewer's existing pow(2.2)*2 + view_lut
-# decode is exact. Costs a Cycles bake per player per frame; drops the screen light.
-ANIM_DO_ATLAS = False
+# The LIGHT band's TYPE follows draft vs full, not a toggle:
+#   DRAFT -> screen-space light (2 renders/frame, fast; base-only -- the viewer turns the
+#            2nd-layer overlays OFF, since screen light can't light the overlay shells that
+#            extend past the base silhouette).
+#   FULL  -> per-player UV BAKE atlas (a Cycles bake/player/frame): lights every face in UV,
+#            base AND 2nd layer, overlays baked non-occluding so the base stays overlay-free
+#            (no phantom). Tiles ride in the light band's slot (WxH canvas, tiles packed in a
+#            corner) so the composite stacking is unchanged; stored sRGB (not _to_display) so
+#            the viewer's pow(2.2)*2 + view_lut decode is exact. Enabling overlays in the
+#            viewer requires this (the manifest's `light_atlas`).
+# Derived per export as `ANIM_DO_LIGHT and not DRAFT_MODE` (see _anim_render_steps).
 ANIM_ENCODE = True          # run ffmpeg after rendering (else keep PNG sequences + script)
 ANIM_KEEP_SEQUENCES = False  # keep seq/ PNGs after a successful encode
 # Resume an interrupted export: skip frames whose PNGs already exist in seq/. A crash or
@@ -2992,8 +2995,9 @@ def _anim_frame_cached(adir, i):
     """True if frame i's PNGs for the ENABLED bands already exist (non-empty) -- resume skips
     re-rendering. Only the bands actually saved (per the ANIM_DO_* toggles) are required."""
     fn = f"{i + 1:04d}.png"
-    # the atlas mode also writes the "light" dir (the atlas tiles ride in the light band slot)
-    dirs = [k for k, on in (("bg", ANIM_DO_BG), ("light", ANIM_DO_LIGHT or ANIM_DO_ATLAS),
+    # the "light" dir holds either the screen light (draft) or the atlas tiles (full) -- both
+    # gated by ANIM_DO_LIGHT, so the resume check is the same
+    dirs = [k for k, on in (("bg", ANIM_DO_BG), ("light", ANIM_DO_LIGHT),
                             ("occ", ANIM_DO_OCC)) if on]
     return bool(dirs) and all(os.path.exists(p) and os.path.getsize(p) > 0
                               for p in (os.path.join(adir, "seq", k, fn) for k in dirs))
@@ -4697,10 +4701,12 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
     baked), combined player light, and the player-vs-scenery occlusion matte -- plus mesh keys
     every ANIM_KEYS_STEP frames. Writes mesh.bin/anim.bin/manifest.json + view_lut.png and
     vstacks the three streams into ONE composite.webm."""
-    if not (ANIM_DO_BG or ANIM_DO_LIGHT or ANIM_DO_OCC or ANIM_DO_ATLAS):
+    if not (ANIM_DO_BG or ANIM_DO_LIGHT or ANIM_DO_OCC):
         if op is not None:
             op.report({'ERROR'}, "NovaSkin animated: enable at least one band (BG / Light / Occ)")
         return
+    # LIGHT band type: screen-space in draft, baked UV atlas in full quality (enables overlays).
+    do_atlas = ANIM_DO_LIGHT and not DRAFT_MODE
     s = bpy.context.scene
     f0 = s.frame_start if frame_start is None else frame_start
     f1 = s.frame_end if frame_end is None else frame_end
@@ -4831,7 +4837,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         # 'Atlas res'), so drafts (smaller frames) shrink the tiles automatically instead of
         # failing. Reused every frame; the manifest ships res + per_row for the viewer.
         atlas_A, atlas_per_row = _anim_atlas_pack(len(ordered_p), W, H, int(ATLAS_RES))
-        if ANIM_DO_ATLAS:
+        if do_atlas:
             print(f"[ANIM] bake atlas: {len(ordered_p)} player(s) -> {atlas_A}px tiles, "
                   f"{atlas_per_row}/row (frame {W}x{H}, cap {ATLAS_RES})")
         for o in s.objects:
@@ -4922,11 +4928,11 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                     zlo, zsc = (0.0, 1.0) if zfar > 0.99 else (16.0 / 255.0, 219.0 / 255.0)
                     z_scene = np.clip((zr - zlo) / zsc, 0.0, 1.0)
 
-            # 2) LIGHT band -- a per-player UV bake atlas (ANIM_DO_ATLAS) OR the screen-space
+            # 2) LIGHT band -- a per-player UV bake atlas (full quality) OR the screen-space
             # light. Both ride in the SAME WxH band slot and are sRGB(0.5*L)-encoded, so the
             # viewer's pow(2.2)*2 + view_lut decode is identical; only the SAMPLING differs
             # (atlas: skin UV + player tile; screen: fragment position).
-            if ANIM_DO_ATLAS:
+            if do_atlas:
                 # bake each player's UV light atlas from the FULL player -- overlays are made
                 # non-occluding inside _bake_player_light_atlas (Option B), so the 2nd layer is
                 # lit per-face (no screen-space fringe) and the base stays overlay-free (no
@@ -5023,7 +5029,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         # which bands the composite actually has, in stack order (matches _anim_encode); a
         # disabled band is simply absent, and the viewer skips it.
         band_order = [name for (name, on) in (("background", ANIM_DO_BG),
-                                              ("light", ANIM_DO_LIGHT or ANIM_DO_ATLAS),
+                                              ("light", ANIM_DO_LIGHT),
                                               ("occlusion", ANIM_DO_OCC)) if on]
         bands = {name: idx for idx, name in enumerate(band_order)}
         bands["count"] = len(band_order)
@@ -5062,7 +5068,7 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                             "skin_lin(uv) * light_band(screen) * 2, then the view transform "
                             "(view_lut). Interpolate between mesh keys."),
         }
-        if ANIM_DO_ATLAS:
+        if do_atlas:
             # the LIGHT band holds per-player UV light atlases (not a screen-space frame): the
             # viewer samples it by the skin UV inside each player's tile. Tiles are ATLAS_RES px,
             # laid row-major (per_row across) in the band's BOTTOM-LEFT corner, back-to-front
@@ -5416,13 +5422,6 @@ class NovaSkinSettings(bpy.types.PropertyGroup):
         name="Occlusion", default=True,
         description="Animated: include the occlusion band (player-vs-scenery matte). OFF when nothing "
                     "occludes the players -- skips a render pass and a band")
-    anim_light_atlas: BoolProperty(
-        name="Bake atlas", default=False,
-        description="Animated: bake a per-player UV light atlas instead of the screen-space light "
-                    "band. Lights the 2nd-layer overlays correctly per-face (no screen-space "
-                    "fringe), overlay-free base (no phantom). Tile size auto-fits the frame, "
-                    "capped at 'Atlas res' (drafts shrink it). Costs a Cycles bake per player per "
-                    "frame; replaces the Light band")
     fix_2layer_position: BoolProperty(
         name="Fix Hat Position and Scale", default=True,
         description="Snap the hat (2_Layer_Extrusion) onto the head and scale it to the "
@@ -5492,7 +5491,6 @@ def _apply_settings(scene, draft=False):
     g["ANIM_DO_BG"] = st.anim_background
     g["ANIM_DO_LIGHT"] = st.anim_light
     g["ANIM_DO_OCC"] = st.anim_occlusion
-    g["ANIM_DO_ATLAS"] = st.anim_light_atlas
     g["FIX_2LAYER_POSITION"] = st.fix_2layer_position
     g["LIGHTSHADOW_FORMAT"] = st.lightshadow_format
     g["JPEG_QUALITY"] = st.jpeg_quality
@@ -6137,15 +6135,13 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
 
             box = layout.box()
             box.label(text="Animated", icon='RENDER_ANIMATION')
-            # which composite bands to render (drop Occlusion when nothing occludes the players)
+            # which composite bands to render (drop Occlusion when nothing occludes the players).
+            # The light band is screen-space in Draft and a baked UV atlas in Full (automatic).
             bcol = box.column(align=True)
             bcol.label(text="Bands:")
             bcol.prop(st, "anim_background")
-            lrow = bcol.row(align=True)
-            lrow.enabled = not st.anim_light_atlas   # the atlas replaces the screen light band
-            lrow.prop(st, "anim_light")
+            bcol.prop(st, "anim_light")
             bcol.prop(st, "anim_occlusion")
-            bcol.prop(st, "anim_light_atlas")        # OFF = screen light; ON = per-player UV bake
             if not running:               # while running, the top progress bar is the indicator
                 # draft: first ~N s at draft resolution/samples -- the iteration button
                 box.operator("render.novaskin_animated",
