@@ -74,6 +74,10 @@ const STACK_V = manifest.bands.vertical !== false;   // vertical (landscape) vs 
 const HAS_BG = BAND.background !== undefined;
 const HAS_LIGHT = BAND.light !== undefined;
 const HAS_OCC = BAND.occlusion !== undefined;
+// bake-atlas mode: the LIGHT band carries per-player UV light tiles instead of a screen frame.
+// {res, tiles, per_row}: tile i is at (i%per_row, i//per_row), res px, bottom-left corner up.
+const ATLAS = manifest.light_atlas || null;
+const HAS_ATLAS = !!ATLAS;
 
 // --- mesh.bin: NSKM | u32 version, welded, unique, ntris | zlib(uv u16x2, src u16, tris u16x3)
 const mb = await bin(manifest.mesh.file);
@@ -215,6 +219,8 @@ const meshP = prog(
    uniform sampler2D uViewLut;
    uniform vec4 uLutSpec;   // N, tiles, min_ev, max_ev (from manifest.view_lut)
    uniform float uBlackT;   // "black discard" slider, /255 (default 0)
+   // bake-atlas mode: the LIGHT band holds per-player UV light tiles (not a screen frame).
+   uniform bool uAtlas; uniform float uAtlasTile; uniform vec2 uAtlasSpec;   // res, per_row
    in vec2 vUv; out vec4 frag;
    ${BAND_GLSL}
    // anti-aliased pixel-art sampling: snap UV to the texel CENTRE but ramp across the seam over ~1px.
@@ -251,13 +257,27 @@ const meshP = prog(
      // silhouette. Discard the fragment where it is set.
      // uOcclude/uUseLight/uHasBg are false when the export dropped that band (see JS).
      if (uOcclude && sampleBand(uStack, fuv, uOccBand).r > 0.5) discard;
-     vec3 lraw = uUseLight ? sampleBand(uStack, fuv, uLightBand).rgb : vec3(1.0);
+     // LIGHT sample: the screen-space light band at the fragment position, OR -- in bake-atlas
+     // mode -- the player's UV light tile (skin uv inside the tile packed in the band's corner:
+     // tile uAtlasTile at (col,row) row-major, each uAtlasSpec.x px, uAtlasSpec.y per row).
+     vec3 lraw = vec3(1.0);
+     if (uUseLight) {
+       if (uAtlas) {
+         float A = uAtlasSpec.x, pr = uAtlasSpec.y;
+         float col = mod(uAtlasTile, pr), row = floor(uAtlasTile / pr);
+         vec2 auv = vec2(A * (col + vUv.x) / uRes.x, A * (row + vUv.y) / uRes.y);
+         lraw = sampleBand(uStack, auv, uLightBand).rgb;
+       } else {
+         lraw = sampleBand(uStack, fuv, uLightBand).rgb;
+       }
+     }
      // black-discard tiebreak at player/scenery intersections (the z-fighty seam). The winner
      // is a stable pixel comparison (illum darkness vs bg darkness) instead of the noisy matte
      // edge -- discard the player ONLY where its illum is black AND the bg has real colour to
      // show. If the bg is black too (or absent), keep the player. bg band = the scenery at this
      // pixel (players are camera-invisible in the bg render).
-     if (uOcclude && uUseLight) {
+     if (uOcclude && uUseLight && !uAtlas) {   // fringe tiebreak: screen light only (the atlas
+                                               // has no dilated black fringe to eat)
        bool illumBlack = max(lraw.r, max(lraw.g, lraw.b)) <= uBlackT;
        bool bgBlack = false;
        if (uHasBg) {
@@ -446,6 +466,8 @@ function drawPlayers(o) {
   gl.uniform1i(gl.getUniformLocation(meshP, 'uUseLight'), (o.light && HAS_LIGHT) ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uOcclude'), (o.occlude && HAS_OCC) ? 1 : 0);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uHasBg'), HAS_BG ? 1 : 0);
+  gl.uniform1i(gl.getUniformLocation(meshP, 'uAtlas'), HAS_ATLAS ? 1 : 0);
+  if (HAS_ATLAS) gl.uniform2f(gl.getUniformLocation(meshP, 'uAtlasSpec'), ATLAS.res, ATLAS.per_row);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uFlat'), o.wire ? 1 : 0);
   gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, tStack);
   gl.uniform1i(gl.getUniformLocation(meshP, 'uStack'), 1);
@@ -464,6 +486,7 @@ function drawPlayers(o) {
   gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.clear(gl.DEPTH_BUFFER_BIT);
   manifest.mesh.players.forEach((p, i) => {
     gl.bindTexture(gl.TEXTURE_2D, tSkins[i]);
+    if (HAS_ATLAS) gl.uniform1f(gl.getUniformLocation(meshP, 'uAtlasTile'), i);  // player -> tile
     // shared parts + the SELECTED arm variant + each enabled overlay, coalesced into
     // contiguous spans
     const sel = variantSel[p.label] || p.default_variant || 'classic';
