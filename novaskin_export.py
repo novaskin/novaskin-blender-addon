@@ -3063,18 +3063,51 @@ def _anim_label_kind(lab):
     return None
 
 
-def _anim_collect_static(players, W, H):
+def _anim_collect_static(players, W, H, layers=None):
     """Build the static mesh buffers at the CURRENT frame: weld vertices by
     (part, vertex, uv) for the GPU buffers, and map each welded vert to a UNIQUE
     (part, vertex) position index -- anim.bin only carries unique positions, mesh.bin
     carries the static src (welded -> unique) map. Players are emitted back-to-front
-    (painter's order). Returns the dict used by _anim_frame_positions/_anim_write_mesh."""
+    (painter's order). Optional mesh LAYERS (props like a held sword) are emitted after the
+    players as SIMPLE entities -- every mesh one base part, no arm variant, no 2nd layer,
+    role='layer', its own shipped texture, toggled as a whole in the viewer. Returns the dict
+    used by _anim_frame_positions/_anim_write_mesh."""
     dg = bpy.context.evaluated_depsgraph_get()
     ordered = sorted(players, key=lambda p: _player_camera_depth(p) or 0.0, reverse=True)
     st = {"parts": [], "uv": [], "src": [], "tris": [], "players": [],
           "uniq": [],                                  # uniq: list of (part_idx, vert_idx)
           "flip": []}       # inactive arm-variant parts: positions need the rig style flipped
     weld, uniq_keys = {}, {}
+
+    def emit(o, lab, subset, overlay, parts_meta, pis_meta):
+        pt0 = len(st["tris"]) // 3
+        pi = len(st["parts"]); st["parts"].append(o.name)
+        pis_meta.append(pi)
+        ev = o.evaluated_get(dg); me = ev.to_mesh(); me.calc_loop_triangles()
+        uvl = me.uv_layers.active.data
+        lts = (me.loop_triangles if subset is None
+               else [me.loop_triangles[i] for i in subset])
+        for lt in lts:
+            for li, vi in zip(lt.loops, lt.vertices):
+                u, v = uvl[li].uv
+                k = (pi, vi, round(u * 4096), round(v * 4096))
+                j = weld.get(k)
+                if j is None:
+                    j = len(st["src"]); weld[k] = j
+                    uk = (pi, vi)
+                    ui = uniq_keys.get(uk)
+                    if ui is None:
+                        ui = len(st["uniq"]); uniq_keys[uk] = ui
+                        st["uniq"].append(uk)
+                    st["uv"] += [min(max(u, 0.0), 1.0), min(max(v, 0.0), 1.0)]
+                    st["src"].append(ui)
+                st["tris"].append(j)
+        ev.to_mesh_clear()
+        parts_meta.append({"label": lab,
+                           "tri_range": [pt0, len(st["tris"]) // 3],
+                           "overlay": overlay,
+                           "variant": _part_variant(lab)})
+
     for p in ordered:
         labs = p.get("uv_labels") or _assign_part_labels(p["uv_parts"], label=p["label"])
         kind = {o.name: _anim_label_kind(labs.get(o.name)) for o in p["uv_parts"]}
@@ -3088,47 +3121,17 @@ def _anim_collect_static(players, W, H):
                     mixed[o.name] = b
         w0, t0 = len(st["src"]), len(st["tris"]) // 3
         parts_meta, pis_meta = [], []
-
-        def emit(o, lab, subset, overlay):
-            pt0 = len(st["tris"]) // 3
-            pi = len(st["parts"]); st["parts"].append(o.name)
-            pis_meta.append(pi)
-            ev = o.evaluated_get(dg); me = ev.to_mesh(); me.calc_loop_triangles()
-            uvl = me.uv_layers.active.data
-            lts = (me.loop_triangles if subset is None
-                   else [me.loop_triangles[i] for i in subset])
-            for lt in lts:
-                for li, vi in zip(lt.loops, lt.vertices):
-                    u, v = uvl[li].uv
-                    k = (pi, vi, round(u * 4096), round(v * 4096))
-                    j = weld.get(k)
-                    if j is None:
-                        j = len(st["src"]); weld[k] = j
-                        uk = (pi, vi)
-                        ui = uniq_keys.get(uk)
-                        if ui is None:
-                            ui = len(st["uniq"]); uniq_keys[uk] = ui
-                            st["uniq"].append(uk)
-                        st["uv"] += [min(max(u, 0.0), 1.0), min(max(v, 0.0), 1.0)]
-                        st["src"].append(ui)
-                    st["tris"].append(j)
-            ev.to_mesh_clear()
-            parts_meta.append({"label": lab,
-                               "tri_range": [pt0, len(st["tris"]) // 3],
-                               "overlay": overlay,
-                               "variant": _part_variant(lab)})
-
         # ALL base tris first, then ALL overlay tris (the viewer's base span is
         # [tri_range[0], overlay_tri_start]); mixed objects are visited once per phase.
         for phase in ('base', 'overlay'):
             for o in sorted([o for o in p["uv_parts"] if kind[o.name] == phase],
                             key=lambda o: o.name):
-                emit(o, labs.get(o.name), None, phase == 'overlay')
+                emit(o, labs.get(o.name), None, phase == 'overlay', parts_meta, pis_meta)
             for o in sorted([o for o in p["uv_parts"] if o.name in mixed],
                             key=lambda o: o.name):
                 for lab in sorted(mixed[o.name]):
                     if _anim_label_kind(lab) == phase:
-                        emit(o, lab, mixed[o.name][lab], phase == 'overlay')
+                        emit(o, lab, mixed[o.name][lab], phase == 'overlay', parts_meta, pis_meta)
         ov_t0 = next((pm["tri_range"][0] for pm in parts_meta if pm["overlay"]),
                      len(st["tris"]) // 3)
         # The OTHER arm style (classic <-> slim, same design as the static export): topology
@@ -3146,19 +3149,35 @@ def _anim_collect_static(players, W, H):
                          if _part_variant(labs.get(o.name)) == 'slim'],
                         key=lambda o: o.name):
             lab = labs.get(o.name)
-            emit(o, lab, None, any(k in lab for k in ANIM_OVERLAY_KEYS))
+            emit(o, lab, None, any(k in lab for k in ANIM_OVERLAY_KEYS), parts_meta, pis_meta)
         flip_pis = [pi for pi, pm in zip(pis_meta, parts_meta)
                     if pm["variant"] == other]
         if flip_pis:
             st["flip"].append({"player": p, "parts": flip_pis,
                                "slim_value": dict(MASK_ARM_VARIANTS)[other]})
-        st["players"].append({"label": p["label"],
+        st["players"].append({"label": p["label"], "role": "player",
                               "welded_range": [w0, len(st["src"])],
                               "tri_range": [t0, len(st["tris"]) // 3],
                               "overlay_tri_start": ov_t0,
                               "parts": parts_meta,
                               "default_variant": default_variant,
                               "camera_depth": round(_player_camera_depth(p) or 0.0, 3)})
+    # optional MESH LAYERS (props: a held sword, glass): a simple entity each -- every mesh a
+    # base part, no arm variant, no 2nd layer, its own shipped texture, toggled as a whole in the
+    # viewer. Emitted AFTER the players; they depth-composite against them via the shared z buffer.
+    for ml in (layers or []):
+        w0, t0 = len(st["src"]), len(st["tris"]) // 3
+        parts_meta, pis_meta = [], []
+        for o in sorted([o for o in ml["meshes"] if o.type == 'MESH'
+                         and o.data.uv_layers.active is not None], key=lambda o: o.name):
+            emit(o, o.name, None, False, parts_meta, pis_meta)
+        ntris = len(st["tris"]) // 3
+        st["players"].append({"label": ml["name"], "role": "layer",
+                              "welded_range": [w0, len(st["src"])],
+                              "tri_range": [t0, ntris],
+                              "overlay_tri_start": ntris,          # no overlays on a layer
+                              "parts": parts_meta,
+                              "camera_depth": round(_group_camera_depth(ml["meshes"]) or 0.0, 3)})
     # per-part gather arrays: part_idx -> (vert indices, unique indices)
     gather = {}
     for ui, (pi, vi) in enumerate(st["uniq"]):
@@ -4744,6 +4763,22 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             (base_parts if kind is not None else other_char).append(o)
     char_names = {o.name for p in players for o in p["char_all"]}
 
+    # Optional MESH LAYERS: props marked as optional layers (a held sword, a pane of glass) are
+    # exported as toggleable MESHES -- geometry + own texture + the shared player light -- so they
+    # depth-composite against the players (a flat sprite can't). The animated export always treats
+    # a marked layer as mesh (unlike the static SPRITE default); one whose meshes don't share a
+    # single texture can't be a mesh, so it is left as baked scenery (with a warning).
+    mesh_layers = []
+    for g in discover_layers():
+        img, ok = _static_layer_mesh_info(g)
+        if ok:
+            mesh_layers.append(dict(g, image=img))
+        else:
+            print(f"[ANIM] optional layer '{g['name']}' can't be a mesh (its meshes don't share "
+                  f"one texture) -- left as baked scenery, not toggleable.")
+    layer_meshes = [o for ml in mesh_layers for o in ml["meshes"] if o.type == 'MESH']
+    layer_names = {o.name for o in layer_meshes}
+
     forced_props = _force_selection_props_on(players)   # not strictly needed (base only)
     sess = _Session()
     cur_frame = s.frame_current
@@ -4774,6 +4809,8 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             o.hide_render = False
         for o in overlay_parts:
             o.hide_render = True
+        for o in layer_meshes:            # optional mesh layers render like players (base look)
+            o.hide_render = False
         bpy.context.view_layer.update()
 
     try:
@@ -4800,8 +4837,9 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         bpy.context.view_layer.update()
 
         setup()
-        st = _anim_collect_static(players, W, H)
-        yield prog(f"static mesh ({len(st['src'])} welded / {len(st['uniq'])} unique verts)")
+        st = _anim_collect_static(players, W, H, layers=mesh_layers)
+        yield prog(f"static mesh ({len(st['src'])} welded / {len(st['uniq'])} unique verts, "
+                   f"{len(mesh_layers)} layer(s))")
 
         # Pre-pass: capture the mesh keys (every ANIM_KEYS_STEP frames) for anim.bin. The
         # streams are full-frame (no crop -- they vstack into one video), so no bbox needed.
@@ -4820,15 +4858,19 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         if zb1 - zb0 < 1e-6:
             zb1 = zb0 + 1e-6
         gray = _gray_diffuse_material()
-        scenery = [o for o in s.objects if o.type == 'MESH' and o.name not in char_names]
+        # optional mesh layers are NOT scenery (they ship as separate meshes); exclude them so
+        # they aren't baked into the bg band and don't light as scenery.
+        scenery = [o for o in s.objects if o.type == 'MESH'
+                   and o.name not in char_names and o.name not in layer_names]
         # ---- v5 pipeline setup ----
         ff = _ffmpeg_path()
         if ff is None:
             raise RuntimeError("The animated export needs ffmpeg at RENDER time (v5 reads the "
                                "UV/index/depth passes back through it). Install ffmpeg first.")
-        # players wear the gray light material for the WHOLE export: the bg render doubles as
-        # the light source (gray mannequin) -- restored in the finally
-        v5_mats = _swap_materials(base_parts, gray)
+        # players (and mesh layers) wear the gray light material for the WHOLE export: the light
+        # render is a gray mannequin, relit in the viewer by the skin/layer texture -- restored
+        # in the finally. (The atlas bake swaps to its own bake material per entity anyway.)
+        v5_mats = _swap_materials(base_parts + layer_meshes, gray)
         # per-player object index, in the SAME back-to-front order as the collected mesh
         # players (the atlas tile order). Scenery zeroed so nothing pollutes a player's tile.
         # (_Session snapshots pass_index and restores it.)
@@ -4836,10 +4878,13 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         # bake-atlas packing: size the tiles to FIT the WxH light-band slot (capped at the panel
         # 'Atlas res'), so drafts (smaller frames) shrink the tiles automatically instead of
         # failing. Reused every frame; the manifest ships res + per_row for the viewer.
-        atlas_A, atlas_per_row = _anim_atlas_pack(len(ordered_p), W, H, int(ATLAS_RES))
+        # one atlas tile per ENTITY (players + mesh layers), in st["players"] order = the viewer's
+        # uAtlasTile index. Players come first (ordered_p order), then the layers.
+        n_tiles = len(ordered_p) + len(mesh_layers)
+        atlas_A, atlas_per_row = _anim_atlas_pack(n_tiles, W, H, int(ATLAS_RES))
         if do_atlas:
-            print(f"[ANIM] bake atlas: {len(ordered_p)} player(s) -> {atlas_A}px tiles, "
-                  f"{atlas_per_row}/row (frame {W}x{H}, cap {ATLAS_RES})")
+            print(f"[ANIM] bake atlas: {len(ordered_p)} player(s) + {len(mesh_layers)} layer(s) "
+                  f"-> {atlas_A}px tiles, {atlas_per_row}/row (frame {W}x{H}, cap {ATLAS_RES})")
         for o in s.objects:
             o.pass_index = 0
         for pnum, p in enumerate(ordered_p, start=1):
@@ -4906,8 +4951,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             # it if the bg band is wanted OR occlusion is (the matte needs its scenery depth).
             if ANIM_DO_BG or ANIM_DO_OCC:
                 setup()
-                sc = {o: o.visible_camera for o in base_parts}
-                for o in base_parts:
+                # players AND mesh layers camera-invisible (still cast shadows): they ship as
+                # separate meshes, so the bg band must not contain them.
+                sc = {o: o.visible_camera for o in base_parts + layer_meshes}
+                for o in base_parts + layer_meshes:
                     o.visible_camera = False
                 bpy.context.view_layer.update()
                 bg, rW, rH = yield from _render_combined_array_gen(sess, ILLUM_RES_PCT)
@@ -4949,6 +4996,19 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                     if tile is None:                   # player has no visible parts this frame
                         continue
                     col, row = pnum % atlas_per_row, pnum // atlas_per_row
+                    x0, y0 = col * atlas_A, row * atlas_A
+                    atlas_band[y0:y0 + atlas_A, x0:x0 + atlas_A] = tile
+                # mesh-layer tiles follow the players (same order as st["players"] / the viewer's
+                # uAtlasTile). A layer bakes with the other entities visible, so it is shadowed.
+                for li, ml in enumerate(mesh_layers):
+                    syn = {"uv_parts": [o for o in ml["meshes"] if o.type == 'MESH'],
+                           "label": ml["name"]}
+                    tile = _bake_player_light_atlas(syn, atlas_res=atlas_A,
+                                                    encode='srgb', return_px=True)
+                    if tile is None:
+                        continue
+                    tnum = len(ordered_p) + li
+                    col, row = tnum % atlas_per_row, tnum // atlas_per_row
                     x0, y0 = col * atlas_A, row * atlas_A
                     atlas_band[y0:y0 + atlas_A, x0:x0 + atlas_A] = tile
                 lbuf = np.ones((H * W, 4), 'float32')
@@ -4996,8 +5056,11 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
             setup()
             for o in overlay_parts:
                 o.hide_render = False                 # FULL player for the occlusion silhouette
-            sc = {o: o.visible_camera for o in scenery}
-            for o in scenery:
+            # mesh layers are camera-invisible here: the matte is player-vs-scenery only, so their
+            # depth must not enter z_play. (Layer-vs-scenery occlusion is a v1 gap; layer-vs-player
+            # is handled by the shared mesh z-buffer in the viewer.)
+            sc = {o: o.visible_camera for o in list(scenery) + layer_meshes}
+            for o in list(scenery) + layer_meshes:
                 o.visible_camera = False
             occ_samp = s.cycles.samples if hasattr(s, 'cycles') else None
             occ_den = s.cycles.use_denoising if hasattr(s, 'cycles') else None
@@ -5026,6 +5089,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         welded, unique, ntris = _anim_write_mesh(os.path.join(adir, "mesh.bin"), st)
         K, V = _anim_write_anim(os.path.join(adir, "anim.bin"), keys,
                                 ANIM_QUANT, fps / ANIM_KEYS_STEP)
+        # optional mesh layers: ship each one's base texture (its swappable "skin"). Its light is
+        # the shared atlas tile / screen light band, sampled by the same UV as a player.
+        layer_assets = {ml["name"]: {"tex": _static_export_layer_texture(
+            ml["image"], adir, ml["name"])} for ml in mesh_layers}
         # which bands the composite actually has, in stack order (matches _anim_encode); a
         # disabled band is simply absent, and the viewer skips it.
         band_order = [name for (name, on) in (("background", ANIM_DO_BG),
@@ -5069,12 +5136,16 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
                             "(view_lut). Interpolate between mesh keys."),
         }
         if do_atlas:
-            # the LIGHT band holds per-player UV light atlases (not a screen-space frame): the
-            # viewer samples it by the skin UV inside each player's tile. Tiles are ATLAS_RES px,
-            # laid row-major (per_row across) in the band's BOTTOM-LEFT corner, back-to-front
-            # player order (same as mesh.players). Rest of the band is black.
-            manifest["light_atlas"] = {"res": atlas_A, "tiles": len(ordered_p),
+            # the LIGHT band holds per-ENTITY UV light atlases (not a screen-space frame): the
+            # viewer samples it by the skin/layer UV inside each entity's tile. Tiles are ATLAS_RES
+            # px, laid row-major (per_row across) in the band's BOTTOM-LEFT corner, in mesh.players
+            # order (players back-to-front, then the mesh layers). Rest of the band is black.
+            manifest["light_atlas"] = {"res": atlas_A, "tiles": n_tiles,
                                        "per_row": atlas_per_row}
+        if mesh_layers:
+            # optional mesh-layer assets keyed by mesh.players[].label (role='layer'): the base
+            # texture to relight (like a skin). Their light tile = their index in mesh.players.
+            manifest["layers"] = layer_assets
         # the scene's view transform as a 3D LUT: the viewer's final display encode after
         # relighting in linear -- exact AgX/Filmic/... match with the background render
         manifest["view_lut"] = _write_view_lut(os.path.join(adir, "view_lut.png"))
