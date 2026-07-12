@@ -61,7 +61,7 @@ Outputs go to <blend_dir>/novaskin/.
 bl_info = {
     "name": "NovaSkin Export",
     "author": "saviski",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (4, 2, 0),
     "location": "Top bar > Render > Render for NovaSkin",
     "description": "Export Minecraft scenes as re-skinnable browser wallpapers",
@@ -80,7 +80,7 @@ from bpy.props import (BoolProperty, IntProperty, EnumProperty,
 # Add-on version stamped into manifest.json ("addon_version"). Keep in sync with bl_info
 # and blender_manifest.toml -- bl_info must stay a literal (Blender parses it via ast) and
 # is STRIPPED from the extension zip, so the manifest can't read it at run time.
-ADDON_VERSION = "1.3.0"
+ADDON_VERSION = "1.4.0"
 # Version of the manifest.json FORMAT (bump when keys/semantics change, so the web tool
 # can branch). Absent in manifests written before this key existed.
 MANIFEST_VERSION = 1
