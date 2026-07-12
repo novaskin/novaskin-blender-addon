@@ -584,10 +584,14 @@ function drawGrid() {
 // is an async seek -- until it lands the decoder still shows the OLD frame, and drawing the exact
 // mesh over that stale frame misaligns. So wait until the seek finishes, then draw. (One video
 // now, so all three bands are inherently in lockstep -- no cross-video sync needed.)
-function render(t) {
+function render(t, frame) {
   if (vComp.seeking) return;                     // a seek is still in flight -- hold last frame
   upload(tStack, vComp);
-  setPositions(ck('ck_snap') ? Math.floor(t * manifest.fps) / manifest.fps : t);   // snap to frame grid
+  // snap the mesh to the SAME frame the composite is showing. `frame` is the shown-frame index
+  // computed per driver (rounded from the rVFC mediaTime, floored from a scrub's frame-centred
+  // seek) -- flooring the raw mediaTime here would drop to frame-1 on the boundary (fp jitter),
+  // drawing the previous frame's mesh over the new video frame.
+  setPositions(ck('ck_snap') ? frame / manifest.fps : t);
   gl.viewport(0, 0, W, H);
   gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
   gl.clearColor(0.13, 0.13, 0.13, 1);
@@ -604,10 +608,10 @@ function render(t) {
   if (recTrack) recTrack.requestFrame();         // recording: push THIS frame into the capture
 }
 // the readout tracks the target frame even while the composite is held mid-seek
-function readout(t) {
-  const fr = Math.min(manifest.frames - 1, Math.floor(t * manifest.fps));
+function readout(frame) {
+  const fr = Math.max(0, Math.min(manifest.frames - 1, frame));
   if (!scrubbing) scrub.value = fr;              // scrub is a frame index (0 .. frames-1)
-  timeEl.textContent = `f${fr}/${manifest.frames - 1} · ${t.toFixed(1)}s`;
+  timeEl.textContent = `f${fr}/${manifest.frames - 1} · ${(fr / manifest.fps).toFixed(1)}s`;
 }
 
 // Playback is driven by requestVideoFrameCallback: it fires when the background decoder actually
@@ -618,15 +622,20 @@ const hasRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
 function onVideoFrame(now, meta) {
   if (dead) return;
   vComp.requestVideoFrameCallback(onVideoFrame);
-  render(meta.mediaTime);
-  readout(meta.mediaTime);
+  // mediaTime is the presented frame's timestamp (on a frame boundary) -> ROUND to its index
+  const frame = Math.round(meta.mediaTime * manifest.fps);
+  render(meta.mediaTime, frame);
+  readout(frame);
 }
 function rafLoop() {
   if (dead) return;
   rafId = requestAnimationFrame(rafLoop);
   if (hasRVFC && !vComp.paused) return;            // playing with rVFC: onVideoFrame drives it
-  render(vComp.currentTime);
-  readout(vComp.currentTime);
+  // paused / scrub: currentTime sits INSIDE the shown frame (a scrub seeks to its centre) -> FLOOR
+  const t = vComp.currentTime;
+  const frame = Math.floor(t * manifest.fps);
+  render(t, frame);
+  readout(frame);
 }
 
 // keys at the video rate -> default to SNAP (the pose every render saw; the depth mask is
