@@ -5513,6 +5513,14 @@ def _retarget_mixamo(src, trg, action_name="NovaSkin Retarget"):
                         m = (Twi @ (R @ Trest_arm[tb].to_3x3())).to_4x4()
                         m.translation = cur.translation
                     pb.matrix = m
+                    # `pb.matrix =` solves matrix_basis relative to the parent; when a parent
+                    # bone is scaled and the child does not inherit that scale (inherit_scale
+                    # != FULL -- true of the hips' Flip_Bone parent on the Thomas rig), the solve
+                    # leaves a compensating scale on matrix_basis. We only ever want rotation
+                    # (+ the hips' location), so strip it -- otherwise that scale is never
+                    # keyframed away and permanently resizes the whole character (it cascades
+                    # from the FK-root hips), by an amount that varies with the source rig.
+                    pb.scale = (1.0, 1.0, 1.0)
                     rot = ("rotation_quaternion" if pb.rotation_mode == 'QUATERNION'
                            else "rotation_euler")
                     pb.keyframe_insert(data_path=rot, frame=f)
