@@ -61,7 +61,7 @@ Outputs go to <blend_dir>/novaskin/.
 bl_info = {
     "name": "NovaSkin Export",
     "author": "saviski",
-    "version": (1, 4, 0),
+    "version": (1, 4, 1),
     "blender": (4, 2, 0),
     "location": "Top bar > Render > Render for NovaSkin",
     "description": "Export Minecraft scenes as re-skinnable browser wallpapers",
@@ -80,7 +80,7 @@ from bpy.props import (BoolProperty, IntProperty, EnumProperty,
 # Add-on version stamped into manifest.json ("addon_version"). Keep in sync with bl_info
 # and blender_manifest.toml -- bl_info must stay a literal (Blender parses it via ast) and
 # is STRIPPED from the extension zip, so the manifest can't read it at run time.
-ADDON_VERSION = "1.4.0"
+ADDON_VERSION = "1.4.1"
 # Version of the manifest.json FORMAT (bump when keys/semantics change, so the web tool
 # can branch). Absent in manifests written before this key existed.
 MANIFEST_VERSION = 1
@@ -403,7 +403,12 @@ STATIC_SKIN_PX = 64              # Minecraft skin resolution -> UV cell pitch = 
 ATLAS_RES = 512
 ATLAS_BAKE_SAMPLES = None   # Cycles samples for the bake (denoised). None = follow the panel
                             # "Illum samples" (ILLUM_SAMPLES, live); set a fixed int to override.
-ATLAS_BAKE_MARGIN = 4      # UV island edge bleed (px)
+ATLAS_BAKE_MARGIN = 0      # NO edge bleed (px). The rig's per-pixel UV islands touch with no gap
+                           # (see _expand_pixel_uvs), so a >0 margin dilates each island's edge into
+                           # the boundary pixels its NEIGHBOUR owns -- e.g. the dark sleeve-bottom
+                           # bleeding over the arm-front's last row, since a boundary pixel whose
+                           # centre no face covers becomes "empty" and the margin fills it from the
+                           # nearest island. 0 keeps every face strictly inside its own cell.
 ATLAS_OVERLAY_LABELS = ("hat", "jacket", "sleeve", "pant")   # 2nd-layer parts -> non-occluding
 # The atlas is baked SMOOTH-shaded -- exactly like the viewport / screen-space light -- for soft,
 # realistic shadows. (Flat shading facets the rig's per-pixel quads into a blocky grid, which looked
@@ -414,10 +419,6 @@ ATLAS_BAKE_FLAT = False    # True = flat per-face bake (faceted, faster); False 
 ATLAS_FORMAT = 'WEBP'      # atlas image format ('WEBP' or 'PNG') -- lossless, NOT the panel's lossy
 ATLAS_LOSSLESS = True      # JPEG/lossy block boundaries align with skin pixels -> grid; keep lossless
 ATLAS_EXT = {'WEBP': '.webp', 'PNG': '.png'}.get(ATLAS_FORMAT, '.png')
-# Optional residual low-pass (atlas px; 8 px = 1 skin texel at 512/64). 0 = off; raise only if the
-# per-pixel relief still shows after smooth+lossless.
-ATLAS_BLUR_RADIUS = 0
-ATLAS_BLUR_PASSES = 2      # box passes (2-3 ~ Gaussian)
 STATIC_OUT_SUBDIR = ""   # "" = export straight into OUT_DIR; a name (e.g. "static") would nest under it
 STATIC_OUT_PREFIX = (STATIC_OUT_SUBDIR + "/") if STATIC_OUT_SUBDIR else ""   # manifest path prefix
 # Static lighting space:
@@ -1737,41 +1738,6 @@ def _gray_diffuse_material():
     return m
 
 
-def _box_blur_2d(x, r):
-    """Separable box blur (radius r px) over the first two axes, edge-clamped. x: (H, W) or
-    (H, W, C). Cumulative-sum implementation -- O(n) regardless of radius."""
-    if r <= 0:
-        return x
-    x = np.asarray(x, 'float32')
-    k = 2 * r + 1
-    for ax in (0, 1):
-        n = x.shape[ax]
-        pad = [(0, 0)] * x.ndim
-        pad[ax] = (r, r)
-        xp = np.pad(x, pad, mode='edge')
-        z = list(xp.shape); z[ax] = 1
-        c = np.concatenate([np.zeros(z, 'float32'), np.cumsum(xp, axis=ax, dtype='float32')],
-                           axis=ax)
-        hi = np.take(c, np.arange(k, n + k), axis=ax)
-        lo = np.take(c, np.arange(0, n), axis=ax)
-        x = (hi - lo) / k
-    return x
-
-
-def _masked_blur(rgb, mask, r, passes):
-    """Blur `rgb` (H, W, 3) within `mask` (H, W, 0/1) without bleeding the zeroed background in:
-    blur(rgb*mask)/blur(mask). Smooths the per-pixel lighting lattice while keeping the light's
-    low-frequency gradient; the un-covered texels are left untouched by the caller."""
-    if r <= 0 or passes <= 0:
-        return rgb
-    num = rgb * mask[:, :, None]
-    den = mask.copy()
-    for _ in range(passes):
-        num = _box_blur_2d(num, r)
-        den = _box_blur_2d(den, r)
-    return num / np.maximum(den, 1e-4)[:, :, None]
-
-
 def _atlas_bake_material(img):
     """Gray-0.5 diffuse with an Image Texture node = `img`, set active so it is the bake
     target. Same lighting response as `_gray_diffuse_material`, plus the destination image."""
@@ -1943,13 +1909,6 @@ def _bake_player_light_atlas(player, atlas_res=None, samples=None, out_dir=None,
         flat = np.empty(atlas_res * atlas_res * 4, dtype='float32')
         img.pixels.foreach_get(flat)
         grid = flat.reshape(atlas_res, atlas_res, 4)
-        # Low-pass the light (masked, within coverage) to kill the per-pixel relief lattice that
-        # a sharp bake captures -- the light is low-frequency; the per-pixel detail is the skin's.
-        if ATLAS_BLUR_RADIUS > 0:
-            rgb = grid[:, :, :3]
-            mask = (rgb.sum(2) > 1e-4).astype('float32')   # covered + margin bleed
-            grid[:, :, :3] = _masked_blur(rgb, mask, ATLAS_BLUR_RADIUS, ATLAS_BLUR_PASSES) \
-                * mask[:, :, None]
         rgba = grid.reshape(-1, 4)
         # encode: 'display' = _to_display (AgX, the static viewer's skin*atlas*2 model);
         # 'srgb' = plain sRGB(0.5*L) matching the animated screen-light band, so the viewer's
@@ -3318,7 +3277,8 @@ def _anim_collect_static(players, W, H, layers=None):
         # base span [tri_range[0], overlay_tri_start] stays intact; the viewer picks parts by
         # their `variant` field. Object-level only: single-mesh generic rigs have no variant
         # duplicates to add. The atlas bakes the ACTIVE style; the other borrows its rects
-        # (the two UV nets differ ~1px, the bake margin covers it).
+        # (the two UV nets differ ~1px, but _expand_pixel_uvs snaps both to the same 1/64 cell
+        # grid so the rects align -- no margin needed; a margin would bleed into neighbour cells).
         default_variant = next((v for o in p["uv_parts"] if not o.hide_render
                                 and (v := _part_variant(labs.get(o.name)))), 'classic')
         other = 'slim' if default_variant == 'classic' else 'classic'
@@ -3675,8 +3635,9 @@ def _static_collect(players, W, H, mesh_layers=None):
                 _emit(o, True, lab, b[lab])
         # The OTHER arm variant (classic<->slim): flip the rig so its arm/sleeve parts pose at the
         # arm position, then collect them (positions captured here, while correct). Atlas is baked
-        # from the default variant only -- the two UV regions differ ~1px so the bake margin covers
-        # the other. The browser draws the parts of whichever variant is active.
+        # from the default variant only -- the two UV regions differ ~1px, but _expand_pixel_uvs
+        # snaps both to the same 1/64 cell grid so the rects align without a margin. The browser
+        # draws the parts of whichever variant is active.
         cur_variant = next((pm["variant"] for pm in parts_meta if pm["variant"]), None)
         if cur_variant:
             other = "slim" if cur_variant == "classic" else "classic"
@@ -6191,12 +6152,6 @@ def _legacy_export_enabled(context):
     return _addon_pref(context, "enable_legacy_export")
 
 
-def _animated_export_enabled(context):
-    """Experimental animated export (Animation tab) exposed? (add-on pref; off by default). The
-    animated operator stays registered either way, for advanced use."""
-    return _addon_pref(context, "enable_animated_export")
-
-
 class NovaSkinAddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
 
@@ -6207,18 +6162,11 @@ class NovaSkinAddonPreferences(bpy.types.AddonPreferences):
                     "and the Render menu. When off, only the interactive Mesh (v2) export is "
                     "offered; the legacy per-part UV export still works, for advanced or "
                     "backward-compatible use")
-    enable_animated_export: BoolProperty(
-        name="Enable animated export",
-        default=False,
-        description="Show the Animation tab in the NovaSkin sidebar (animated wallpaper "
-                    "export + FBX retarget). Its operators stay registered either way, "
-                    "for advanced use")
 
     def draw(self, context):
         col = self.layout.column()
         col.prop(self, "enable_legacy_export")
-        col.prop(self, "enable_animated_export")
-        col.label(text="Both off by default: NovaSkin exports the interactive Mesh (v2) format.",
+        col.label(text="Off by default: NovaSkin exports the interactive Mesh (v2) format.",
                   icon='INFO')
 
 
@@ -6264,16 +6212,13 @@ class VIEW3D_PT_novaskin(bpy.types.Panel):
         if not _player_armatures():
             layout.label(text="No Thomas rig found — see the Layers tab", icon='ERROR')
 
-        # Tabs; the experimental Animation tab appears only when enabled in the add-on prefs.
-        anim = _animated_export_enabled(context)
+        # Tabs. (The Animation tab used to hide behind an "experimental" add-on pref; the
+        # animated export is stable since 1.4, so it is always available now.)
         row = layout.row(align=True)
         row.prop_enum(st, "ui_tab", 'EXPORT')
         row.prop_enum(st, "ui_tab", 'LAYERS')
-        if anim:
-            row.prop_enum(st, "ui_tab", 'ANIM')
+        row.prop_enum(st, "ui_tab", 'ANIM')
         tab = st.ui_tab
-        if tab == 'ANIM' and not anim:   # pref turned off while on the Animation tab
-            tab = 'EXPORT'
 
         if tab == 'EXPORT':
             legacy = _legacy_export_enabled(context)

@@ -85,31 +85,35 @@ Each optional layer is exported so the web tool can toggle it on/off, with the s
 casts. Per layer you can pick how it's exported — a flat **Sprite**, a re-skinnable
 **Texture** mesh, or a full **Player**. Player rigs can't be marked as layers.
 
-### Advanced: legacy & animated exports
+### Animated export
 
-Two extra export modes are **off by default**; enable them under
+The **Animation** tab exports the scene's frame range as an animated wallpaper, re-skinned
+live in the browser. Everything ships in ONE `composite.webm` — the scenery, the player
+light and a player-vs-scenery occlusion matte stacked into bands, so a single decoder keeps
+them in perfect frame lockstep — plus the players' animated geometry (a compact mesh stream,
+~1 MB for 15 s) and the scene's exact view transform (AgX/Filmic/…) baked as a 3D LUT, so
+the relit players match the rendered scenery. Two buttons:
+
+- **Export Draft** — the first few seconds at half resolution / half fps with a fast
+  screen-space light (base layer only; the 2nd layer is off in draft).
+- **Export Animation (full quality)** — the whole range, baking a per-frame UV light atlas
+  per character so the 2nd layer (hat/jacket/sleeves/pants) is lit correctly per-face.
+  Slower (a Cycles bake per character per frame).
+
+Props marked as **optional layers** are exported as **toggleable meshes** that depth-
+composite with the players — a held sword, a pane of glass — each with its own baked
+texture (transparency included), swappable in the browser. The **Bands** checkboxes let you
+drop the background / light / occlusion band when a scene doesn't need it. Requires `ffmpeg`
+at render time. The tab also carries the Mixamo FBX → rig animation retarget.
+
+### Advanced: legacy export
+
+One extra export mode is **off by default**; enable it under
 `Edit > Preferences > Add-ons > NovaSkin Export`:
 
 - **Legacy Texture UV export** — the classic per-part UV / occlusion-mask / light / shadow
   image export (flat images instead of a mesh). Enabling it adds a **Format** selector
   (Texture UV / Mesh) to the sidebar plus a **Render Draft** button for quick previews.
-- **Animated export** — exports the scene's frame range as an animated wallpaper, re-skinned
-  live in the browser. Everything ships in ONE `composite.webm` — the scenery, the player
-  light and a player-vs-scenery occlusion matte stacked into bands, so a single decoder keeps
-  them in perfect frame lockstep — plus the players' animated geometry (a compact mesh stream,
-  ~1 MB for 15 s) and the scene's exact view transform (AgX/Filmic/…) baked as a 3D LUT, so
-  the relit players match the rendered scenery. Two buttons in the **Animation** tab:
-  - **Export Draft** — the first few seconds at half resolution / half fps with a fast
-    screen-space light (base layer only; the 2nd layer is off in draft).
-  - **Export Animation (full quality)** — the whole range, baking a per-frame UV light atlas
-    per character so the 2nd layer (hat/jacket/sleeves/pants) is lit correctly per-face.
-    Slower (a Cycles bake per character per frame).
-
-  Props marked as **optional layers** are exported as **toggleable meshes** that depth-
-  composite with the players — a held sword, a pane of glass — each with its own baked
-  texture (transparency included), swappable in the browser. The **Bands** checkboxes let you
-  drop the background / light / occlusion band when a scene doesn't need it. Requires `ffmpeg`
-  at render time. The tab also carries the Mixamo FBX → rig animation retarget.
 
 ## What you get
 
