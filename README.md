@@ -1,11 +1,12 @@
 # NovaSkin Export
 
 A Blender add-on that exports a scene built with the **Thomas Rig Legacy** Minecraft rig
-as an **interactive 3D wallpaper** for the
-[NovaSkin wallpaper tool](https://minecraft.novaskin.me/wallpapers/tools/blender/). The
-characters ship as re-skinnable meshes with a baked light atlas, so the browser can drop
-in **any skin**, relight it, switch **classic/slim** arms and toggle scenery — all live,
-without re-rendering. One click renders everything the web tool needs.
+as a **re-skinnable browser wallpaper** for the
+[NovaSkin wallpaper tool](https://minecraft.novaskin.me/wallpapers/tools/blender/) — a
+**still interactive 3D scene** or a **full animation**. The characters ship as re-skinnable
+meshes with a baked light atlas, so the browser can drop in **any skin**, relight it, switch
+**classic/slim** arms and toggle scenery — all live, without re-rendering. One click renders
+everything the web tool needs.
 
 <p align="center">
   <img src="blender-panel.png" alt="NovaSkin Export panel in the 3D Viewport sidebar"
@@ -22,6 +23,7 @@ without re-rendering. One click renders everything the web tool needs.
   how many players it detects, and links to the rig if none is found.
 - An **active camera** and some lights/scenery.
 - A **saved `.blend`** (the output goes to a `novaskin/` folder next to it).
+- **`ffmpeg`** on your PATH — for animated exports only (still exports need nothing extra).
 
 If something is missing, the export stops right away with a clear message instead of
 failing midway.
@@ -52,6 +54,9 @@ Open the **3D Viewport sidebar** (<kbd>N</kbd>) → **NovaSkin** tab:
 
 Everything also lives in the top bar under **Render → Render for NovaSkin (Mesh)**, and
 scripts can call `bpy.ops.render.novaskin_static()`.
+
+For an **animated** wallpaper, switch to the **Animation** tab instead — see
+[Animated export](#animated-export) below.
 
 While it runs you get a progress bar in the panel (plus the viewport header and status
 bar). Cancel any time with **Cancel** or <kbd>Esc</kbd> — the scene is always restored to
