@@ -5409,11 +5409,12 @@ _RETARGET_FK_SWITCH = [                  # (properties_bone, custom_prop, value 
     ("L.Arm_Properties", "L.Arm_World", 1), ("R.Arm_Properties", "R.Arm_World", 1),
     ("L.Leg_Properties", "L.IK/FK", 1), ("R.Leg_Properties", "R.IK/FK", 1),
 ]
-_RETARGET_HIPS = ("mixamorig:Hips", "Lower_body")   # pelvis rotation-delta target (tilt/facing)
-_RETARGET_ROOT = "Root"                             # root motion (hips translation) goes on the
-#                                                     master Root, so the WHOLE rig travels (Root,
-#                                                     Flip_Bone, the Arm_IK anchors) -- not just
-#                                                     Lower_body, which left Root behind at origin.
+_RETARGET_HIPS = ("mixamorig:Hips", "Lower_body")   # rotation-delta AND root-motion location both
+#                                                     go on the hips -- NOT on the master Root.
+#                                                     Root is left un-keyed so it stays free as the
+#                                                     user's "place the rig in the scene" handle;
+#                                                     the baked hip motion rides inside whatever
+#                                                     Root position they set (Root->Flip_Bone->hips).
 
 
 def _poll_mixamo_src(self, obj):
@@ -5474,8 +5475,6 @@ def _retarget_mixamo(src, trg, action_name="NovaSkin Retarget"):
     hip_rest = (Sw @ src.pose.bones[hips_src].bone.matrix_local).translation
     ratio = (Trest[hips_trg].translation.z / hip_rest.z
              if hips_trg in Trest and abs(hip_rest.z) > 1e-6 else 1.0)
-    root_trg = _RETARGET_ROOT if _RETARGET_ROOT in trg.pose.bones else hips_trg
-    root_rest = (Tw @ trg.pose.bones[root_trg].bone.matrix_local).translation
 
     def _depth(b):
         d, p = 0, trg.data.bones[b].parent
@@ -5504,20 +5503,22 @@ def _retarget_mixamo(src, trg, action_name="NovaSkin Retarget"):
     trg.animation_data.action = act
 
     update = bpy.context.view_layer.update
+    update()                                             # settle the placement pose (empty action)
+    # Anchor the hips' root motion at its PLACED rest, not the object-space rest. The Thomas rig is
+    # positioned by posing a control the hips descend from (Root, driven by StaticBone; the object
+    # itself stays at the origin), so `Trest[hips]` (object rest) sits at the origin and would snap
+    # the character there on retarget. Read the hips' rest head through its CURRENT parent pose so
+    # the baked motion sits where the user placed the rig. (pb.matrix keyframes the parent-relative
+    # basis, so moving that control afterwards still carries the whole animation with it.)
+    hp = trg.pose.bones[hips_trg]
+    hips_anchor = ((hp.parent.matrix @ hp.parent.bone.matrix_local.inverted()
+                    @ hp.bone.matrix_local).translation if hp.parent
+                   else Trest[hips_trg].translation)
     wm = bpy.context.window_manager
     wm.progress_begin(f0, f1)
     try:
         for f in range(f0, f1 + 1):
             scene.frame_set(f)
-            update()
-            # Root motion first, so every child (body, Arm_IK anchors) inherits the travel.
-            # Only the master Root gets a location key -- the hips (Lower_body) below only rotate.
-            rpb = trg.pose.bones[root_trg]
-            rm = rpb.matrix.copy()                          # keep Root's (rest) rotation
-            rm.translation = root_rest + ratio * (sh(hips_src) - hip_rest)
-            rpb.matrix = rm
-            rpb.scale = (1.0, 1.0, 1.0)
-            rpb.keyframe_insert(data_path="location", frame=f)
             update()
             for level in levels:
                 for tb in level:
@@ -5528,7 +5529,11 @@ def _retarget_mixamo(src, trg, action_name="NovaSkin Retarget"):
                         Swr = (Sw @ src.pose.bones[s].matrix).to_3x3()
                         desired = (Swr @ Srest[s].inverted()) @ Trest[tb].to_3x3()
                         m = (Twi @ desired).to_4x4()
-                        m.translation = cur.translation      # keep inherited pos (incl. root motion)
+                        if tb == hips_trg:                   # hips: rotation + scaled root motion,
+                            m.translation = (hips_anchor     # anchored at the PLACED rest (not the
+                                             + ratio * (sh(hips_src) - hip_rest))  # object origin)
+                        else:
+                            m.translation = cur.translation
                     else:                                    # --- arm/hand: rotation copy ---
                         s = arm_map[tb]
                         m = _orthonormal((Sw @ src.pose.bones[s].matrix).to_3x3()).to_4x4()
@@ -5545,6 +5550,8 @@ def _retarget_mixamo(src, trg, action_name="NovaSkin Retarget"):
                     rot = ("rotation_quaternion" if pb.rotation_mode == 'QUATERNION'
                            else "rotation_euler")
                     pb.keyframe_insert(data_path=rot, frame=f)
+                    if tb == hips_trg:                       # root motion lives on the hips
+                        pb.keyframe_insert(data_path="location", frame=f)
                 update()
             wm.progress_update(f)
     finally:
