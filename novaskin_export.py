@@ -3088,10 +3088,23 @@ def _render_steps(players, op=None):
     return results
 
 
+def _force_object_mode():
+    """The export's bake/select operators (`object.select_all`, `object.bake`) only poll in Object
+    mode -- launched from Pose or Edit mode (e.g. while posing/placing a rig) their poll fails with
+    "context is incorrect" and the whole export aborts. Drop to Object mode up front. Best-effort:
+    a missing active object or an odd context is swallowed rather than crashing the export."""
+    if bpy.context.mode != 'OBJECT':
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except RuntimeError:
+            pass
+
+
 def render_all(op=None, draft=False):
     """Synchronous full run (UI is blocked while it works). Returns the results dict, or
     None if the preflight aborts. The menu uses the modal operator instead (see invoke)."""
     _apply_settings(bpy.context.scene, draft=draft)
+    _force_object_mode()
     players = discover_players()
     errors = _preflight(players)
     if errors:
@@ -5804,6 +5817,7 @@ class _NovaSkinModalMixin:
     def invoke(self, context, event):
         # Interactive launch (menu/panel): run as a modal job with a progress bar.
         _apply_settings(context.scene, draft=getattr(self, "draft", False))
+        _force_object_mode()          # bakes need Object mode; a panel click from Pose mode fails
         players = discover_players()
         errors = _preflight(players)
         if errors:
@@ -5842,6 +5856,7 @@ class _NovaSkinModalMixin:
         # Non-interactive launch (e.g. bpy.ops.render.novaskin() from a script, or the modal
         # fallback above): run the whole batch synchronously and block until done.
         _apply_settings(context.scene, draft=getattr(self, "draft", False))
+        _force_object_mode()          # bakes need Object mode; a panel click from Pose mode fails
         players = discover_players()
         errors = _preflight(players)
         if errors:
