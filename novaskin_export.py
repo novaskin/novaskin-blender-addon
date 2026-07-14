@@ -4510,7 +4510,9 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, fore
                   for l in layers]
     light_term = ("atlas(uv)" if light_space == "uv" else "light(screenUv)")
     manifest = {
-        "static_version": 1,
+        "format": 3,             # render/serve routing kind: 3 = static mesh (WebGL). The web API
+        #                          reads this to pick the render path (2 = packed, 4 = animated).
+        "static_version": 1,     # schema version of THIS (static mesh) format
         "addon_version": ADDON_VERSION,
         "resolution": geo["resolution"],
         "light_space": light_space,
@@ -5278,7 +5280,10 @@ def _anim_render_steps(players, op=None, frame_start=None, frame_end=None):
         bands["count"] = len(band_order)
         bands["vertical"] = bool(W >= H)
         manifest = {
-            "animated_version": 6,   # 6: single composite.webm (bg/light/occ bands)
+            "format": 4,             # render/serve routing kind: 4 = animated. The web API reads
+            #                          this to pick the render path (2 = packed, 3 = static mesh).
+            "animated": True,        # explicit kind marker (redundant with format, kept human-readable)
+            "animated_version": 6,   # schema version of THIS (animated) format: single composite.webm
             "addon_version": ADDON_VERSION,
             "fps": fps,
             "frames": nf,
