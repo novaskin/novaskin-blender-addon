@@ -4574,7 +4574,10 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, fore
     manifest = {
         "format": 3,             # render/serve routing kind: 3 = static mesh (WebGL). The web API
         #                          reads this to pick the render path (2 = packed, 4 = animated).
-        "static_version": 1,     # schema version of THIS (static mesh) format
+        "static_version": 2,     # schema version of THIS (static mesh) format. v2: the UV atlas is
+        #                          sRGB(0.5*L)-encoded and `view_lut` ships, so the viewer relights
+        #                          in LINEAR and applies the scene view transform exactly (like the
+        #                          animated path) instead of the v1 AgX-baked atlas + pow(1/2.2).
         "addon_version": ADDON_VERSION,
         "resolution": geo["resolution"],
         "light_space": light_space,
@@ -4596,15 +4599,24 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, fore
         "shader_note": (f"draw the CLEAN background; multiply each ENABLED entity's `shadow` ratio "
                         f"(players + layers, display-space, 1=untouched) onto it; then draw players "
                         f"and `layers` together back -> front by camera_depth (larger = farther): a "
-                        f"player mesh is depth-tested with color = skin(uv) * {light_term} * 2, base "
+                        f"player mesh is depth-tested, relit from skin(uv) and {light_term}, base "
                         "tris then overlay tris [overlay_tri_start] (alpha-discard the overlay's "
-                        "transparent texels); a layer is either type='mesh' (depth-tested "
-                        "tex(uv)*atlas(uv)*2 over its tri_range, retexturable) or type='sprite' (a "
-                        "straight-alpha quad, painter's order). Finally composite the overlay "
-                        "(straight alpha) over the top: out = ov.rgb*ov.a + behind*(1 - ov.a)."),
+                        "transparent texels); a layer is either type='mesh' (depth-tested, "
+                        "retexturable over its tri_range) or type='sprite' (a straight-alpha quad, "
+                        "painter's order). RELIGHT: when `view_lut` is present decode skin (pow 2.2) "
+                        "and atlas (pow 2.2 * 2 for the 0.5 carrier) to LINEAR, lin = skin*light, "
+                        "then apply the `view_lut` (3D LUT) for the display look; without it (v1) the "
+                        "atlas is AgX-baked and out = pow(clamp(skin*light,0,1), 1/2.2). Finally "
+                        "composite the overlay (straight alpha): out = ov.rgb*ov.a + behind*(1-ov.a)."),
     }
     if layers:
         manifest["layers"] = layers           # scenery sprites, ordered back -> front
+    if light_space == "uv":
+        # scene view transform as a 64^3 3D LUT: the UV atlas is sRGB(0.5*L)-encoded (not AgX-baked),
+        # so the viewer decodes light + skin to LINEAR, relights, and applies THIS LUT last -- the
+        # exact AgX/Filmic display, matching the animated path (v1 baked AgX into the atlas and used
+        # an approximate pow(1/2.2) encode). Its presence is the v2 signal; absent -> legacy path.
+        manifest["view_lut"] = _write_view_lut(os.path.join(out_dir, "view_lut.png"))
     if light_space == "screen" and imgs.get("light"):
         # screen-space light image, sampled at the fragment's screen pixel (full frame, no crop)
         manifest["light"] = os.path.basename(imgs["light"])
@@ -4755,7 +4767,7 @@ def _static_export_steps(players, op=None, out_dir=None):
                         muted = _hide_others_for_bake(s, {o.name for o in p["char_all"]},
                                                       entity_names)
                         bpy.context.view_layer.update()
-                        rel = _bake_player_light_atlas(p, out_dir=out_dir,
+                        rel = _bake_player_light_atlas(p, out_dir=out_dir, encode='srgb',
                                                        stem=f"{p['label']}_atlas")
                         for d in muted:
                             d.mute = False
@@ -4767,7 +4779,7 @@ def _static_export_steps(players, op=None, out_dir=None):
                     muted = _hide_others_for_bake(s, {m.name for m in ml["meshes"]}, entity_names)
                     bpy.context.view_layer.update()
                     syn = {"uv_parts": ml["meshes"], "label": ml["name"]}
-                    rel = _bake_player_light_atlas(syn, atlas_res=LAYER_ATLAS_RES,
+                    rel = _bake_player_light_atlas(syn, atlas_res=LAYER_ATLAS_RES, encode='srgb',
                                                    out_dir=out_dir, stem=f"{ml['name']}_atlas")
                     for d in muted:
                         d.mute = False
