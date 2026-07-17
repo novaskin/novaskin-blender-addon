@@ -153,7 +153,7 @@ UV_DEPTH_IN_BLUE = True
 # player casts on the scenery (ratio vs the clean scene). Independent toggles.
 EXPORT_ILLUM = True
 EXPORT_SHADOW = True
-EXPORT_FOREGROUND = True   # per-player FOREGROUND matte (transmission tint over the masked player)
+EXPORT_FOREGROUND = True   # per-player FOREGROUND maps (affine add+mul of what is in front)
 # Compute the shadow ratio in DISPLAY space (view-transformed, like background.png)
 # instead of linear, so multiplying it onto the (display) background in a 2D/sRGB canvas
 # reproduces the render -- a LINEAR ratio multiplied in display space over-darkens. True for
@@ -434,10 +434,10 @@ STATIC_LIGHT_SPACE = "uv"
 # scripted/headless exports doing the full run.
 STATIC_DO_ATLAS = STATIC_DO_BACKGROUND = STATIC_DO_FOREGROUND = STATIC_DO_SHADOWS = True
 STATIC_DO_SPRITES = True
-# STATIC_DO_FOREGROUND gates the per-entity FOREGROUND matte -- one two-background map of everything in
-# front of the entity (opaque scenery occludes + transmissive water/glass tints), replacing the old
-# mask + tint. (The old GLOBAL opaque-foreground pass is gone: the per-entity matte's a=1 reveals the
-# background, which already contains that scenery.)
+# STATIC_DO_FOREGROUND gates the per-entity FOREGROUND maps -- the affine add+mul pair of everything
+# in front of the entity (opaque scenery occludes + transmissive water/glass tints per channel),
+# replacing the old mask + tint. (The old GLOBAL opaque-foreground pass is gone: an opaque occluder's
+# maps (mul=0, add=its color) repaint the scenery the background already contains.)
 # Static background image (+ optional rain/glare overlay + the per-entity foreground mattes). The
 # alpha-carrying images are ALWAYS WebP because they need a real alpha channel; the matte split is a
 # VIDEO-only workaround (no in-browser video codec carries alpha on Safari) -- a still image
@@ -2786,7 +2786,9 @@ def _write_manifest(players, out_path, layer_infos=None, overlay=None, foregroun
                 "base_layer": ([COMPOSITE_OUTPUT_NAME.format(variant=v) + UV_EXT
                                 for v, _ in MASK_ARM_VARIANTS] if COMPOSITE_BASE_LAYER else None),
                 "masks": [v for v, _ in MASK_ARM_VARIANTS],
-                "foreground": (foregrounds or {}).get(p["label"]),   # {variant: file}; viewer uses a<1 (tint)
+                "foreground": (foregrounds or {}).get(p["label"]),   # {add?, mul?} affine maps (classic
+                #   arms serve both variants; legacy exports: {variant: file|{add,mul}} -- readers
+                #   branch on the shape)
                 "shadow": p.get("shadow"),   # shared per-entity multiply ratio (1=no shadow)
             }
             for p in players
@@ -2891,7 +2893,7 @@ def _render_steps(players, op=None):
                        for g in mesh_layers))
                 if mesh_layers else 0)                             # retexturable mesh-layers
              + len(sprite_groups)                                  # sprites (one shared render each)
-             + (len(players) * n_variants if EXPORT_FOREGROUND else 0)   # foreground matte (per player/variant)
+             + (len(players) if EXPORT_FOREGROUND else 0)   # foreground maps (classic serves both variants)
              + (1 if overlay_groups else 0)                        # overlay (rain/glare)
              + 1)                                                  # manifest
     total = max(total, 1)
@@ -3060,9 +3062,9 @@ def _render_steps(players, op=None):
                                     "camera_depth": si["camera_depth"]})
         if mesh_layers:
             yield from _layer_steps(players, mesh_layers, sess, prog, layer_infos)
-        # 6a) per-player FOREGROUND matte (occlusion + transmission tint), shared with the mesh exporter.
-        # Legacy keeps the MASK for OPAQUE occlusion; the viewer composites only the TRANSMISSIVE part
-        # (a<1, water/glass) over the masked player. Flat <label>_foreground_<variant>.webp at the root.
+        # 6a) per-player FOREGROUND maps (affine add+mul of what is in front), shared with the mesh
+        # exporter. Legacy keeps the MASK for OPAQUE occlusion; the viewer's multiply+add repaints the
+        # transmissive (water/glass) part over the masked player. <label>/foreground_{add,mul}.webp.
         foregrounds = {}
         if EXPORT_FOREGROUND:
             foregrounds = yield from _static_render_foreground(players, [], all_layer_mesh_names,
@@ -4295,23 +4297,30 @@ def _box_blur_rgb(rgb2d, iterations=2):
 
 
 def _static_render_foreground(players, mesh_layers, all_layer_mesh_names, out_dir=None, prog=None, sub=False):
-    """Per-entity FOREGROUND matte by two-background matting -- ONE map that replaces BOTH the Object-Index
-    occlusion mask AND the transmission tint (and the per-material water exclusion the mask needed).
-    Render the entity as flat WHITE then BLACK emission with ALL scenery (opaque AND transmissive)
-    visible, PLUS a third render of the entity ALONE for its silhouette. The front stuff composites over
-    the entity (the "background"): `C = F + (1-a)*entity`, so the black/white difference gives the front
-    coverage `a = 1 - (C_white - C_black)` -- used for the ALPHA ONLY; the COLOUR is taken STRAIGHT from
-    the white render `C_white` (brighter than over black -- the water shows its lit transmission, not
-    just the reflection). The alpha is MASKED to the entity silhouette so the map holds ONLY what is in
-    front of the entity (opaque scenery in front -> a=1 covers; water/glass -> a<1 the entity shows
-    through, tinted; nothing in front, or outside the silhouette -> a=0 transparent). The browser
-    composites it OVER the relit entity (STRAIGHT alpha-over): re-skinnable (the new skin shows through
-    where a<1) and the colour comes from the material. Players get one foreground map PER ARM VARIANT (classic/slim -- the silhouette, so the
-    occlusion, differs); mesh-type layers get one. GENERATOR: `yield`s a progress tuple per map
-    (player x variant, then mesh-layer) and RETURNS {player_label: {variant: file}, layer_name: file}
-    (capture via `yield from`). SYNCHRONOUS + bbox-cropped (the white->black material swap is a
-    mid-sequence scene change the async modal cannot order; the bbox keeps the block short).
-    Self-contained. (NB: distinct from `_static_render_overlay`, the rain/glare OVERLAY layers.)"""
+    """Per-entity FOREGROUND as the exact AFFINE composite `out = add + mul * entity` -- TWO RGB maps
+    (multiply + add) that replace the old single RGBA lerp matte. Path-traced radiance is linear in
+    the entity's emission, so rendering the entity as flat WHITE then BLACK emission (all scenery
+    visible) measures the model exactly: `mul = C_white - C_black` is the per-CHANNEL transmission
+    of everything in front (water tints blue instead of just dimming; opaque -> 0), `add = C_black`
+    is the additive part (the water surface's reflection; an opaque occluder's own color). Two more
+    renders -- the scenery ALONE (entity invisible) and the entity ALONE (its silhouette) -- separate
+    the scenery around the entity's AA edge from real in-front content, so the maps are an exact
+    IDENTITY (mul=1, add=0) where nothing is in front: no rim, and a fully-dry entity ships NO maps
+    (returns None for it). Values are display-encoded ANCHORED at black and mid-gray, which keeps
+    the identity exact under ANY view transform (AgX/Filmic compress linear white below display
+    white) and lands the browser's display-space multiply-add on the render's view transform for
+    dark and mid skins alike (the old format took its color from the white render + a scalar
+    mean() alpha -- dark skins came out bright/milky and the transmission lost its hue; a white
+    ENDPOINT encode instead veiled dry players gray under AgX). The browser composites
+    with two blend passes over the drawn entity: dst = mul*dst, then dst += add -- each pass only
+    when its map shipped (an identity map -- all-black add, all-white mul -- is dropped; add is
+    all-black in most scenes). Players get ONE map set, rendered with the CLASSIC arms: the slim
+    silhouette is a subset and the viewer stencil-clips to the drawn mesh, so it serves both
+    variants. Mesh-type layers get one too. GENERATOR: `yield`s a progress tuple per map (player,
+    then mesh-layer) and RETURNS {player_or_layer_label: {add?,mul?}|None} (capture via
+    `yield from`). SYNCHRONOUS + bbox-cropped (the white->black material swap is a mid-sequence
+    scene change the async modal cannot order; the bbox keeps the block short). Self-contained.
+    (NB: distinct from `_static_render_overlay`, the rain/glare OVERLAY layers.)"""
     s = bpy.context.scene
     out_dir = out_dir or os.path.join(_abs(OUT_DIR), STATIC_OUT_SUBDIR)
     os.makedirs(out_dir, exist_ok=True)
@@ -4336,12 +4345,13 @@ def _static_render_foreground(players, mesh_layers, all_layer_mesh_names, out_di
     def _y(msg):
         return prog(msg) if prog else (0.0, msg)
 
-    def _render_foreground(meshes, fn):
-        # white/black matte (ALL scenery visible) -> foreground colour + raw coverage; PLUS a third render of
-        # the entity ALONE (all scenery hidden) for its silhouette -- the foreground is then MASKED to it.
-        # black==white ("no entity shows") happens in TWO cases: opaque scenery covers the entity, OR
-        # there is simply no entity there. The silhouette tells them apart -> keep the foreground only where
-        # the entity is, drop it everywhere else.
+    def _render_foreground(meshes, stem):
+        # FOUR renders -> the exact per-pixel AFFINE model of "everything in front of the entity":
+        #   out = add + mul * entity   (per RGB channel; the browser's two-blit multiply+add)
+        # white/black matte (ALL scenery visible) gives the transmission; a scenery-ONLY render
+        # (entity camera-invisible) separates the scenery AROUND the entity's AA edge from real
+        # in-front content; the entity ALONE (scenery hidden) gives its silhouette. Where nothing
+        # is in front the maps are an exact identity (mul=1, add=0) -- no rim at the AA edge.
         bb = _screen_bbox(meshes)
         bsave = (s.render.use_border, s.render.use_crop_to_border, s.render.border_min_x,
                  s.render.border_max_x, s.render.border_min_y, s.render.border_max_y)
@@ -4374,6 +4384,12 @@ def _static_render_foreground(players, mesh_layers, all_layer_mesh_names, out_di
                     sl.material = black
             bpy.context.view_layer.update()
             Cb, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+            for o in meshes:                                    # entity fully invisible -> the
+                o.visible_camera = o.visible_transmission = False   # scenery ALONE (== the bg here)
+            bpy.context.view_layer.update()
+            Cn, _, _ = _render_combined_array(sess, ILLUM_RES_PCT)
+            for o in meshes:
+                o.visible_camera = o.visible_transmission = True
             for o in scenery:
                 o.hide_render = True                            # the entity ALONE -> its silhouette
             bpy.context.view_layer.update()
@@ -4389,51 +4405,95 @@ def _static_render_foreground(players, mesh_layers, all_layer_mesh_names, out_di
             for o, mats in saved.items():
                 for i, sl in enumerate(o.material_slots):
                     sl.material = mats[i]
-        Cw3 = np.clip(Cw[:, :3], 0.0, 1.0)                      # COLOUR = the WHITE-player render (bright)
-        sil = np.clip(Cs[:, 3], 0.0, 1.0)                       # the entity's own silhouette (0..1)
-        diff = (Cw3 - np.clip(Cb[:, :3], 0.0, 1.0)).mean(axis=1)   # = (1 - front_a) * silhouette coverage
-        # alpha = silhouette - diff (NOT (1-diff)*sil). The white/black diff ALREADY carries the entity's
-        # AA coverage (diff = (1-front_a)*sil), so subtracting it directly cancels the partial-coverage
-        # at the anti-aliased edge: where the entity simply shows (front_a=0), diff == sil so a == 0 --
-        # no thin "rim" line. = sil*front_a, so the front fades smoothly with the silhouette. Cap the max
-        # at `sil` (NOT 1): finite-sample render noise dips diff<0 OUTSIDE the entity (where sil=0, so
-        # sil-diff>0 would leak a spurious overlay); clamping the max to sil (=0 outside) zeroes that.
-        a = np.clip(sil - diff, 0.0, sil)
-        fr = np.empty((Cw3.shape[0], 4), 'float32')
-        fr[:, :3] = _to_display(Cw[:, :3])                     # DISPLAY-encode the colour to MATCH the bg
-                                                               #   (linear Cw read wrong over the display bg)
-        fr[:, 3] = a
-        _save_image(fr.reshape(-1), W, H, os.path.join(out_dir, fn), file_format='WEBP', lossless=True)
-        return fn
+        sil = np.clip(Cs[:, 3], 0.0, 1.0)[:, None]              # the entity's own coverage (0..1)
+        Cwl = np.clip(Cw[:, :3], 0.0, None)
+        Cbl = np.clip(Cb[:, :3], 0.0, None)
+        Bl = np.clip(Cn[:, :3], 0.0, None)
+        del Cw, Cb, Cn, Cs
+        # Per-COVERAGE (un-premultiplied by the AA coverage) linear terms of what is in front:
+        #   t  = (Cw - Cb) / sil          colored transmission (1 = nothing / clear glass)
+        #   At = (Cb - (1-sil)*B) / sil   additive light (water reflection; an opaque occluder = its
+        #                                 own color; nothing in front = 0). Subtracting the scenery-
+        #   only render B removes the scenery AROUND the entity from the black render, so At (and
+        #   the maps) vanish where nothing is in front -- including at the AA edge.
+        d = np.maximum(sil, 1e-3)
+        t = np.clip((Cwl - Cbl) / d, 0.0, 1.0)
+        At = np.clip((Cbl - (1.0 - sil) * Bl) / d, 0.0, None)
+        del Cwl, Cbl, Bl
+        # Display-encode ANCHORED at black and MID-GRAY: the browser multiplies/adds in DISPLAY
+        # space (its skin, light and bg all are), so solve `add + mul*d(E) = d(At + t*E)` at the
+        # anchors E=0 and E=MID and ship that (mul, add). Anchoring at linear WHITE instead (the
+        # obvious endpoint) is WRONG: compressive view transforms map linear 1.0 well below display
+        # white (AgX: d(1)=0.77), so a nothing-in-front pixel got mul=0.77 -- a gray veil over every
+        # DRY player. The anchored form is IDENTITY-EXACT (mul=1, add=0) under ANY view transform
+        # where nothing is in front, exact at dark and mid tones (where lit skins live), and only
+        # approximates extreme highlights.
+        MID = 0.18
+        d_ref = _to_display(np.array([[0.0] * 3, [MID] * 3], dtype='float32'))
+        d0, dm = d_ref[0], d_ref[1]                       # display(0), display(MID) per channel
+        dA = _to_display(At)
+        dM = np.clip((_to_display(At + t * MID) - dA) / np.maximum(dm - d0, 1e-4), 0.0, 1.0)
+        dA = np.clip(dA - dM * d0, 0.0, 1.0)              # solve `add` at the E=0 anchor
+        del t, At
+        # Fade the maps to identity (mul=1, add=0) with the coverage: solid pixels get the exact
+        # per-coverage maps, the 1-px AA rim blends toward no-op (the blit's dst there is already
+        # part background), and sub-threshold coverage is forced to identity outright (the /sil
+        # above amplifies render noise where sil ~ 0).
+        w = np.clip((sil - 0.05) / 0.95, 0.0, 1.0)
+        mul = 1.0 - w * (1.0 - dM)
+        add = w * dA
+        # Ship ONLY the non-identity maps: below one 8-bit quantization step the map is an
+        # invisible no-op, so drop it and let the viewer skip that blend pass. `add` is all-black
+        # (nothing additive in front -- no water reflection / haze / opaque occluder) in most
+        # scenes; both identity -> no foreground entry at all.
+        EPS = 2.0 / 255.0
+        content = {}
+        if not bool((add < EPS).all()):
+            content["add"] = add
+        if not bool((mul > 1.0 - EPS).all()):
+            content["mul"] = mul
+        if not content:
+            return None                          # nothing in front anywhere -- ship no maps at all
+        names = {}
+        for key, rgb in content.items():
+            fr = np.empty((rgb.shape[0], 4), 'float32')
+            fr[:, :3] = rgb
+            fr[:, 3] = 1.0
+            fg_fn = f"{stem}_{key}.webp"
+            _save_image(fr.reshape(-1), W, H, os.path.join(out_dir, fg_fn),
+                        file_format='WEBP', lossless=True)
+            names[key] = fg_fn
+        return names
 
     try:
+        classic_vval = dict(MASK_ARM_VARIANTS).get("classic", False)
         for p in players:
             active = {o.name for o in p["char_all"]}
             meshes = [o for o in p["char_all"] if o.type == 'MESH']
-            variants = {}
-            for vname, vval in MASK_ARM_VARIANTS:
-                yield _y(f"rendering foreground: {p['label']} / {vname}")
-                sess.restore_visibility()
-                arm, saved_arm = _set_arm_style(p, vval)
-                muted = _hide_others_for_bake(s, active, entity_names)
-                try:
-                    fg_name = (f"{p['label']}/foreground_{vname}.webp" if sub
-                               else f"{p['label']}_foreground_{vname}.webp")
-                    fn = _render_foreground(meshes, fg_name)
-                finally:
-                    for d in muted:
-                        d.mute = False
-                    _restore_arm_style(arm, p, saved_arm)
-                variants[vname] = fn
-                print(f"[STATIC foreground] {p['label']} {vname} -> {fn}")
-            foregrounds[p["label"]] = variants
+            yield _y(f"rendering foreground: {p['label']}")
+            sess.restore_visibility()
+            # ONE map rendered with the CLASSIC (wider) arms serves BOTH variants: the slim arms'
+            # screen silhouette is a subset of the classic one, and the viewer clips the maps to
+            # the pixels the DRAWN mesh actually covers (stencil) -- classic-only arm slivers
+            # where the slim mesh drew nothing are simply never applied. Halves the renders.
+            arm, saved_arm = _set_arm_style(p, classic_vval)
+            muted = _hide_others_for_bake(s, active, entity_names)
+            try:
+                fg_stem = (f"{p['label']}/foreground" if sub else f"{p['label']}_foreground")
+                fn = _render_foreground(meshes, fg_stem)
+            finally:
+                for d in muted:
+                    d.mute = False
+                _restore_arm_style(arm, p, saved_arm)
+            foregrounds[p["label"]] = fn        # {add?, mul?} | None -- same shape as mesh layers
+            print(f"[STATIC foreground] {p['label']} -> {fn}")
         for ml in mesh_layers:
             yield _y(f"rendering foreground layer: {ml['name']}")
             active = {m.name for m in ml["meshes"]}
             sess.restore_visibility()
             muted = _hide_others_for_bake(s, active, entity_names)
             try:
-                fn = _render_foreground(list(ml["meshes"]), f"{ml['name']}_foreground.webp")
+                fn = _render_foreground(list(ml["meshes"]), f"{ml['name']}_foreground")
             finally:
                 for d in muted:
                     d.mute = False
@@ -4503,7 +4563,9 @@ def _static_write_manifest(out_dir, geo, imgs, atlas_by_label, layers=None, fore
         if light_space == "uv":
             e["atlas"] = atlas_by_label.get(pm["label"])
         e["shadow"] = shadows.get(pm["label"])    # display-space multiply ratio, toggleable
-        e["foreground"] = foregrounds.get(pm["label"])      # {variant: file} foreground matte (occlusion+tint, RGBA)
+        e["foreground"] = foregrounds.get(pm["label"])      # {add?, mul?} affine foreground (classic
+        #   arms serve both variants; legacy exports: {variant: file|{add,mul}} -- readers branch
+        #   on the shape)
         players_meta.append(e)
     if layers:
         layers = [dict(l, shadow=shadows.get(l["name"]), foreground=foregrounds.get(l["name"]))
@@ -4616,8 +4678,8 @@ def _static_export_steps(players, op=None, out_dir=None):
     # fraction so a mismatch only shifts where the bar lands, never overshoots):
     #   images : bg + optional screen light + one per entity shadow (players + sprites)
     #   sprites: one beauty-cut per sprite group
-    #   foreground: one two-background matte per player x arm-variant + one per mesh-layer (occlusion+tint)
-    n_foreground_renders = len(players) * len(MASK_ARM_VARIANTS) + len(mesh_layers)
+    #   foreground: one affine map set per player (classic arms serve both variants) + per mesh-layer
+    n_foreground_renders = len(players) + len(mesh_layers)
     # per-step toggles: a step turned OFF is reused from the previous manifest (1 yield instead of N).
     reuse_any = not (STATIC_DO_ATLAS and STATIC_DO_BACKGROUND and STATIC_DO_FOREGROUND
                      and STATIC_DO_SHADOWS and STATIC_DO_SPRITES)
