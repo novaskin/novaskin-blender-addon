@@ -33,19 +33,44 @@ mesh.bin                 NSKM v2 — welded UV, src (welded→unique), tris (DEN
 positions.bin            one key of screen positions + z (NSKA v3 with K=1, absolute only)
 <player>_atlas.<ext>     UV-space light atlas per player (sampled by uv like the skin)
 background.<ext>         scene without players (shadows baked in); opaque
-foreground.<ext>         scenery in front of the players — WebP with a real ALPHA channel
+<player>_foreground_add.webp / _mul.webp   affine "what is in front" maps (see below; either
+                         is omitted when identity, both omitted when nothing is in front)
 manifest.json            static_version, resolution, crop, per-player atlas + tri ranges
 ```
 
 Same WebGL renderer as the animated mode, with K=1 (no interpolation) and the light sampled
 in **UV space** instead of screen space (see the shader note).
 
-**No matte for the static foreground.** The animated mode splits the foreground into RGB +
-grayscale matte because no in-browser **video** codec carries alpha on Safari (no VP9-alpha) and
-Blender's bundled ffmpeg can't encode it. A static foreground is a still **image**, and WebP
-carries a real alpha channel that every target browser decodes — so static ships a single
-`foreground.webp` with alpha (lossless or lossy), no separate matte file. (Matte stays
-animated-only.)
+**Foreground = affine composite, per entity** (current; `_static_render_foreground`). What is in
+front of each player — water/glass tint, a reflection, an opaque occluder — is exported as the exact
+affine model `out = add + mul · player` (per RGB channel), two straight-RGB lossless WebP maps per
+entity:
+
+- **`mul`** = the per-channel transmission of everything in front (`1` = nothing / clear glass;
+  blue water tints the blue channel, not just dims). `= C_white − C_black` from the matte renders.
+- **`add`** = the additive part — a water surface's reflection, an opaque occluder's own colour
+  (`= C_black`, minus the surrounding scenery so it vanishes where nothing is in front).
+
+The browser composites them as **two stencil-clipped blend passes** over the drawn player:
+`dst = mul·dst` (`GL_ZERO, GL_SRC_COLOR`), then `dst += add` (`GL_ONE, GL_ONE`). This replaced a
+single RGBA "matte" (colour = white-player render, scalar `mean()` alpha, alpha-over lerp) that made
+dark skins milky and lost the transmission's hue. Four renders feed it (white / black / scenery-only
+/ silhouette); the scenery-only pass keeps the maps identity at the AA edge (no rim).
+
+Encoding & size wins:
+- Values are **display-encoded anchored at black + mid-gray**, so the browser's display-space
+  multiply-add lands on the scene's view transform for dark and mid skins. (Anchoring at linear
+  white is wrong — AgX/Filmic map linear 1.0 below display white, veiling dry players gray.)
+- **Identity maps are dropped**: an all-black `add` (nothing additive in front — the common case)
+  or all-white `mul` is not written; a fully-dry player ships no foreground at all.
+- **One map set, rendered with the classic (wider) arms, serves both arm variants** — the slim
+  silhouette is a subset and the viewer stencil-clips to the drawn mesh. So the manifest value is a
+  variant-less `{add?, mul?}` (same shape as a mesh layer's foreground). Halves the fg renders.
+
+Readers branch on the value shape, so older exports still load: transitional per-variant affine
+(`{classic: {add,mul}, slim: {…}}`) and the legacy per-variant RGBA matte string. The **animated**
+mode keeps its RGB + grayscale-matte *video* split — no in-browser video codec carries alpha on
+Safari — but composites the same affine math.
 
 ## The UV light atlas (the new piece)
 
@@ -202,8 +227,10 @@ shared UV islands. `ATLAS_BLUR_RADIUS` (0 = off) stays as an optional knob.
   `[6.85, 55.78]`; the cleaned mesh is `[6.85, 8.77]`, giving the GPU depth test ~0.0005 u/level.
 - Measured (2 players, 1920×1080): welded 79 475, unique 47 268, **94 464 tris**; mesh.bin
   ≈ 574 KB, positions.bin ≈ 219 KB.
-- Crop, foreground, background: same as the animated mode but single still images (step 3). The
-  static foreground is one **WebP with alpha** (no matte — see Deliverables).
+- Crop, foreground, background: single still images. The foreground is the per-entity affine
+  `add`/`mul` map pair — see *Foreground* under Deliverables. (The blockquote below is the ORIGINAL
+  step-3 single-`foreground.webp`-with-alpha design, kept for history; the affine maps superseded
+  it.)
 
 > **Step 3 implemented**: `_static_render_images(players, out_dir=None)` (+ config
 > `STATIC_BG_FORMAT`/`STATIC_BG_QUALITY`/`STATIC_FG_LOSSLESS`/`STATIC_FG_QUALITY`). Renders, at the
@@ -231,9 +258,10 @@ shared UV islands. `ATLAS_BLUR_RADIUS` (0 = off) stays as an optional knob.
 color = skin(uv) * light(uv_or_screen) * 2.0;   // static: atlas(uv); animated: lightVideo(screenUv)
 ```
 A manifest flag (`light_space: "uv" | "screen"`) tells the renderer which sampler to use.
-Background → players (depth test) → foreground (over). Static composites the foreground with its
-own WebP alpha (animated uses the separate matte). Otherwise identical to the animated path with
-K=1.
+Background → players (depth test) → foreground. The foreground is composited per drawn entity,
+stencil-clipped to its pixels: the affine `mul`/`add` blend passes (see *Foreground* above) —
+static and animated share the math (animated carries the maps in a video). Otherwise identical to
+the animated path with K=1.
 
 ## Panel & migration strategy ✅ decided
 
